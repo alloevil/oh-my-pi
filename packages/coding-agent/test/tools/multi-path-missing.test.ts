@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 // Regression for grievances #208 (find) and #209 (search): a multi-path call
 // that includes an entry which does not exist on disk must not abort the whole
@@ -16,6 +17,7 @@ function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): T
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd }),
 		settings: Settings.isolated(),
 		...overrides,
 	};

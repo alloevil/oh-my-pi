@@ -21,6 +21,7 @@ import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { TSchema } from "@sinclair/typebox";
 import type { ToolSession } from "..";
 import { AsyncJobManager } from "../async";
+import type { BackendSelectOptions } from "../backend/select";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
@@ -110,6 +111,20 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.cacheRead += cost.cacheRead;
 	target.cost.cacheWrite += cost.cacheWrite;
 	target.cost.total += cost.total;
+}
+
+function getLocalDiscoveryCwd(session: ToolSession): string {
+	return session.sessionPath?.localWorkspaceCwd ?? session.cwd;
+}
+
+function getInheritedRemoteBackend(session: ToolSession): BackendSelectOptions["remote"] | undefined {
+	const sessionPath = session.sessionPath;
+	if (sessionPath?.kind !== "connected" || !sessionPath.remoteSession.baseUrl) return undefined;
+	return {
+		baseUrl: sessionPath.remoteSession.baseUrl,
+		token: sessionPath.remoteSession.token,
+		cwd: sessionPath.remoteSession.cwd ?? sessionPath.remoteCwd,
+	};
 }
 
 // Re-export types and utilities
@@ -249,7 +264,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 	 * Create a TaskTool instance with async agent discovery.
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
-		const { agents } = await discoverAgents(session.cwd);
+		const { agents } = await discoverAgents(getLocalDiscoveryCwd(session));
 		return new TaskTool(session, agents);
 	}
 
@@ -508,7 +523,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 		preAllocatedIds?: string[],
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
-		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
+		const { agents, projectAgentsDir } = await discoverAgents(getLocalDiscoveryCwd(this.session));
 		const { agent: agentName, context, schema: outputSchema } = params;
 		const simpleMode = this.#getTaskSimpleMode();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
@@ -520,6 +535,8 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 		const commitStyle = this.session.settings.get("task.isolation.commits");
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
 		const taskDepth = this.session.taskDepth ?? 0;
+		const backend = this.session.backend;
+		const connectedSession = this.session.sessionPath?.kind === "connected";
 
 		if (isolationMode === "none" && "isolated" in params) {
 			return {
@@ -527,6 +544,22 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 					{
 						type: "text",
 						text: "Task isolation is disabled. Remove the isolated argument or set task.isolation.mode to 'worktree', 'fuse-overlay', or 'fuse-projfs'.",
+					},
+				],
+				details: {
+					projectAgentsDir,
+					results: [],
+					totalDurationMs: 0,
+				},
+			};
+		}
+
+		if (isIsolated && connectedSession && (isolationMode === "fuse-overlay" || isolationMode === "fuse-projfs")) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `${isolationMode} isolation is unavailable for connected sessions because it requires a local FUSE/ProjFS mount. Use worktree isolation, or branch mode with task.isolation.mode='worktree' and task.isolation.merge='branch'.`,
 					},
 				],
 				details: {
@@ -676,8 +709,8 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 		let baseline: WorktreeBaseline | null = null;
 		if (isIsolated) {
 			try {
-				repoRoot = await getRepoRoot(this.session.cwd);
-				baseline = await captureBaseline(repoRoot);
+				repoRoot = await getRepoRoot(this.session.cwd, backend);
+				baseline = await captureBaseline(repoRoot, backend);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				return {
@@ -819,6 +852,9 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				file => path.basename(file.path).toLowerCase() !== "agents.md",
 			);
 			const promptTemplates = this.session.promptTemplates;
+			const inheritedSessionPathContext =
+				this.session.sessionPath?.kind === "connected" ? this.session.sessionPath : undefined;
+			const inheritedRemoteBackend = getInheritedRemoteBackend(this.session);
 
 			// Initialize progress for all tasks
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
@@ -847,6 +883,8 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				if (!isIsolated) {
 					return runSubprocess({
 						cwd: this.session.cwd,
+						sessionPathContext: inheritedSessionPathContext,
+						remoteBackend: inheritedRemoteBackend,
 						agent,
 						task: renderSubagentUserPrompt(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
@@ -899,13 +937,15 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 					} else if (effectiveIsolationMode === "fuse-projfs") {
 						isolationDir = await ensureProjfsOverlay(repoRoot, task.id);
 					} else {
-						isolationDir = await ensureWorktree(repoRoot, task.id);
-						await applyBaseline(isolationDir, taskBaseline);
+						isolationDir = await ensureWorktree(repoRoot, task.id, backend);
+						await applyBaseline(isolationDir, taskBaseline, backend);
 					}
 
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						worktree: isolationDir,
+						sessionPathContext: inheritedSessionPathContext,
+						remoteBackend: inheritedRemoteBackend,
 						agent,
 						task: renderSubagentUserPrompt(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
@@ -962,6 +1002,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 								task.id,
 								task.description,
 								commitMsg,
+								backend,
 							);
 							return {
 								...result,
@@ -971,14 +1012,14 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						} catch (mergeErr) {
 							// Agent succeeded but branch commit failed — clean up stale branch
 							const branchName = `omp/task/${task.id}`;
-							await git.branch.tryDelete(repoRoot, branchName);
+							await git.branch.tryDelete(repoRoot, branchName, { backend });
 							const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
 							return { ...result, error: `Merge failed: ${msg}` };
 						}
 					}
 					if (result.exitCode === 0) {
 						try {
-							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
+							const delta = await captureDeltaPatch(isolationDir, taskBaseline, backend);
 							const patchPath = path.join(effectiveArtifactsDir, `${task.id}.patch`);
 							await Bun.write(patchPath, delta.rootPatch);
 							return {
@@ -1019,7 +1060,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						} else if (effectiveIsolationMode === "fuse-projfs") {
 							await cleanupProjfsOverlay(isolationDir);
 						} else {
-							await cleanupWorktree(isolationDir);
+							await cleanupWorktree(isolationDir, backend);
 						}
 					}
 				}
@@ -1097,7 +1138,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						if (branchEntries.length === 0) {
 							changesApplied = true;
 						} else {
-							const mergeResult = await mergeTaskBranches(repoRoot, branchEntries);
+							const mergeResult = await mergeTaskBranches(repoRoot, branchEntries, backend);
 							mergedBranchesForNestedPatches = new Set(mergeResult.merged);
 							changesApplied = mergeResult.failed.length === 0;
 
@@ -1115,7 +1156,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						// Clean up merged branches (keep failed ones for manual resolution)
 						const allBranches = branchEntries.map(b => b.branchName);
 						if (changesApplied) {
-							await cleanupTaskBranches(repoRoot, allBranches);
+							await cleanupTaskBranches(repoRoot, allBranches, backend);
 						}
 					} else {
 						// Patch mode: combine and apply patches
@@ -1143,10 +1184,10 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 								if (!combinedPatch.trim()) {
 									changesApplied = true;
 								} else {
-									changesApplied = await git.patch.canApplyText(repoRoot, combinedPatch);
+									changesApplied = await git.patch.canApplyText(repoRoot, combinedPatch, { backend });
 									if (changesApplied) {
 										try {
-											await git.patch.applyText(repoRoot, combinedPatch);
+											await git.patch.applyText(repoRoot, combinedPatch, { backend });
 										} catch {
 											changesApplied = false;
 										}
@@ -1203,7 +1244,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 										);
 									}
 								: undefined;
-						await applyNestedPatches(repoRoot, allNestedPatches, commitMsg);
+						await applyNestedPatches(repoRoot, allNestedPatches, commitMsg, backend);
 					} catch {
 						// Nested patch failures are non-fatal to the parent merge
 						mergeSummary +=

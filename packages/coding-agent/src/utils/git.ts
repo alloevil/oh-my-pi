@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Shell } from "@oh-my-pi/pi-natives";
 import { $which, hasFsCode, isEnoent, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Backend, BashEvent, BashExecRequest, ShellBackend } from "../backend";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -21,6 +23,16 @@ export interface GitCommandResult {
 	stderr: string;
 }
 
+export type GitBackend = Pick<Backend, "fs" | "kind" | "shell">;
+
+function isRemoteGitBackend(backend: GitBackend | undefined): boolean {
+	return backend?.kind === "remote";
+}
+
+export interface GitBackendOptions {
+	readonly backend?: GitBackend;
+}
+
 export interface GitRepository {
 	commonDir: string;
 	gitDir: string;
@@ -35,18 +47,23 @@ export interface GitStatusSummary {
 	untracked: number;
 }
 
+export interface GitShellOptions extends GitBackendOptions {
+	readonly shell?: ShellBackend;
+	readonly signal?: AbortSignal;
+}
+
 export type HunkSelection = {
 	path: string;
 	hunks: { type: "all" } | { type: "indices"; indices: number[] } | { type: "lines"; start: number; end: number };
 };
 
-export interface StageHunksOptions {
+export interface StageHunksOptions extends GitBackendOptions {
 	readonly diffCached?: boolean;
 	readonly rawDiff?: string;
 	readonly signal?: AbortSignal;
 }
 
-export interface DiffOptions {
+export interface DiffOptions extends GitBackendOptions {
 	readonly allowFailure?: boolean;
 	readonly base?: string;
 	readonly binary?: boolean;
@@ -61,35 +78,36 @@ export interface DiffOptions {
 	readonly stat?: boolean;
 }
 
-export interface StatusOptions {
+export interface StatusOptions extends GitBackendOptions {
 	readonly pathspecs?: readonly string[];
 	readonly porcelainV1?: boolean;
+	readonly shell?: ShellBackend;
 	readonly signal?: AbortSignal;
 	readonly untrackedFiles?: "all" | "no" | "normal";
 	readonly z?: boolean;
 }
 
-export interface CommitOptions {
+export interface CommitOptions extends GitBackendOptions {
 	readonly allowEmpty?: boolean;
 	readonly files?: readonly string[];
 	readonly signal?: AbortSignal;
 }
 
-export interface PushOptions {
+export interface PushOptions extends GitBackendOptions {
 	readonly forceWithLease?: boolean;
 	readonly refspec?: string;
 	readonly remote?: string;
 	readonly signal?: AbortSignal;
 }
 
-export interface PatchOptions {
+export interface PatchOptions extends GitBackendOptions {
 	readonly cached?: boolean;
 	readonly check?: boolean;
 	readonly env?: Record<string, string | undefined>;
 	readonly signal?: AbortSignal;
 }
 
-export interface RestoreOptions {
+export interface RestoreOptions extends GitBackendOptions {
 	readonly files?: readonly string[];
 	readonly signal?: AbortSignal;
 	readonly source?: string;
@@ -97,7 +115,7 @@ export interface RestoreOptions {
 	readonly worktree?: boolean;
 }
 
-export interface CloneOptions {
+export interface CloneOptions extends GitBackendOptions {
 	readonly ref?: string;
 	readonly sha?: string;
 	readonly signal?: AbortSignal;
@@ -159,23 +177,170 @@ const SHORT_LIVED_GIT_CONFIG: readonly (readonly [key: string, value: string])[]
 const REMOTE_ALREADY_EXISTS = /remote .* already exists/i;
 
 interface CommandOptions {
+	readonly backend?: GitBackend;
 	readonly env?: Record<string, string | undefined>;
 	readonly readOnly?: boolean;
+	readonly shell?: ShellBackend;
 	readonly signal?: AbortSignal;
-	readonly stdin?: string | Uint8Array | ArrayBuffer | SharedArrayBuffer;
 }
 
-function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
-	if (input === undefined) return "ignore";
-	if (typeof input === "string") return new TextEncoder().encode(input);
-	if (input instanceof Uint8Array) return input;
-	return new Uint8Array(input);
+export type GitSignalOrOptions = AbortSignal | GitShellOptions | undefined;
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"aborted" in value &&
+		typeof (value as { addEventListener?: unknown }).addEventListener === "function"
+	);
+}
+
+function normalizeGitOptions(input?: GitSignalOrOptions): GitShellOptions {
+	if (!input) return {};
+	if (isAbortSignal(input)) return { signal: input };
+	return input;
+}
+
+function normalizeEnv(env: Record<string, string | undefined> | undefined): Record<string, string> | undefined {
+	if (!env) return undefined;
+	const normalized: Record<string, string> = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (value !== undefined) normalized[key] = value;
+	}
+	return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function shellQuote(value: string): string {
+	if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+async function runExternalCommand(
+	program: string,
+	cwd: string,
+	args: readonly string[],
+	options: Omit<CommandOptions, "readOnly"> = {},
+): Promise<GitCommandResult> {
+	const stdoutPath = allocateTempPath(cwd, `${program}-stdout`, options.backend);
+	const stderrPath = allocateTempPath(cwd, `${program}-stderr`, options.backend);
+	const redirectedCommand = `${[program, ...args].map(shellQuote).join(" ")} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}`;
+	let exitCode = 0;
+	for await (const event of commandShell(options).exec({
+		command: redirectedCommand,
+		cwd,
+		env: normalizeEnv(options.env),
+		pty: false,
+		signal: options.signal,
+	})) {
+		if (event.type === "exit")
+			exitCode = event.exitCode ?? (event.signaled || event.cancelled || event.timedOut ? 1 : 0);
+	}
+	try {
+		const [stdout, stderr] = await Promise.all([
+			readTempTextIfExists(stdoutPath, options.backend),
+			readTempTextIfExists(stderrPath, options.backend),
+		]);
+		return { exitCode, stdout, stderr };
+	} finally {
+		await Promise.allSettled([
+			removeTempText(stdoutPath, options.backend),
+			removeTempText(stderrPath, options.backend),
+		]);
+	}
 }
 
 function ensureAvailable(): void {
 	if (!$which("git")) {
 		throw new Error("git is not installed.");
 	}
+}
+
+class GitAsyncQueue<TValue> {
+	#items: TValue[] = [];
+	#resolvers: Array<(value: IteratorResult<TValue>) => void> = [];
+	#done = false;
+	#error: unknown = undefined;
+
+	push(value: TValue): void {
+		if (this.#done) return;
+		const resolve = this.#resolvers.shift();
+		if (resolve) {
+			resolve({ value, done: false });
+			return;
+		}
+		this.#items.push(value);
+	}
+
+	finish(error?: unknown): void {
+		if (this.#done) return;
+		this.#done = true;
+		this.#error = error;
+		for (const resolve of this.#resolvers.splice(0)) {
+			resolve({ value: undefined, done: true });
+		}
+	}
+
+	async next(): Promise<IteratorResult<TValue>> {
+		const value = this.#items.shift();
+		if (value !== undefined) return { value, done: false };
+		if (this.#done) {
+			if (this.#error !== undefined) throw this.#error;
+			return { value: undefined, done: true };
+		}
+		return await new Promise<IteratorResult<TValue>>(resolve => {
+			this.#resolvers.push(resolve);
+		});
+	}
+
+	[Symbol.asyncIterator](): AsyncIterator<TValue> {
+		return { next: () => this.next() };
+	}
+}
+
+class LocalGitShellBackend implements ShellBackend {
+	exec(req: BashExecRequest): AsyncIterable<BashEvent> {
+		const queue = new GitAsyncQueue<BashEvent>();
+		const shell = new Shell();
+		void shell
+			.run(
+				{
+					command: req.command,
+					cwd: req.cwd ?? undefined,
+					env: req.env ?? undefined,
+					timeoutMs: req.timeout_ms ?? undefined,
+					signal: req.signal,
+				},
+				(_error, chunk) => {
+					if (req.outputStreams === "split") {
+						queue.push(
+							chunk.stream === "stderr"
+								? { type: "stderr", data: chunk.text }
+								: { type: "stdout", data: chunk.text },
+						);
+						return;
+					}
+					queue.push({ type: "output", text: chunk.text });
+				},
+			)
+			.then(result => {
+				queue.push({
+					type: "exit",
+					exitCode: result.exitCode ?? null,
+					signaled: result.cancelled || result.timedOut,
+					cancelled: result.cancelled,
+					timedOut: result.timedOut,
+				});
+				queue.finish();
+			})
+			.catch(error => queue.finish(error));
+		return queue;
+	}
+}
+
+const localGitShellBackend = new LocalGitShellBackend();
+
+function commandShell(options: Pick<CommandOptions, "backend" | "shell">): ShellBackend {
+	return options.backend?.shell ?? options.shell ?? localGitShellBackend;
 }
 
 function formatCommandFailure(
@@ -195,27 +360,12 @@ async function runCommand(
 	options: CommandOptions = {},
 ): Promise<GitCommandResult> {
 	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
-	const child = Bun.spawn(["git", ...commandArgs], {
-		cwd,
-		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
+	return runExternalCommand("git", cwd, commandArgs, {
+		backend: options.backend,
+		env: { GIT_OPTIONAL_LOCKS: "0", ...options.env },
+		shell: options.shell,
 		signal: options.signal,
-		stdin: normalizeStdin(options.stdin),
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
 	});
-
-	if (!child.stdout || !child.stderr) {
-		throw new Error("Failed to capture git command output.");
-	}
-
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-
-	return { exitCode: exitCode ?? 0, stdout, stderr };
 }
 
 function withNoOptionalLocks(args: readonly string[]): string[] {
@@ -247,7 +397,7 @@ async function runChecked(
 	args: readonly string[],
 	options: CommandOptions = {},
 ): Promise<GitCommandResult> {
-	ensureAvailable();
+	if (!isRemoteGitBackend(options.backend) && !options.shell) ensureAvailable();
 	const result = await runCommand(cwd, args, options);
 	if (result.exitCode !== 0) {
 		throw new GitCommandError(args, result);
@@ -268,7 +418,7 @@ async function tryText(
 	args: readonly string[],
 	options: CommandOptions = {},
 ): Promise<string | undefined> {
-	ensureAvailable();
+	if (!isRemoteGitBackend(options.backend) && !options.shell) ensureAvailable();
 	const result = await runCommand(cwd, args, options);
 	if (result.exitCode !== 0) return undefined;
 	return result.stdout;
@@ -362,10 +512,45 @@ function buildApplyArgs(patchPath: string, options: PatchOptions): string[] {
 	return args;
 }
 
-async function writeTempPatch(content: string): Promise<string> {
-	const tempPath = path.join(os.tmpdir(), `omp-git-patch-${Snowflake.next()}.patch`);
-	await Bun.write(tempPath, content);
+function allocateTempPath(cwd: string, prefix: string, backend?: GitBackend): string {
+	return isRemoteGitBackend(backend)
+		? path.join(cwd, `.omp-${prefix}-${Snowflake.next()}`)
+		: path.join(os.tmpdir(), `omp-${prefix}-${Snowflake.next()}`);
+}
+
+async function writeTempText(cwd: string, prefix: string, content: string, backend?: GitBackend): Promise<string> {
+	const useBackendFs = isRemoteGitBackend(backend);
+	const tempPath = allocateTempPath(cwd, prefix, backend);
+	if (useBackendFs && backend) {
+		await backend.fs.writeBlob(tempPath, new TextEncoder().encode(content), { ifMatch: "*" });
+	} else {
+		await Bun.write(tempPath, content);
+	}
 	return tempPath;
+}
+
+async function readTempTextIfExists(tempPath: string, backend?: GitBackend): Promise<string> {
+	if (isRemoteGitBackend(backend) && backend) {
+		try {
+			const blob = await backend.fs.readBlob(tempPath);
+			return new TextDecoder().decode(blob.bytes);
+		} catch {
+			return "";
+		}
+	}
+	try {
+		return await Bun.file(tempPath).text();
+	} catch {
+		return "";
+	}
+}
+
+async function removeTempText(tempPath: string, backend?: GitBackend): Promise<void> {
+	if (isRemoteGitBackend(backend) && backend) {
+		await backend.fs.delete(tempPath).catch(() => undefined);
+		return;
+	}
+	await fs.promises.rm(tempPath, { force: true });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -533,6 +718,29 @@ async function resolveRepository(startDir: string): Promise<GitRepository | null
 		if (parent === current) return null;
 		current = parent;
 	}
+}
+
+async function resolveRepositoryViaGit(cwd: string, options: CommandOptions): Promise<GitRepository | null> {
+	const result = await runCommand(
+		cwd,
+		["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"],
+		{ backend: options.backend, readOnly: true, shell: options.shell, signal: options.signal },
+	);
+	if (result.exitCode !== 0) return null;
+	const lines = result.stdout
+		.split("\n")
+		.map(line => line.trim())
+		.filter(Boolean);
+	if (lines.length < 3) return null;
+	const [gitDir, commonDir, repoRoot] = lines;
+	if (!gitDir || !commonDir || !repoRoot) return null;
+	return {
+		commonDir,
+		gitDir,
+		gitEntryPath: path.join(repoRoot, ".git"),
+		headPath: path.join(gitDir, "HEAD"),
+		repoRoot,
+	};
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -709,39 +917,66 @@ export const diff = Object.assign(
 	async function diff(cwd: string, options: DiffOptions = {}): Promise<string> {
 		const args = buildDiffArgs(options);
 		if (options.allowFailure) {
-			return (await runCommand(cwd, args, { env: options.env, readOnly: true, signal: options.signal })).stdout;
+			return (
+				await runCommand(cwd, args, {
+					backend: options.backend,
+					env: options.env,
+					readOnly: true,
+					signal: options.signal,
+				})
+			).stdout;
 		}
-		return runText(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
+		return runText(cwd, args, {
+			backend: options.backend,
+			env: options.env,
+			readOnly: true,
+			signal: options.signal,
+		});
 	},
 	{
 		/** List changed file paths. */
 		async changedFiles(
 			cwd: string,
-			options: Pick<DiffOptions, "cached" | "files" | "signal"> = {},
+			options: Pick<DiffOptions, "backend" | "cached" | "files" | "signal"> = {},
 		): Promise<string[]> {
 			return splitLines(await diff(cwd, { ...options, nameOnly: true }));
 		},
 		/** Parsed per-file add/remove counts. */
-		async numstat(cwd: string, options: Pick<DiffOptions, "cached" | "signal"> = {}): Promise<NumstatEntry[]> {
+		async numstat(
+			cwd: string,
+			options: Pick<DiffOptions, "backend" | "cached" | "signal"> = {},
+		): Promise<NumstatEntry[]> {
 			return parseNumstat(await diff(cwd, { ...options, numstat: true }));
 		},
 		/** Parsed diff hunks for the given files. */
 		async hunks(
 			cwd: string,
 			files: readonly string[],
-			options: { cached?: boolean; signal?: AbortSignal } = {},
+			options: { backend?: GitBackend; cached?: boolean; signal?: AbortSignal } = {},
 		): Promise<FileHunks[]> {
 			return parseCommitDiffHunks(
-				await diff(cwd, { cached: options.cached ?? true, files, signal: options.signal }),
+				await diff(cwd, {
+					backend: options.backend,
+					cached: options.cached ?? true,
+					files,
+					signal: options.signal,
+				}),
 			);
 		},
 		/** Check whether a diff exists (uses `--quiet` for efficiency). */
-		async has(cwd: string, options: Pick<DiffOptions, "cached" | "files" | "signal"> = {}): Promise<boolean> {
+		async has(
+			cwd: string,
+			options: Pick<DiffOptions, "backend" | "cached" | "files" | "signal"> = {},
+		): Promise<boolean> {
 			const args = ["diff"];
 			if (options.cached) args.push("--cached");
 			args.push("--quiet");
 			if (options.files?.length) args.push("--", ...options.files);
-			const result = await runCommand(cwd, args, { readOnly: true, signal: options.signal });
+			const result = await runCommand(cwd, args, {
+				backend: options.backend,
+				readOnly: true,
+				signal: options.signal,
+			});
 			if (result.exitCode === 0) return false;
 			if (result.exitCode === 1) return true;
 			throw new GitCommandError(args, result);
@@ -751,15 +986,16 @@ export const diff = Object.assign(
 			cwd: string,
 			base: string,
 			headRef: string,
-			options: { binary?: boolean; signal?: AbortSignal; allowFailure?: boolean } = {},
+			options: { backend?: GitBackend; binary?: boolean; signal?: AbortSignal; allowFailure?: boolean } = {},
 		): Promise<string> {
 			const args = ["diff-tree", "-r", "-p"];
 			if (options.binary) args.push("--binary");
 			args.push(base, headRef);
 			if (options.allowFailure) {
-				return (await runCommand(cwd, args, { readOnly: true, signal: options.signal })).stdout;
+				return (await runCommand(cwd, args, { backend: options.backend, readOnly: true, signal: options.signal }))
+					.stdout;
 			}
-			return runText(cwd, args, { readOnly: true, signal: options.signal });
+			return runText(cwd, args, { backend: options.backend, readOnly: true, signal: options.signal });
 		},
 		/** Parse raw diff text into per-file diffs. */
 		parseFiles(text: string): FileDiff[] {
@@ -784,12 +1020,23 @@ export const status = Object.assign(
 		if (options.z) args.push("-z");
 		if (options.untrackedFiles) args.push(`--untracked-files=${options.untrackedFiles}`);
 		if (options.pathspecs?.length) args.push("--", ...options.pathspecs);
-		return runText(cwd, args, { readOnly: true, signal: options.signal });
+		return runText(cwd, args, {
+			backend: options.backend,
+			readOnly: true,
+			shell: options.shell,
+			signal: options.signal,
+		});
 	},
 	{
 		/** Parsed status counts (staged, unstaged, untracked). */
-		async summary(cwd: string, signal?: AbortSignal): Promise<GitStatusSummary | null> {
-			const result = await runCommand(cwd, ["status", "--porcelain"], { readOnly: true, signal });
+		async summary(cwd: string, options?: GitSignalOrOptions): Promise<GitStatusSummary | null> {
+			const gitOptions = normalizeGitOptions(options);
+			const result = await runCommand(cwd, ["status", "--porcelain"], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			});
 			if (result.exitCode !== 0) return null;
 			return parseStatusPorcelain(result.stdout);
 		},
@@ -804,15 +1051,18 @@ export const status = Object.assign(
 
 export const stage = {
 	/** Stage files. Empty array stages all (`git add -A`). */
-	async files(cwd: string, files: readonly string[] = [], signal?: AbortSignal): Promise<void> {
+	async files(cwd: string, files: readonly string[] = [], options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
 		const args = files.length === 0 ? ["add", "-A"] : ["add", "--", ...files];
-		await runEffect(cwd, args, { signal });
+		await runEffect(cwd, args, { backend: gitOptions.backend, shell: gitOptions.shell, signal: gitOptions.signal });
 	},
 
 	/** Selectively stage hunks from the provided diff or the current working tree diff. */
 	async hunks(cwd: string, selections: HunkSelection[], options: StageHunksOptions = {}): Promise<void> {
 		if (selections.length === 0) return;
-		const rawDiff = options.rawDiff ?? (await diff(cwd, { cached: options.diffCached, signal: options.signal }));
+		const rawDiff =
+			options.rawDiff ??
+			(await diff(cwd, { backend: options.backend, cached: options.diffCached, signal: options.signal }));
 		const fileDiffs = parseFileDiffs(rawDiff);
 		const fileDiffMap = new Map(fileDiffs.map(entry => [entry.filename, entry]));
 		const patchParts: string[] = [];
@@ -839,13 +1089,14 @@ export const stage = {
 
 		const patchText = patch.join(patchParts);
 		if (!patchText.trim()) return;
-		await patch.applyText(cwd, patchText, { cached: true, signal: options.signal });
+		await patch.applyText(cwd, patchText, { backend: options.backend, cached: true, signal: options.signal });
 	},
 
 	/** Unstage files. Empty array unstages all (`git reset`). */
-	async reset(cwd: string, files: readonly string[] = [], signal?: AbortSignal): Promise<void> {
+	async reset(cwd: string, files: readonly string[] = [], options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
 		const args = files.length === 0 ? ["reset"] : ["reset", "--", ...files];
-		await runEffect(cwd, args, { signal });
+		await runEffect(cwd, args, { backend: gitOptions.backend, shell: gitOptions.shell, signal: gitOptions.signal });
 	},
 };
 
@@ -853,12 +1104,17 @@ export const stage = {
 // API: commit, push, checkout
 // ════════════════════════════════════════════════════════════════════════════
 
-/** Create a commit with the given message (passed via stdin). */
+/** Create a commit with the given message. */
 export async function commit(cwd: string, message: string, options: CommitOptions = {}): Promise<GitCommandResult> {
-	const args = ["commit", "-F", "-"];
+	const messagePath = await writeTempText(cwd, "git-commit-message", message, options.backend);
+	const args = ["commit", "-F", messagePath];
 	if (options.allowEmpty) args.push("--allow-empty");
 	if (options.files?.length) args.push("--", ...options.files);
-	return runChecked(cwd, args, { signal: options.signal, stdin: message });
+	try {
+		return await runChecked(cwd, args, { backend: options.backend, signal: options.signal });
+	} finally {
+		await removeTempText(messagePath, options.backend);
+	}
 }
 
 /** Push the current branch. */
@@ -867,12 +1123,17 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 	if (options.forceWithLease) args.push("--force-with-lease");
 	if (options.remote) args.push(options.remote);
 	if (options.refspec) args.push(options.refspec);
-	await runEffect(cwd, args, { signal: options.signal });
+	await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 }
 
 /** Checkout a ref. */
-export async function checkout(cwd: string, ref: string, signal?: AbortSignal): Promise<void> {
-	await runEffect(cwd, ["checkout", ref], { signal });
+export async function checkout(cwd: string, ref: string, options?: GitSignalOrOptions): Promise<void> {
+	const gitOptions = normalizeGitOptions(options);
+	await runEffect(cwd, ["checkout", ref], {
+		backend: gitOptions.backend,
+		shell: gitOptions.shell,
+		signal: gitOptions.signal,
+	});
 }
 
 /** Fetch a specific refspec from a remote. */
@@ -881,16 +1142,21 @@ export async function fetch(
 	remote: string,
 	source: string,
 	target: string,
-	signal?: AbortSignal,
+	options?: GitSignalOrOptions,
 ): Promise<void> {
-	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], { signal });
+	const gitOptions = normalizeGitOptions(options);
+	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], {
+		backend: gitOptions.backend,
+		shell: gitOptions.shell,
+		signal: gitOptions.signal,
+	});
 }
 
 /** Read a tree-ish into the index. */
 export async function readTree(
 	cwd: string,
 	treeish: string,
-	options: Pick<CommandOptions, "env" | "signal"> = {},
+	options: Pick<CommandOptions, "backend" | "env" | "signal"> = {},
 ): Promise<void> {
 	await runEffect(cwd, ["read-tree", treeish], options);
 }
@@ -904,17 +1170,26 @@ export const show = Object.assign(
 	async function show(
 		cwd: string,
 		revision: string,
-		options: { format?: string; signal?: AbortSignal } = {},
+		options: { backend?: GitBackend; format?: string; signal?: AbortSignal } = {},
 	): Promise<string> {
 		return runText(cwd, ["show", `--format=${options.format ?? ""}`, revision], {
+			backend: options.backend,
 			readOnly: true,
 			signal: options.signal,
 		});
 	},
 	{
 		/** Get the path prefix of the current directory relative to the repo root. */
-		async prefix(cwd: string, signal?: AbortSignal): Promise<string> {
-			return (await runText(cwd, ["rev-parse", "--show-prefix"], { readOnly: true, signal })).trim();
+		async prefix(cwd: string, options?: GitSignalOrOptions): Promise<string> {
+			const gitOptions = normalizeGitOptions(options);
+			return (
+				await runText(cwd, ["rev-parse", "--show-prefix"], {
+					backend: gitOptions.backend,
+					readOnly: true,
+					shell: gitOptions.shell,
+					signal: gitOptions.signal,
+				})
+			).trim();
 		},
 	},
 );
@@ -925,13 +1200,27 @@ export const show = Object.assign(
 
 export const log = {
 	/** Recent commit subjects (one-line each). */
-	async subjects(cwd: string, count: number, signal?: AbortSignal): Promise<string[]> {
-		return splitLines(await runText(cwd, ["log", `-n${count}`, "--pretty=format:%s"], { readOnly: true, signal }));
+	async subjects(cwd: string, count: number, options?: GitSignalOrOptions): Promise<string[]> {
+		const gitOptions = normalizeGitOptions(options);
+		return splitLines(
+			await runText(cwd, ["log", `-n${count}`, "--pretty=format:%s"], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			}),
+		);
 	},
 	/** Recent commits as `<short-sha> <subject>` onelines. */
-	async onelines(cwd: string, count: number, signal?: AbortSignal): Promise<string[]> {
+	async onelines(cwd: string, count: number, options?: GitSignalOrOptions): Promise<string[]> {
+		const gitOptions = normalizeGitOptions(options);
 		return splitLines(
-			await runText(cwd, ["log", `-${count}`, "--oneline", "--no-decorate"], { readOnly: true, signal }),
+			await runText(cwd, ["log", `-${count}`, "--oneline", "--no-decorate"], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			}),
 		);
 	},
 };
@@ -942,17 +1231,24 @@ export const log = {
 
 export const branch = {
 	/** Current branch name, or null if detached/unavailable. */
-	async current(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const headState = await resolveHead(cwd);
+	async current(cwd: string, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		const headState = await resolveHead(cwd, gitOptions);
 		if (headState?.kind === "ref") return headState.branchName ?? headState.ref;
-		const result = await runCommand(cwd, ["symbolic-ref", "--short", "HEAD"], { readOnly: true, signal });
+		const result = await runCommand(cwd, ["symbolic-ref", "--short", "HEAD"], {
+			backend: gitOptions.backend,
+			readOnly: true,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
 
 	/** Default branch name (from remote HEAD refs). */
-	async default(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const repository = await resolveRepository(cwd);
+	async default(cwd: string, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		const repository = gitOptions.backend || gitOptions.shell ? null : await resolveRepository(cwd);
 		if (repository) {
 			for (const refPath of DEFAULT_BRANCH_REFS) {
 				const target = await readRef(repository, refPath);
@@ -961,7 +1257,12 @@ export const branch = {
 			}
 		}
 		for (const remoteRef of ["origin/HEAD", "upstream/HEAD"]) {
-			const result = await runCommand(cwd, ["rev-parse", "--abbrev-ref", remoteRef], { readOnly: true, signal });
+			const result = await runCommand(cwd, ["rev-parse", "--abbrev-ref", remoteRef], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			});
 			if (result.exitCode !== 0) continue;
 			const branchName = stripRemotePrefix(result.stdout.trim());
 			if (branchName) return branchName;
@@ -970,43 +1271,69 @@ export const branch = {
 	},
 
 	/** Create a new branch at the given start point. */
-	async create(cwd: string, name: string, startPoint = "HEAD", signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["branch", name, startPoint], { signal });
+	async create(cwd: string, name: string, startPoint = "HEAD", options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
+		await runEffect(cwd, ["branch", name, startPoint], {
+			backend: gitOptions.backend,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 	},
 
 	/** Force-move a branch to a new start point. */
-	async force(cwd: string, name: string, startPoint: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["branch", "--force", name, startPoint], { signal });
+	async force(cwd: string, name: string, startPoint: string, options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
+		await runEffect(cwd, ["branch", "--force", name, startPoint], {
+			backend: gitOptions.backend,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 	},
 
 	/** Delete a branch. Throws on failure. */
-	async delete(cwd: string, name: string, options: { force?: boolean; signal?: AbortSignal } = {}): Promise<void> {
-		await runEffect(cwd, ["branch", options.force === false ? "-d" : "-D", name], { signal: options.signal });
+	async delete(
+		cwd: string,
+		name: string,
+		options: { backend?: GitBackend; force?: boolean; signal?: AbortSignal } = {},
+	): Promise<void> {
+		await runEffect(cwd, ["branch", options.force === false ? "-d" : "-D", name], {
+			backend: options.backend,
+			signal: options.signal,
+		});
 	},
 
 	/** Delete a branch. Returns false on failure instead of throwing. */
 	async tryDelete(
 		cwd: string,
 		name: string,
-		options: { force?: boolean; signal?: AbortSignal } = {},
+		options: { backend?: GitBackend; force?: boolean; signal?: AbortSignal } = {},
 	): Promise<boolean> {
 		const result = await runCommand(cwd, ["branch", options.force === false ? "-d" : "-D", name], {
+			backend: options.backend,
 			signal: options.signal,
 		});
 		return result.exitCode === 0;
 	},
 
 	/** Create and checkout a new branch. */
-	async checkoutNew(cwd: string, name: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["checkout", "-b", name], { signal });
+	async checkoutNew(cwd: string, name: string, options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
+		await runEffect(cwd, ["checkout", "-b", name], {
+			backend: gitOptions.backend,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 	},
 
 	/** List branches. Pass `{ all: true }` to include remotes. */
-	async list(cwd: string, options: { all?: boolean; signal?: AbortSignal } = {}): Promise<string[]> {
+	async list(
+		cwd: string,
+		options: { all?: boolean; backend?: GitBackend; signal?: AbortSignal } = {},
+	): Promise<string[]> {
 		const args = ["branch"];
 		if (options.all) args.push("-a");
 		args.push("--format=%(refname:short)");
-		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
+		return splitLines(await runText(cwd, args, { backend: options.backend, readOnly: true, signal: options.signal }));
 	},
 };
 
@@ -1016,13 +1343,29 @@ export const branch = {
 
 export const remote = {
 	/** List remote names. */
-	async list(cwd: string, signal?: AbortSignal): Promise<string[]> {
-		return splitLines(await runText(cwd, ["remote"], { readOnly: true, signal }));
+	async list(cwd: string, options?: GitSignalOrOptions): Promise<string[]> {
+		const gitOptions = normalizeGitOptions(options);
+		return splitLines(
+			await runText(cwd, ["remote"], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			}),
+		);
 	},
 
 	/** Get the URL for a remote. */
-	async url(cwd: string, name: string, signal?: AbortSignal): Promise<string | undefined> {
-		return trimScalar(await tryText(cwd, ["remote", "get-url", name], { readOnly: true, signal }));
+	async url(cwd: string, name: string, options?: GitSignalOrOptions): Promise<string | undefined> {
+		const gitOptions = normalizeGitOptions(options);
+		return trimScalar(
+			await tryText(cwd, ["remote", "get-url", name], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			}),
+		);
 	},
 
 	/**
@@ -1032,11 +1375,16 @@ export const remote = {
 	 * remote exists with a different URL — that's a real conflict the caller
 	 * needs to resolve, not paper over.
 	 */
-	async add(cwd: string, name: string, url: string, signal?: AbortSignal): Promise<void> {
-		const result = await runCommand(cwd, ["remote", "add", name, url], { signal });
+	async add(cwd: string, name: string, url: string, options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
+		const result = await runCommand(cwd, ["remote", "add", name, url], {
+			backend: gitOptions.backend,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		if (result.exitCode === 0) return;
 		if (REMOTE_ALREADY_EXISTS.test(result.stderr)) {
-			const existing = await remote.url(cwd, name, signal);
+			const existing = await remote.url(cwd, name, gitOptions);
 			if (existing === url) return;
 			throw new ToolError(`remote ${name} already exists with URL ${existing ?? "(unset)"}, expected ${url}`);
 		}
@@ -1050,26 +1398,39 @@ export const remote = {
 
 export const ref = {
 	/** Check if a ref exists. */
-	async exists(cwd: string, refName: string, signal?: AbortSignal): Promise<boolean> {
-		if (refName === "HEAD") return (await head.sha(cwd, signal)) !== null;
-		const repository = await resolveRepository(cwd);
+	async exists(cwd: string, refName: string, options?: GitSignalOrOptions): Promise<boolean> {
+		const gitOptions = normalizeGitOptions(options);
+		if (refName === "HEAD") return (await head.sha(cwd, gitOptions)) !== null;
+		const repository = gitOptions.backend || gitOptions.shell ? null : await resolveRepository(cwd);
 		if (repository && refName.startsWith("refs/")) return (await readRef(repository, refName)) !== null;
-		const result = await runCommand(cwd, ["show-ref", "--verify", "--quiet", refName], { readOnly: true, signal });
+		const result = await runCommand(cwd, ["show-ref", "--verify", "--quiet", refName], {
+			backend: gitOptions.backend,
+			readOnly: true,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		return result.exitCode === 0;
 	},
 
 	/** Resolve a ref to its commit SHA. */
-	async resolve(cwd: string, refName: string, signal?: AbortSignal): Promise<string | null> {
-		if (refName === "HEAD") return head.sha(cwd, signal);
-		const repository = await resolveRepository(cwd);
+	async resolve(cwd: string, refName: string, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		if (refName === "HEAD") return head.sha(cwd, gitOptions);
+		const repository = gitOptions.backend || gitOptions.shell ? null : await resolveRepository(cwd);
 		if (repository && refName.startsWith("refs/")) return readRef(repository, refName);
-		const result = await runCommand(cwd, ["rev-parse", refName], { readOnly: true, signal });
+		const result = await runCommand(cwd, ["rev-parse", refName], {
+			backend: gitOptions.backend,
+			readOnly: true,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
 
 	/** Tags pointing at a ref. */
-	async tags(cwd: string, refName = "HEAD", signal?: AbortSignal): Promise<string[]> {
+	async tags(cwd: string, refName = "HEAD", options?: GitSignalOrOptions): Promise<string[]> {
+		const gitOptions = normalizeGitOptions(options);
 		return splitLines(
 			await runText(
 				cwd,
@@ -1081,7 +1442,7 @@ export const ref = {
 					"--format=%(refname:strip=2)",
 					"refs/tags",
 				],
-				{ readOnly: true, signal },
+				{ backend: gitOptions.backend, readOnly: true, shell: gitOptions.shell, signal: gitOptions.signal },
 			),
 		);
 	},
@@ -1092,20 +1453,44 @@ export const ref = {
 // ════════════════════════════════════════════════════════════════════════════
 
 export const config = {
-	async get(cwd: string, key: string, signal?: AbortSignal): Promise<string | undefined> {
-		return trimScalar(await tryText(cwd, ["config", "--get", key], { readOnly: true, signal }));
+	async get(cwd: string, key: string, options?: GitSignalOrOptions): Promise<string | undefined> {
+		const gitOptions = normalizeGitOptions(options);
+		return trimScalar(
+			await tryText(cwd, ["config", "--get", key], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			}),
+		);
 	},
 
-	async set(cwd: string, key: string, value: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["config", key, value], { signal });
+	async set(cwd: string, key: string, value: string, options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
+		await runEffect(cwd, ["config", key, value], {
+			backend: gitOptions.backend,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 	},
 
-	async getBranch(cwd: string, branchName: string, key: string, signal?: AbortSignal): Promise<string | undefined> {
-		return config.get(cwd, `branch.${branchName}.${key}`, signal);
+	async getBranch(
+		cwd: string,
+		branchName: string,
+		key: string,
+		options?: GitSignalOrOptions,
+	): Promise<string | undefined> {
+		return config.get(cwd, `branch.${branchName}.${key}`, options);
 	},
 
-	async setBranch(cwd: string, branchName: string, key: string, value: string, signal?: AbortSignal): Promise<void> {
-		return config.set(cwd, `branch.${branchName}.${key}`, value, signal);
+	async setBranch(
+		cwd: string,
+		branchName: string,
+		key: string,
+		value: string,
+		options?: GitSignalOrOptions,
+	): Promise<void> {
+		return config.set(cwd, `branch.${branchName}.${key}`, value, options);
 	},
 };
 
@@ -1118,39 +1503,47 @@ export const worktree = {
 		cwd: string,
 		worktreePath: string,
 		refName: string,
-		options: { detach?: boolean; signal?: AbortSignal } = {},
+		options: { backend?: GitBackend; detach?: boolean; signal?: AbortSignal } = {},
 	): Promise<void> {
 		const args = ["worktree", "add"];
 		if (options.detach) args.push("--detach");
 		args.push(worktreePath, refName);
-		await runEffect(cwd, args, { signal: options.signal });
+		await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 	},
 
 	async remove(
 		cwd: string,
 		worktreePath: string,
-		options: { force?: boolean; signal?: AbortSignal } = {},
+		options: { backend?: GitBackend; force?: boolean; signal?: AbortSignal } = {},
 	): Promise<void> {
 		const args = ["worktree", "remove"];
 		if (options.force ?? true) args.push("-f");
 		args.push(worktreePath);
-		await runEffect(cwd, args, { signal: options.signal });
+		await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 	},
 
 	async tryRemove(
 		cwd: string,
 		worktreePath: string,
-		options: { force?: boolean; signal?: AbortSignal } = {},
+		options: { backend?: GitBackend; force?: boolean; signal?: AbortSignal } = {},
 	): Promise<boolean> {
 		const args = ["worktree", "remove"];
 		if (options.force ?? true) args.push("-f");
 		args.push(worktreePath);
-		const result = await runCommand(cwd, args, { signal: options.signal });
+		const result = await runCommand(cwd, args, { backend: options.backend, signal: options.signal });
 		return result.exitCode === 0;
 	},
 
-	async list(cwd: string, signal?: AbortSignal): Promise<GitWorktreeEntry[]> {
-		return parseWorktreeList(await runText(cwd, ["worktree", "list", "--porcelain"], { readOnly: true, signal }));
+	async list(cwd: string, options?: GitSignalOrOptions): Promise<GitWorktreeEntry[]> {
+		const gitOptions = normalizeGitOptions(options);
+		return parseWorktreeList(
+			await runText(cwd, ["worktree", "list", "--porcelain"], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			}),
+		);
 	},
 };
 
@@ -1161,23 +1554,28 @@ export const worktree = {
 export const patch = {
 	/** Apply a patch file. */
 	async apply(cwd: string, patchPath: string, options: PatchOptions = {}): Promise<void> {
-		await runEffect(cwd, buildApplyArgs(patchPath, options), { env: options.env, signal: options.signal });
+		await runEffect(cwd, buildApplyArgs(patchPath, options), {
+			backend: options.backend,
+			env: options.env,
+			signal: options.signal,
+		});
 	},
 
 	/** Apply a patch from a string (writes to a temp file). */
 	async applyText(cwd: string, patchText: string, options: PatchOptions = {}): Promise<void> {
 		if (!patchText.trim()) return;
-		const tempPath = await writeTempPatch(patchText);
+		const tempPath = await writeTempText(cwd, "git-patch", patchText, options.backend);
 		try {
 			await patch.apply(cwd, tempPath, options);
 		} finally {
-			await fs.promises.rm(tempPath, { force: true });
+			await removeTempText(tempPath, options.backend);
 		}
 	},
 
 	/** Check if a patch file can be applied cleanly. */
 	async canApply(cwd: string, patchPath: string, options: Omit<PatchOptions, "check"> = {}): Promise<boolean> {
 		const result = await runCommand(cwd, buildApplyArgs(patchPath, { ...options, check: true }), {
+			backend: options.backend,
 			env: options.env,
 			readOnly: true,
 			signal: options.signal,
@@ -1188,11 +1586,11 @@ export const patch = {
 	/** Check if a patch string can be applied cleanly. */
 	async canApplyText(cwd: string, patchText: string, options: Omit<PatchOptions, "check"> = {}): Promise<boolean> {
 		if (!patchText.trim()) return true;
-		const tempPath = await writeTempPatch(patchText);
+		const tempPath = await writeTempText(cwd, "git-patch", patchText, options.backend);
 		try {
 			return await patch.canApply(cwd, tempPath, options);
 		} finally {
-			await fs.promises.rm(tempPath, { force: true });
+			await removeTempText(tempPath, options.backend);
 		}
 	},
 
@@ -1210,12 +1608,22 @@ export const patch = {
 // ════════════════════════════════════════════════════════════════════════════
 
 export const cherryPick = Object.assign(
-	async function cherryPick(cwd: string, revision: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["cherry-pick", revision], { signal });
+	async function cherryPick(cwd: string, revision: string, options?: GitSignalOrOptions): Promise<void> {
+		const gitOptions = normalizeGitOptions(options);
+		await runEffect(cwd, ["cherry-pick", revision], {
+			backend: gitOptions.backend,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 	},
 	{
-		async abort(cwd: string, signal?: AbortSignal): Promise<void> {
-			await runEffect(cwd, ["cherry-pick", "--abort"], { signal });
+		async abort(cwd: string, options?: GitSignalOrOptions): Promise<void> {
+			const gitOptions = normalizeGitOptions(options);
+			await runEffect(cwd, ["cherry-pick", "--abort"], {
+				backend: gitOptions.backend,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			});
 		},
 	},
 );
@@ -1226,20 +1634,24 @@ export const cherryPick = Object.assign(
 
 export const stash = {
 	/** Stash working tree + index changes. Returns true when git created a new stash entry. */
-	async push(cwd: string, message?: string): Promise<boolean> {
-		ensureAvailable();
-		const previousStash = await ref.resolve(cwd, "refs/stash");
+	async push(cwd: string, message?: string, options?: GitSignalOrOptions): Promise<boolean> {
+		const gitOptions = normalizeGitOptions(options);
+		if (!gitOptions.backend && !gitOptions.shell) ensureAvailable();
+		const previousStash = await ref.resolve(cwd, "refs/stash", gitOptions);
 		const args = ["stash", "push", "--include-untracked"];
 		if (message) args.push("-m", message);
-		await runEffect(cwd, args);
-		const nextStash = await ref.resolve(cwd, "refs/stash");
+		await runEffect(cwd, args, { backend: gitOptions.backend, shell: gitOptions.shell, signal: gitOptions.signal });
+		const nextStash = await ref.resolve(cwd, "refs/stash", gitOptions);
 		return nextStash !== null && nextStash !== previousStash;
 	},
 	/** Pop the most recent stash entry, optionally restoring its staged state. */
-	async pop(cwd: string, options?: { index?: boolean }): Promise<void> {
+	async pop(
+		cwd: string,
+		options: { backend?: GitBackend; index?: boolean; signal?: AbortSignal } = {},
+	): Promise<void> {
 		const args = ["stash", "pop"];
 		if (options?.index) args.push("--index");
-		await runEffect(cwd, args);
+		await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 	},
 };
 
@@ -1248,7 +1660,7 @@ export const stash = {
 // ════════════════════════════════════════════════════════════════════════════
 
 export async function clone(url: string, targetDir: string, options: CloneOptions = {}): Promise<void> {
-	ensureAvailable();
+	if (!isRemoteGitBackend(options.backend)) ensureAvailable();
 	const absoluteTarget = path.resolve(targetDir);
 	await fs.promises.mkdir(path.dirname(absoluteTarget), { recursive: true });
 
@@ -1258,10 +1670,14 @@ export async function clone(url: string, targetDir: string, options: CloneOption
 	args.push(url, absoluteTarget);
 
 	try {
-		await runEffect(path.dirname(absoluteTarget), args, { signal: options.signal });
+		await runEffect(path.dirname(absoluteTarget), args, { backend: options.backend, signal: options.signal });
 		if (options.sha) {
 			try {
-				await checkout(absoluteTarget, options.sha, options.signal);
+				await checkout(
+					absoluteTarget,
+					options.sha,
+					options.backend ? { backend: options.backend, signal: options.signal } : options.signal,
+				);
 			} catch {
 				await fs.promises.rm(absoluteTarget, { force: true, recursive: true });
 				throw new Error(`Failed to checkout SHA ${options.sha} - shallow clone may not contain this commit`);
@@ -1279,7 +1695,7 @@ export async function restore(cwd: string, options: RestoreOptions = {}): Promis
 	if (options.staged) args.push("--staged");
 	if (options.worktree) args.push("--worktree");
 	if (options.files?.length) args.push("--", ...options.files);
-	await runEffect(cwd, args, { signal: options.signal });
+	await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 }
 
 /**
@@ -1289,23 +1705,30 @@ export async function restore(cwd: string, options: RestoreOptions = {}): Promis
  */
 export async function reset(
 	cwd: string,
-	options: { hard?: boolean; mixed?: boolean; soft?: boolean; target?: string; signal?: AbortSignal } = {},
+	options: {
+		backend?: GitBackend;
+		hard?: boolean;
+		mixed?: boolean;
+		soft?: boolean;
+		target?: string;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<void> {
 	const args = ["reset"];
 	if (options.hard) args.push("--hard");
 	else if (options.mixed) args.push("--mixed");
 	else if (options.soft) args.push("--soft");
 	if (options.target) args.push(options.target);
-	await runEffect(cwd, args, { signal: options.signal });
+	await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 }
 
 export async function clean(
 	cwd: string,
-	options: { ignoredOnly?: boolean; paths?: readonly string[]; signal?: AbortSignal } = {},
+	options: { backend?: GitBackend; ignoredOnly?: boolean; paths?: readonly string[]; signal?: AbortSignal } = {},
 ): Promise<void> {
 	const args = ["clean", options.ignoredOnly ? "-fdX" : "-fd"];
 	if (options.paths?.length) args.push("--", ...options.paths);
-	await runEffect(cwd, args, { signal: options.signal });
+	await runEffect(cwd, args, { backend: options.backend, signal: options.signal });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1316,24 +1739,33 @@ export const ls = {
 	/** List files tracked or untracked by git. */
 	async files(
 		cwd: string,
-		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
+		options: { backend?: GitBackend; others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
 	): Promise<string[]> {
 		const args = ["ls-files"];
 		if (options.others) args.push("--others");
 		if (options.excludeStandard) args.push("--exclude-standard");
-		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
+		return splitLines(await runText(cwd, args, { backend: options.backend, readOnly: true, signal: options.signal }));
 	},
 
 	/** List untracked files (excludes ignored). */
-	async untracked(cwd: string, signal?: AbortSignal): Promise<string[]> {
-		return ls.files(cwd, { others: true, excludeStandard: true, signal });
+	async untracked(cwd: string, options?: GitSignalOrOptions): Promise<string[]> {
+		const gitOptions = normalizeGitOptions(options);
+		return ls.files(cwd, {
+			backend: gitOptions.backend,
+			excludeStandard: true,
+			others: true,
+			signal: gitOptions.signal,
+		});
 	},
 
 	/** List submodule paths (recursive). */
-	async submodules(cwd: string, signal?: AbortSignal): Promise<string[]> {
+	async submodules(cwd: string, options?: GitSignalOrOptions): Promise<string[]> {
+		const gitOptions = normalizeGitOptions(options);
 		const output = await runCommand(cwd, ["submodule", "--quiet", "foreach", "--recursive", "echo $sm_path"], {
+			backend: gitOptions.backend,
 			readOnly: true,
-			signal,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
 		});
 		return splitLines(output.stdout);
 	},
@@ -1345,7 +1777,38 @@ export const ls = {
 
 export const head = {
 	/** Full HEAD state (branch, commit, repo info). */
-	async resolve(cwd: string): Promise<GitHeadState | null> {
+	async resolve(cwd: string, options?: GitSignalOrOptions): Promise<GitHeadState | null> {
+		const gitOptions = normalizeGitOptions(options);
+		if (gitOptions.backend || gitOptions.shell) {
+			const repository = await resolveRepositoryViaGit(cwd, {
+				backend: gitOptions.backend,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			});
+			if (!repository) return null;
+			const commit =
+				trimScalar(
+					await tryText(cwd, ["rev-parse", "--verify", "HEAD"], {
+						backend: gitOptions.backend,
+						readOnly: true,
+						shell: gitOptions.shell,
+						signal: gitOptions.signal,
+					}),
+				) ?? null;
+			const refResult = await runCommand(cwd, ["symbolic-ref", "-q", "HEAD"], {
+				backend: gitOptions.backend,
+				readOnly: true,
+				shell: gitOptions.shell,
+				signal: gitOptions.signal,
+			});
+			if (refResult.exitCode === 0) {
+				const ref = refResult.stdout.trim();
+				const branchName = ref.startsWith(LOCAL_BRANCH_PREFIX) ? ref.slice(LOCAL_BRANCH_PREFIX.length) : null;
+				return { ...repository, branchName, commit, headContent: `${HEAD_REF_PREFIX} ${ref}\n`, kind: "ref", ref };
+			}
+			return { ...repository, commit, headContent: commit ?? "", kind: "detached" };
+		}
+
 		const repository = await resolveRepository(cwd);
 		if (!repository) return null;
 		const content = await readOptionalText(repository.headPath);
@@ -1363,17 +1826,29 @@ export const head = {
 	},
 
 	/** Current HEAD commit SHA. */
-	async sha(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const headState = await head.resolve(cwd);
+	async sha(cwd: string, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		const headState = await head.resolve(cwd, gitOptions);
 		if (headState?.commit) return headState.commit;
-		const result = await runCommand(cwd, ["rev-parse", "HEAD"], { readOnly: true, signal });
+		const result = await runCommand(cwd, ["rev-parse", "HEAD"], {
+			backend: gitOptions.backend,
+			readOnly: true,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
 
 	/** Abbreviated HEAD commit SHA. */
-	async short(cwd: string, length = 7, signal?: AbortSignal): Promise<string | null> {
-		const result = await runCommand(cwd, ["rev-parse", `--short=${length}`, "HEAD"], { readOnly: true, signal });
+	async short(cwd: string, length = 7, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		const result = await runCommand(cwd, ["rev-parse", `--short=${length}`, "HEAD"], {
+			backend: gitOptions.backend,
+			readOnly: true,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
@@ -1385,26 +1860,49 @@ export const head = {
 
 export const repo = {
 	/** Resolve the repository root (may be a worktree root). */
-	async root(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const repository = await resolveRepository(cwd);
+	async root(cwd: string, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		const repository =
+			gitOptions.backend || gitOptions.shell
+				? await resolveRepositoryViaGit(cwd, {
+						backend: gitOptions.backend,
+						shell: gitOptions.shell,
+						signal: gitOptions.signal,
+					})
+				: await resolveRepository(cwd);
 		if (repository) return repository.repoRoot;
-		const result = await runCommand(cwd, ["rev-parse", "--show-toplevel"], { readOnly: true, signal });
+		const result = await runCommand(cwd, ["rev-parse", "--show-toplevel"], {
+			backend: gitOptions.backend,
+			readOnly: true,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
+		});
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
 
 	/** Resolve the primary repository root (not a worktree — the main checkout). */
-	async primaryRoot(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const repository = await resolveRepository(cwd);
+	async primaryRoot(cwd: string, options?: GitSignalOrOptions): Promise<string | null> {
+		const gitOptions = normalizeGitOptions(options);
+		const repository =
+			gitOptions.backend || gitOptions.shell
+				? await resolveRepositoryViaGit(cwd, {
+						backend: gitOptions.backend,
+						shell: gitOptions.shell,
+						signal: gitOptions.signal,
+					})
+				: await resolveRepository(cwd);
 		if (repository) {
 			if (path.basename(repository.commonDir) === ".git") return path.dirname(repository.commonDir);
 			return repository.repoRoot;
 		}
-		const repoRoot = await repo.root(cwd, signal);
+		const repoRoot = await repo.root(cwd, gitOptions);
 		if (!repoRoot) return null;
 		const commonDir = await runText(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+			backend: gitOptions.backend,
 			readOnly: true,
-			signal,
+			shell: gitOptions.shell,
+			signal: gitOptions.signal,
 		});
 		if (path.basename(commonDir.trim()) === ".git") return path.dirname(commonDir.trim());
 		return repoRoot;
@@ -1416,14 +1914,21 @@ export const repo = {
 	},
 
 	/** Full GitRepository metadata. */
-	resolve(cwd: string): Promise<GitRepository | null> {
-		return resolveRepository(cwd);
+	resolve(cwd: string, options?: GitSignalOrOptions): Promise<GitRepository | null> {
+		const gitOptions = normalizeGitOptions(options);
+		return gitOptions.backend || gitOptions.shell
+			? resolveRepositoryViaGit(cwd, {
+					backend: gitOptions.backend,
+					shell: gitOptions.shell,
+					signal: gitOptions.signal,
+				})
+			: resolveRepository(cwd);
 	},
 };
 
 // Helper used during head resolution — defined here to reference `head` namespace.
-async function resolveHead(cwd: string): Promise<GitHeadState | null> {
-	return head.resolve(cwd);
+async function resolveHead(cwd: string, options?: GitSignalOrOptions): Promise<GitHeadState | null> {
+	return head.resolve(cwd, options);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1436,8 +1941,9 @@ export interface GhCommandResult {
 	stderr: string;
 }
 
-export interface GhCommandOptions {
+export interface GhCommandOptions extends GitBackendOptions {
 	repoProvided?: boolean;
+	shell?: ShellBackend;
 	trimOutput?: boolean;
 }
 
@@ -1467,32 +1973,21 @@ export const github = {
 	/** Run a raw `gh` CLI command. Does not throw on non-zero exit. */
 	async run(cwd: string, args: string[], signal?: AbortSignal, options?: GhCommandOptions): Promise<GhCommandResult> {
 		throwIfAborted(signal);
-		if (!$which("gh")) {
+		if (!options?.backend && !options?.shell && !$which("gh")) {
 			throw new ToolError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.");
 		}
 		try {
-			const child = Bun.spawn(["gh", ...args], {
-				cwd,
-				stdin: "ignore",
-				stdout: "pipe",
-				stderr: "pipe",
-				windowsHide: true,
+			const result = await runExternalCommand("gh", cwd, args, {
+				backend: options?.backend,
+				shell: options?.shell,
 				signal,
 			});
-			if (!child.stdout || !child.stderr) {
-				throw new ToolError("Failed to capture GitHub CLI output.");
-			}
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(child.stdout).text(),
-				new Response(child.stderr).text(),
-				child.exited,
-			]);
 			throwIfAborted(signal);
 			const trim = options?.trimOutput !== false;
 			return {
-				exitCode: exitCode ?? 0,
-				stdout: trim ? stdout.trim() : stdout,
-				stderr: trim ? stderr.trim() : stderr,
+				exitCode: result.exitCode,
+				stdout: trim ? result.stdout.trim() : result.stdout,
+				stderr: trim ? result.stderr.trim() : result.stderr,
 			};
 		} catch (error) {
 			if (signal?.aborted) throw new ToolAbortError();

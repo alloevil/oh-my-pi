@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, HIDDEN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 interface ToolSchemaEntry {
 	name: string;
@@ -22,6 +23,7 @@ function createTestSession(): ToolSession {
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 		settings: Settings.isolated(),
 	};
 }

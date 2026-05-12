@@ -219,7 +219,7 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
 **Execution**
 - With a concrete `file`, inspects matching non-custom servers for that file.
 - With omitted `file` or `"*"`, inspects every non-custom configured server.
-- Starts servers as needed and dumps `client.serverCapabilities ?? {}` as pretty JSON.
+- Starts servers as needed through the backend path, then reads backend runtime status with `backend.lsp.get(serverName)` and pretty-prints the routed runtime `capabilities` payload rather than the old in-process `client.serverCapabilities` cache.
 
 **Output text**
 - Per server: `<server>:` followed by indented `capabilities: { ... }`, or `<server>: failed to start (...)`.

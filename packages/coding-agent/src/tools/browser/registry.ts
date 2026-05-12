@@ -7,9 +7,9 @@ import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, killExistingByP
 import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
 
 export type BrowserKind =
-	| { kind: "headless"; headless: boolean }
-	| { kind: "spawned"; path: string }
-	| { kind: "connected"; cdpUrl: string };
+	| { kind: "headless"; headless?: boolean; args?: string[]; userPrefs?: Record<string, unknown> }
+	| { kind: "spawned"; path: string; args?: string[]; headless?: boolean; userPrefs?: Record<string, unknown> }
+	| { kind: "connected"; cdpUrl: string; args?: string[]; headless?: boolean; userPrefs?: Record<string, unknown> };
 
 export type BrowserKindTag = BrowserKind["kind"];
 
@@ -29,22 +29,37 @@ const browsers = new Map<string, BrowserHandle>();
 export function listBrowsers(): BrowserHandle[] {
 	return [...browsers.values()];
 }
+export function toPuppeteerConnectOptions(endpoint: string): { browserURL?: string; browserWSEndpoint?: string } {
+	const normalizedEndpoint = endpoint.replace(/\/+$/, "");
+	return normalizedEndpoint.startsWith("http")
+		? { browserURL: normalizedEndpoint }
+		: { browserWSEndpoint: normalizedEndpoint };
+}
 
 function browserKey(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
-			return `headless:${kind.headless ? "1" : "0"}`;
+			return `headless:${kind.headless === false ? "0" : "1"}:${encodeArgsKey(kind.args)}`;
 		case "spawned":
-			return `spawned:${kind.path}`;
+			return `spawned:${kind.path}:${encodeArgsKey(kind.args)}:${encodePrefsKey(kind.userPrefs)}:${kind.headless === true ? "1" : "0"}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
 	}
 }
 
+function encodeArgsKey(args: string[] | undefined): string {
+	if (!args || args.length === 0) return "";
+	return JSON.stringify(args);
+}
+
+function encodePrefsKey(userPrefs: Record<string, unknown> | undefined): string {
+	if (!userPrefs || Object.keys(userPrefs).length === 0) return "";
+	return JSON.stringify(userPrefs);
+}
+
 export interface AcquireBrowserOptions {
 	cwd: string;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
-	appArgs?: string[];
 	signal?: AbortSignal;
 }
 
@@ -64,7 +79,7 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "headless") {
-		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport });
+		const browser = await launchHeadlessBrowser({ headless: kind.headless ?? true, viewport: opts.viewport });
 		return {
 			key: browserKey(kind),
 			kind,
@@ -78,7 +93,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		await waitForCdp(cdpUrl, 5_000, opts.signal);
 		const puppeteer = await loadPuppeteer();
 		const browser = await puppeteer.connect({
-			browserURL: cdpUrl,
+			...toPuppeteerConnectOptions(cdpUrl),
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
@@ -110,7 +125,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		const killed = await killExistingByPath(exe, opts.signal);
 		if (killed > 0) logger.debug("Killed existing instances before attach", { exe, killed });
 		const port = await findFreeCdpPort();
-		const launchArgs = [...(opts.appArgs ?? []), `--remote-debugging-port=${port}`];
+		const launchArgs = [...(kind.args ?? []), `--remote-debugging-port=${port}`];
 		const child = Bun.spawn([exe, ...launchArgs], {
 			stdout: "ignore",
 			stderr: "ignore",
@@ -134,7 +149,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	let browser: Browser;
 	try {
 		browser = await puppeteer.connect({
-			browserURL: cdpUrl,
+			...toPuppeteerConnectOptions(cdpUrl),
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
@@ -158,7 +173,11 @@ export function holdBrowser(handle: BrowserHandle): void {
 	handle.refCount++;
 }
 
-export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
+export async function releaseBrowser(
+	handle: BrowserHandle,
+	opts: { kill: boolean; signal?: AbortSignal },
+): Promise<void> {
+	opts.signal?.throwIfAborted();
 	handle.refCount = Math.max(0, handle.refCount - 1);
 	if (handle.refCount === 0) {
 		browsers.delete(handle.key);

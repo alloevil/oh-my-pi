@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { FileType, type GlobMatch, listWorkspace } from "@oh-my-pi/pi-natives";
 import { formatAge, formatBytes } from "@oh-my-pi/pi-utils";
+import type { FsBackend, GlobResult } from "./backend";
 
 /** Defaults for the workspace tree shown in the system prompt. */
 const WORKSPACE_DEFAULTS = {
@@ -43,6 +44,24 @@ export interface BuildWorkspaceTreeOptions {
 	timeoutMs?: number;
 }
 
+const BACKEND_DIRECTORY_GLOB_LIMIT = 10_000;
+
+type TreeEntryType = "file" | "dir" | "symlink" | "other";
+
+interface TreeEntry {
+	path: string;
+	type: TreeEntryType;
+	size: number;
+	mtimeMs: number;
+}
+
+export interface BuildBackendDirectoryTreeOptions extends BuildDirectoryTreeOptions {
+	/** Session cwd used to scope backend glob results. */
+	cwd: string;
+	/** Abort the backend scan. */
+	signal?: AbortSignal;
+}
+
 /**
  * Build a generic directory tree using a single native scan. Hidden files are
  * shown, .gitignore is not consulted, and the standard non-source directories
@@ -55,7 +74,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 	const perDirLimit = options.perDirLimit === undefined ? null : options.perDirLimit;
 	const rootLimit = options.rootLimit === undefined ? perDirLimit : options.rootLimit;
 
-	let entries: readonly GlobMatch[];
+	let entries: readonly TreeEntry[];
 	let nativeTruncated: boolean;
 	try {
 		const result = await listWorkspace({
@@ -64,7 +83,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 			hidden: true,
 			gitignore: false,
 		});
-		entries = result.entries;
+		entries = result.entries.map(nativeGlobMatchToTreeEntry);
 		nativeTruncated = result.truncated;
 	} catch {
 		return emptyTree(rootPath);
@@ -75,6 +94,53 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 		rootLimit,
 		lineCap: options.lineCap === undefined ? null : options.lineCap,
 		nativeTruncated,
+	});
+}
+
+/**
+ * Build a directory tree from the active backend rather than the local
+ * filesystem. Used by connected sessions, where `cwd` and `rootPath` belong to
+ * the remote backend and must not be probed locally.
+ */
+export async function buildBackendDirectoryTree(
+	rootPath: string,
+	fsBackend: Pick<FsBackend, "glob">,
+	options: BuildBackendDirectoryTreeOptions,
+): Promise<DirectoryTree> {
+	const resolvedRootPath = path.resolve(rootPath);
+	const maxDepth = options.maxDepth ?? 1;
+	const perDirLimit = options.perDirLimit === undefined ? null : options.perDirLimit;
+	const rootLimit = options.rootLimit === undefined ? perDirLimit : options.rootLimit;
+	const scopePath = relativeScopePath(options.cwd, resolvedRootPath);
+	const patterns = maxDepth <= 0 ? [] : boundedGlobPatterns(maxDepth + 1);
+
+	let result: GlobResult;
+	try {
+		result =
+			patterns.length === 0
+				? { entries: [], truncated: false }
+				: await fsBackend.glob({
+						patterns,
+						paths: [scopePath],
+						includeHidden: true,
+						gitignore: false,
+						limit: BACKEND_DIRECTORY_GLOB_LIMIT,
+						signal: options.signal,
+					});
+	} catch {
+		return emptyTree(resolvedRootPath);
+	}
+
+	const entries = result.entries
+		.map(entry => backendGlobEntryToTreeEntry(entry, options.cwd, resolvedRootPath, scopePath))
+		.map(entry => (entry === null ? null : capTreeEntryDepth(entry, maxDepth)))
+		.filter((entry): entry is TreeEntry => entry !== null);
+
+	return assembleTree(resolvedRootPath, entries, {
+		perDirLimit,
+		rootLimit,
+		lineCap: options.lineCap === undefined ? null : options.lineCap,
+		nativeTruncated: result.truncated,
 	});
 }
 
@@ -94,7 +160,7 @@ export async function buildWorkspaceTree(cwd: string, options: BuildWorkspaceTre
 			collectAgentsMd: true,
 			timeoutMs: options.timeoutMs,
 		});
-		const tree = assembleTree(rootPath, result.entries, {
+		const tree = assembleTree(rootPath, result.entries.map(nativeGlobMatchToTreeEntry), {
 			perDirLimit: WORKSPACE_DEFAULTS.perDirLimit,
 			rootLimit: WORKSPACE_DEFAULTS.perDirLimit,
 			lineCap: WORKSPACE_DEFAULTS.lineCap,
@@ -117,6 +183,8 @@ interface Node {
 	children: Node[];
 	/** When > 0, `children` is laid out as `[recent…, oldest]`. */
 	droppedCount: number;
+	/** Synthetic directory inferred from a backend that only returned files. */
+	synthetic: boolean;
 }
 
 interface RenderedLine {
@@ -134,24 +202,161 @@ interface AssembleOptions {
 	nativeTruncated: boolean;
 }
 
-function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: AssembleOptions): DirectoryTree {
+function nativeGlobMatchToTreeEntry(entry: GlobMatch): TreeEntry {
+	return {
+		path: entry.path,
+		type: entry.fileType === FileType.Dir ? "dir" : entry.fileType === FileType.Symlink ? "symlink" : "file",
+		size: entry.size ?? 0,
+		mtimeMs: entry.mtime ?? 0,
+	};
+}
+
+function relativeScopePath(cwd: string, rootPath: string): string {
+	const relative = path.relative(path.resolve(cwd), rootPath).replaceAll("\\", "/");
+	return relative.length === 0 ? "." : relative;
+}
+
+function boundedGlobPatterns(maxDepth: number): string[] {
+	const depth = Math.max(0, Math.floor(maxDepth));
+	const patterns: string[] = [];
+	for (let level = 1; level <= depth; level++) {
+		patterns.push(Array.from({ length: level }, () => "*").join("/"));
+	}
+	return patterns;
+}
+
+function normalizeTreePath(input: string): string | null {
+	const normalized = path.posix.normalize(input.replaceAll("\\", "/"));
+	const trimmed = normalized === "." ? "" : normalized.replace(/^\.\/+/, "").replace(/\/+$/, "");
+	if (!trimmed || trimmed === ".." || trimmed.startsWith("../") || path.posix.isAbsolute(trimmed)) return null;
+	return trimmed;
+}
+
+function backendGlobEntryToTreeEntry(
+	entry: GlobResult["entries"][number],
+	cwd: string,
+	rootPath: string,
+	scopePath: string,
+): TreeEntry | null {
+	const normalizedScope = normalizeTreePath(scopePath);
+	const normalizedEntry = entry.path.replaceAll("\\", "/").replace(/\/+$/, "");
+	let relativePath: string | null = null;
+
+	if (normalizedScope === null || normalizedScope === "") {
+		relativePath = normalizeTreePath(normalizedEntry);
+	} else if (normalizedEntry === normalizedScope) {
+		return null;
+	} else if (normalizedEntry.startsWith(`${normalizedScope}/`)) {
+		relativePath = normalizeTreePath(normalizedEntry.slice(normalizedScope.length + 1));
+	}
+
+	if (relativePath === null) {
+		relativePath = path.isAbsolute(entry.path) ? null : normalizeTreePath(normalizedEntry);
+	}
+
+	if (relativePath === null) {
+		const absoluteEntry = path.isAbsolute(entry.path) ? entry.path : path.resolve(cwd, entry.path);
+		relativePath = normalizeTreePath(path.relative(rootPath, absoluteEntry));
+	}
+
+	if (relativePath === null) return null;
+	return {
+		path: relativePath,
+		type: entry.type,
+		size: entry.size,
+		mtimeMs: entry.modified,
+	};
+}
+
+function capTreeEntryDepth(entry: TreeEntry, maxDepth: number): TreeEntry | null {
+	if (maxDepth <= 0) return null;
+	const parts = entry.path.split("/");
+	if (parts.length <= maxDepth) return entry;
+	return {
+		path: parts.slice(0, maxDepth).join("/"),
+		type: "dir",
+		size: 0,
+		mtimeMs: entry.mtimeMs,
+	};
+}
+
+function createNode(
+	name: string,
+	isDir: boolean,
+	mtimeMs: number,
+	size: number,
+	depth: number,
+	synthetic: boolean,
+): Node {
+	return {
+		name,
+		isDir,
+		mtimeMs,
+		size,
+		depth,
+		children: [],
+		droppedCount: 0,
+		synthetic,
+	};
+}
+
+function upsertExplicitNode(nodesByPath: Map<string, Node>, entryPath: string, entry: TreeEntry): void {
+	const slash = entryPath.lastIndexOf("/");
+	const name = slash === -1 ? entryPath : entryPath.slice(slash + 1);
+	const depth = entryPath.split("/").length;
+	const isDir = entry.type === "dir";
+	const existing = nodesByPath.get(entryPath);
+	if (!existing) {
+		nodesByPath.set(entryPath, createNode(name, isDir, entry.mtimeMs, entry.size, depth, false));
+		return;
+	}
+
+	existing.synthetic = false;
+	existing.isDir = existing.isDir || isDir;
+	existing.mtimeMs = Math.max(existing.mtimeMs, entry.mtimeMs);
+	if (!isDir) existing.size = entry.size;
+}
+
+function ensureSyntheticDirectory(nodesByPath: Map<string, Node>, dirPath: string, childMtimeMs: number): void {
+	const existing = nodesByPath.get(dirPath);
+	if (existing) {
+		if (existing.synthetic) existing.mtimeMs = Math.max(existing.mtimeMs, childMtimeMs);
+		return;
+	}
+	const slash = dirPath.lastIndexOf("/");
+	const name = slash === -1 ? dirPath : dirPath.slice(slash + 1);
+	nodesByPath.set(dirPath, createNode(name, true, childMtimeMs, 0, dirPath.split("/").length, true));
+}
+
+function materializeTreeEntries(entries: readonly TreeEntry[]): Map<string, Node> {
+	const nodesByPath = new Map<string, Node>();
+	const normalizedEntries: Array<{ path: string; entry: TreeEntry }> = [];
+	for (const entry of entries) {
+		const entryPath = normalizeTreePath(entry.path);
+		if (entryPath === null) continue;
+		normalizedEntries.push({ path: entryPath, entry });
+		upsertExplicitNode(nodesByPath, entryPath, entry);
+	}
+
+	for (const { path: entryPath, entry } of normalizedEntries) {
+		const parts = entryPath.split("/");
+		for (let index = 1; index < parts.length; index++) {
+			ensureSyntheticDirectory(nodesByPath, parts.slice(0, index).join("/"), entry.mtimeMs);
+		}
+	}
+
+	return nodesByPath;
+}
+
+function assembleTree(rootPath: string, entries: readonly TreeEntry[], opts: AssembleOptions): DirectoryTree {
 	// Bucket entries by parent path. The native walker may yield siblings in
 	// any order across worker threads, so we group by string key and sort once
 	// per directory below.
+	const nodesByPath = materializeTreeEntries(entries);
 	const byParent = new Map<string, Node[]>();
-	for (const entry of entries) {
-		const slash = entry.path.lastIndexOf("/");
-		const name = slash === -1 ? entry.path : entry.path.slice(slash + 1);
-		const parentPath = slash === -1 ? "" : entry.path.slice(0, slash);
-		const node: Node = {
-			name,
-			isDir: entry.fileType === FileType.Dir,
-			mtimeMs: entry.mtime ?? 0,
-			size: entry.size ?? 0,
-			depth: parentPath ? parentPath.split("/").length + 1 : 1,
-			children: [],
-			droppedCount: 0,
-		};
+	for (const [entryPath, node] of nodesByPath) {
+		const slash = entryPath.lastIndexOf("/");
+		const parentPath = slash === -1 ? "" : entryPath.slice(0, slash);
 		const bucket = byParent.get(parentPath);
 		if (bucket) bucket.push(node);
 		else byParent.set(parentPath, [node]);
@@ -165,6 +370,7 @@ function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: Ass
 		depth: 0,
 		children: [],
 		droppedCount: 0,
+		synthetic: false,
 	};
 
 	let truncated = opts.nativeTruncated;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
+import { LocalBackend } from "../../src/backend";
 import type { PlanModeState } from "../../src/plan-mode/state";
 import type { ToolSession } from "../../src/tools";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../src/tools/plan-mode-guard";
@@ -18,6 +19,7 @@ function makeSession(overrides: SessionOverrides): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: overrides.cwd ?? "/repo" }),
 		settings: {
 			getPlansDirectory: () => "/plans",
 		},

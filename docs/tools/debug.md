@@ -121,18 +121,17 @@ Side-channel artifacts outside the model tool result:
 3. `launch` and `attach` resolve cwd/program paths, select an adapter in `packages/coding-agent/src/dap/config.ts`, then delegate to `dapSessionManager.launch()` / `.attach()`.
 4. `DapSessionManager.launch()` / `.attach()` enforce the single-session rule with `#ensureLaunchSlot()`, spawn the adapter through `DapClient.spawn()`, register listeners, send `initialize`, cache capabilities, start listening for an initial stop event before sending `launch`/`attach`, then complete the `initialized` → `configurationDone` handshake in `#completeConfigurationHandshake()`.
 5. `DapClient.spawn()` starts the adapter detached with `NON_INTERACTIVE_ENV`. Most adapters use stdio; socket-mode adapters (`dlv`) use `#spawnSocketUnix()` on Linux or `#spawnSocketClientAddr()` on macOS/other.
-6. `#registerSession()` in `packages/coding-agent/src/dap/session.ts` installs reverse-request handlers:
-   - `runInTerminal`: spawns the requested debuggee command detached via `ptree.spawn()` and returns `{ processId }`
-   - `startDebugging`: logs the child-session request and returns `{}`; it does not create nested sessions
-   - events: `output`, `initialized`, `stopped`, `continued`, `exited`, `terminated` update cached session state
-7. Operational actions (`set_breakpoint`, `evaluate`, `threads`, `read_memory`, `custom_request`, and similar) call `dapSessionManager` methods. Most flow through `#sendRequestWithConfig()`, which first sends `configurationDone` when required, then sends the DAP request, then updates `lastUsedAt`.
-8. Breakpoint actions maintain local cached breakpoint sets in `DapSessionManager` and remap adapter responses back onto those cached records.
-9. `continue` and the three step actions clear cached stop state, subscribe for `stopped`/`terminated`/`exited` before sending the DAP request, then `#awaitStopOutcome()` either returns the new stopped location or reports that the program is still running after timeout.
-10. `pause` sends DAP `pause`, waits for a stopped event if needed, and reuses cached stop state if the program was already stopped.
-11. `stack_trace`, `scopes`, `variables`, and `evaluate` default to the current stopped thread/frame when the caller omits ids and cached state is available.
-12. `output` reads the in-memory output ring from `DapSessionManager.getOutput()`. `terminate` sends `terminate` when supported, always attempts `disconnect`, marks the session terminated, and disposes the client.
-13. `sessions` reads the manager’s current map and formats all summaries. Although the manager stores a map, only one active session can exist because new launch/attach calls are blocked until the active one is terminated or cleaned up.
-14. The interactive selector in `packages/coding-agent/src/debug/index.ts` builds a `SelectList` of fixed values and dispatches each to a handler:
+6. The backend-routed agent-tool path does **not** support DAP reverse requests. `debug.ts` keeps `supportsRunInTerminalRequest` / `supportsStartDebuggingRequest` disabled and checks launch/attach configs for known reverse-request requirements before starting the adapter.
+7. Launch or attach requests that require `runInTerminal` or `startDebugging` fail closed with `this debug adapter requires reverse-request support which is not yet implemented`.
+8. If an adapter still sends a reverse request on this path, the DAP client returns an unsupported-request error response and the tool wraps that back into the same user-facing error.
+9. Operational actions (`set_breakpoint`, `evaluate`, `threads`, `read_memory`, `custom_request`, and similar) call `dapSessionManager` methods. Most flow through `#sendRequestWithConfig()`, which first sends `configurationDone` when required, then sends the DAP request, then updates `lastUsedAt`.
+10. Breakpoint actions maintain local cached breakpoint sets in `DapSessionManager` and remap adapter responses back onto those cached records.
+11. `continue` and the three step actions clear cached stop state, subscribe for `stopped`/`terminated`/`exited` before sending the DAP request, then `#awaitStopOutcome()` either returns the new stopped location or reports that the program is still running after timeout.
+12. `pause` sends DAP `pause`, waits for a stopped event if needed, and reuses cached stop state if the program was already stopped.
+13. `stack_trace`, `scopes`, `variables`, and `evaluate` default to the current stopped thread/frame when the caller omits ids and cached state is available.
+14. `output` reads the in-memory output ring from `DapSessionManager.getOutput()`. `terminate` sends `terminate` when supported, always attempts `disconnect`, marks the session terminated, and disposes the client.
+15. `sessions` reads the manager’s current map and formats all summaries. Although the manager stores a map, only one active session can exist because new launch/attach calls are blocked until the active one is terminated or cleaned up.
+16. The interactive selector in `packages/coding-agent/src/debug/index.ts` builds a `SelectList` of fixed values and dispatches each to a handler:
    - `performance`: `startCpuProfile()`, wait for Enter/Escape, stop profiling, read a 30-second work profile with `getWorkProfile(30)`, then bundle via `createReportBundle()`
    - `work`: read `getWorkProfile(30)`, write a temp SVG, open it externally
    - `dump`: create a report bundle immediately
@@ -200,7 +199,6 @@ Side-channel artifacts outside the model tool result:
   - Remote attach may connect through the adapter to a remote debug port.
 - Subprocesses / native bindings
   - Spawns debugger adapters (`gdb`, `lldb-dap`, `python -m debugpy.adapter`, `dlv`, and others from `defaults.json`) detached.
-  - Reverse DAP `runInTerminal` requests spawn the debuggee detached via `ptree.spawn()`.
   - `getWorkProfile(30)` comes from `@oh-my-pi/pi-natives`.
   - CPU profiling uses `node:inspector/promises`; heap snapshots use `Bun.generateHeapSnapshot("v8")`; raw/log viewers sanitize text via `@oh-my-pi/pi-natives`.
   - `openPath()` launches the OS default file/browser handler for artifact dirs and SVGs.
@@ -275,7 +273,7 @@ Side-channel artifacts outside the model tool result:
 ## Notes
 - `packages/coding-agent/src/prompts/tools/debug.md` tells the model only one active session is supported; that is not advisory, it is enforced in code.
 - `configurationDone` is sent automatically both during launch/attach handshake and lazily before later requests if the adapter required it and the initial handshake did not complete.
-- `startDebugging` reverse requests are acknowledged but not implemented; child debug sessions are not spawned.
+- Reverse DAP requests are unsupported on the backend-routed tool path. Requests that need `runInTerminal` or `startDebugging` fail before launch when detectable; unexpected adapter-originated reverse requests receive an unsupported error response.
 - `output` exposes the merged `output` event stream only; the tool does not distinguish stdout, stderr, and console categories.
 - Session summaries expose `needsConfigurationDone`; this is derived from adapter capabilities and whether `configurationDone` has been sent.
 - Source breakpoint file paths are normalized with `path.resolve()` before caching and sending to the adapter.

@@ -3,20 +3,19 @@ import path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
+import type { Backend, JsonRpcChannel } from "../backend/backend";
+import type { LspConfig as BackendLspConfig, LspStatus as BackendLspStatus } from "../backend/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
-import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
+import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
-	ensureFileOpen,
 	getActiveClients,
 	getOrCreateClient,
 	type LspServerStatus,
 	notifySaved,
-	refreshFile,
-	sendNotification,
 	sendRequest,
 	setIdleTimeout,
 	syncContent,
@@ -39,9 +38,11 @@ import {
 	type LocationLink,
 	type LspClient,
 	type LspParams,
+	type LspServerCapabilities,
 	type LspToolDetails,
 	lspSchema,
 	type Position,
+	type PublishDiagnosticsParams,
 	type PublishedDiagnostics,
 	type ServerConfig,
 	type SymbolInformation,
@@ -51,6 +52,7 @@ import {
 import {
 	applyCodeAction,
 	dedupeWorkspaceSymbols,
+	detectLanguageId,
 	extractHoverText,
 	fileToUri,
 	filterWorkspaceSymbols,
@@ -273,6 +275,24 @@ const SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS = 3000;
 const BATCH_DIAGNOSTICS_WAIT_TIMEOUT_MS = 400;
 const MAX_GLOB_DIAGNOSTIC_TARGETS = 20;
 const WORKSPACE_SYMBOL_LIMIT = 200;
+const CONNECTED_LSP_UNAVAILABLE_MESSAGE =
+	"LSP is unavailable in connected sessions because remote path/root/sync/diagnostic behavior is not safe yet.";
+const CONNECTED_LSP_WRITETHROUGH_DISABLED_SUMMARY = "LSP disabled for connected session";
+const CONNECTED_LSP_WRITETHROUGH_DISABLED_MESSAGE =
+	"LSP format/diagnostics skipped: connected sessions do not yet have trustworthy remote LSP state.";
+
+function isRemoteBackend(backend?: Pick<Backend, "kind">): boolean {
+	return backend?.kind === "remote";
+}
+
+function connectedLspDisabledDiagnostics(): FileDiagnosticsResult {
+	return {
+		server: "LSP",
+		messages: [CONNECTED_LSP_WRITETHROUGH_DISABLED_MESSAGE],
+		summary: CONNECTED_LSP_WRITETHROUGH_DISABLED_SUMMARY,
+		errored: false,
+	};
+}
 
 function limitDiagnosticMessages(messages: string[]): string[] {
 	if (messages.length <= DIAGNOSTIC_MESSAGE_LIMIT) {
@@ -381,7 +401,48 @@ function isMethodNotFoundError(err: unknown): boolean {
 	);
 }
 
-async function reloadServer(client: LspClient, serverName: string, signal?: AbortSignal): Promise<string> {
+function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
+	return (
+		err instanceof ToolAbortError || signal?.aborted === true || (err instanceof Error && err.name === "AbortError")
+	);
+}
+
+function formatLspOperationError(
+	serverName: string,
+	method: string,
+	filePath: string,
+	cwd: string,
+	err: unknown,
+): string {
+	const message = err instanceof Error ? err.message : String(err);
+	return `${serverName} ${method} failed for ${formatPathRelativeToCwd(filePath, cwd)}: ${message}`;
+}
+
+function describeActionMethod(action: LspParams["action"]): string | null {
+	switch (action) {
+		case "hover":
+			return "textDocument/hover";
+		case "definition":
+			return "textDocument/definition";
+		case "implementation":
+			return "textDocument/implementation";
+		case "type_definition":
+			return "textDocument/typeDefinition";
+		case "references":
+			return "textDocument/references";
+		case "code_actions":
+			return "textDocument/codeAction";
+		case "symbols":
+			return "textDocument/documentSymbol";
+		case "rename":
+			return "textDocument/rename";
+		case "reload":
+			return "workspace/didChangeConfiguration";
+		default:
+			return null;
+	}
+}
+async function _reloadServer(client: LspClient, serverName: string, signal?: AbortSignal): Promise<string> {
 	let output = `Restarted ${serverName}`;
 	const reloadMethods = ["rust-analyzer/reloadWorkspace", "workspace/didChangeConfiguration"];
 	for (const method of reloadMethods) {
@@ -452,6 +513,449 @@ async function waitForDiagnostics(
 		return [];
 	}
 	return getAcceptedDiagnostics(client.diagnostics.get(uri), expectedDocumentVersion, allowUnversioned) ?? [];
+}
+
+interface ToolLspChannelState {
+	diagnostics: Map<string, PublishedDiagnostics>;
+	diagnosticsVersion: number;
+	openFiles: Map<string, { version: number; languageId: string }>;
+	activeProgressTokens: Set<string | number>;
+}
+
+type LegacyBackendLspCapabilities = {
+	capabilities?: NonNullable<BackendLspStatus["capabilities"]>;
+};
+
+function isLspServerCapabilities(value: unknown): value is LspServerCapabilities {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isLegacyBackendLspCapabilities(value: unknown): value is LegacyBackendLspCapabilities {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"capabilities" in value &&
+		(value.capabilities === undefined || isLspServerCapabilities(value.capabilities))
+	);
+}
+
+type BackendDiagnosticsPayload =
+	| BackendLspStatus["diagnostics"]
+	| Map<string, PublishedDiagnostics>
+	| Record<string, Diagnostic[] | PublishedDiagnostics>
+	| Array<{ uri: string; diagnostics: Diagnostic[]; version?: number | null }>;
+
+type BackendPublishedDiagnosticsEntry = { uri: string; diagnostics: Diagnostic[]; version?: number | null };
+
+type BackendOpenFilesPayload =
+	| BackendLspStatus["openFiles"]
+	| Array<{ uri: string; version?: number; languageId?: string; language_id?: string }>;
+
+interface BackendLspRuntimeStatus {
+	capabilities?: NonNullable<BackendLspStatus["capabilities"]> | LegacyBackendLspCapabilities;
+	projectLoaded?: BackendLspStatus["projectLoaded"];
+	project_loaded?: BackendLspStatus["projectLoaded"];
+	openFiles?: BackendOpenFilesPayload;
+	open_files?: BackendOpenFilesPayload;
+	diagnostics?: BackendDiagnosticsPayload;
+	diagnosticCache?: BackendDiagnosticsPayload;
+	diagnostic_cache?: BackendDiagnosticsPayload;
+}
+
+const PROJECT_LOAD_NOTIFICATION_GRACE_MS = 250;
+
+function getBackendLspCapabilities(
+	status: BackendLspRuntimeStatus | null,
+): NonNullable<BackendLspStatus["capabilities"]> | null {
+	const capabilities = status?.capabilities;
+	if (!capabilities) return null;
+	if (isLegacyBackendLspCapabilities(capabilities)) {
+		return capabilities.capabilities ?? null;
+	}
+	return isLspServerCapabilities(capabilities) ? capabilities : null;
+}
+
+function getBackendProjectLoaded(status: BackendLspRuntimeStatus | null): boolean | null {
+	return status?.projectLoaded ?? status?.project_loaded ?? null;
+}
+
+function getBackendOpenFilesCount(status: BackendLspRuntimeStatus | null): number | null {
+	const raw = status?.openFiles ?? status?.open_files;
+	return raw?.length ?? null;
+}
+
+function toPublishedDiagnostics(
+	value: Diagnostic[] | PublishedDiagnostics | BackendPublishedDiagnosticsEntry | undefined,
+): PublishedDiagnostics | null {
+	if (!value) {
+		return null;
+	}
+	if (Array.isArray(value)) {
+		return {
+			diagnostics: value,
+			version: null,
+		};
+	}
+	return {
+		diagnostics: value.diagnostics,
+		version: value.version ?? null,
+	};
+}
+
+function getBackendDiagnosticsPayload(status: BackendLspRuntimeStatus | null): BackendDiagnosticsPayload | null {
+	return status?.diagnostics ?? status?.diagnosticCache ?? status?.diagnostic_cache ?? null;
+}
+
+function getBackendDiagnostics(status: BackendLspRuntimeStatus | null): Map<string, PublishedDiagnostics> {
+	const diagnostics = new Map<string, PublishedDiagnostics>();
+	const raw = getBackendDiagnosticsPayload(status);
+	if (!raw) return diagnostics;
+	if (Array.isArray(raw)) {
+		for (const entry of raw) {
+			const published = toPublishedDiagnostics(entry);
+			if (published) diagnostics.set(entry.uri, published);
+		}
+		return diagnostics;
+	}
+	if (raw instanceof Map) {
+		for (const [uri, value] of raw) {
+			const published = toPublishedDiagnostics(value);
+			if (published) diagnostics.set(uri, published);
+		}
+		return diagnostics;
+	}
+	for (const [uri, value] of Object.entries(raw)) {
+		const published = toPublishedDiagnostics(value);
+		if (published) diagnostics.set(uri, published);
+	}
+	return diagnostics;
+}
+
+function getBackendDiagnosticsForUri(status: BackendLspRuntimeStatus | null, uri: string): Diagnostic[] | null {
+	const raw = getBackendDiagnosticsPayload(status);
+	if (!raw) return null;
+	if (Array.isArray(raw)) {
+		for (const entry of raw) {
+			if (entry.uri === uri) {
+				return entry.diagnostics;
+			}
+		}
+		return null;
+	}
+	if (raw instanceof Map) {
+		return toPublishedDiagnostics(raw.get(uri))?.diagnostics ?? null;
+	}
+	return toPublishedDiagnostics(raw[uri])?.diagnostics ?? null;
+}
+
+function getBackendOpenFiles(
+	status: BackendLspRuntimeStatus | null,
+): Map<string, { version: number; languageId: string }> {
+	const openFiles = new Map<string, { version: number; languageId: string }>();
+	const raw = status?.openFiles ?? status?.open_files;
+	if (!raw) return openFiles;
+	for (const entry of raw) {
+		if (typeof entry === "string") {
+			openFiles.set(entry, {
+				version: 1,
+				languageId: detectLanguageId(uriToFile(entry)),
+			});
+			continue;
+		}
+		openFiles.set(entry.uri, {
+			version: entry.version ?? 1,
+			languageId: entry.languageId ?? entry.language_id ?? detectLanguageId(uriToFile(entry.uri)),
+		});
+	}
+	return openFiles;
+}
+
+async function getBackendLspRuntimeStatus(
+	backend: Backend,
+	serverName: string,
+): Promise<BackendLspRuntimeStatus | null> {
+	return await backend.lsp.get(serverName);
+}
+
+function createToolLspChannelState(seed?: {
+	diagnostics?: Iterable<[string, PublishedDiagnostics]>;
+	openFiles?: Iterable<[string, { version: number; languageId: string }]>;
+	activeProgressTokens?: Iterable<string | number>;
+}): ToolLspChannelState {
+	const diagnostics = seed?.diagnostics ? Array.from(seed.diagnostics) : [];
+	return {
+		diagnostics: new Map(diagnostics),
+		diagnosticsVersion: diagnostics.length,
+		openFiles: new Map(seed?.openFiles),
+		activeProgressTokens: new Set(seed?.activeProgressTokens),
+	};
+}
+function mergeBackendLspRuntimeStatusIntoState(
+	state: ToolLspChannelState,
+	status: BackendLspRuntimeStatus | null,
+): void {
+	for (const [uri, published] of getBackendDiagnostics(status)) {
+		state.diagnostics.set(uri, published);
+	}
+	state.diagnosticsVersion = Math.max(state.diagnosticsVersion, state.diagnostics.size);
+	for (const [uri, openFile] of getBackendOpenFiles(status)) {
+		state.openFiles.set(uri, openFile);
+	}
+}
+
+function handleToolLspNotification(state: ToolLspChannelState, method: string, params: unknown): void {
+	if (method === "textDocument/publishDiagnostics" && params && typeof params === "object") {
+		const published = params as PublishDiagnosticsParams;
+		if (typeof published.uri === "string" && Array.isArray(published.diagnostics)) {
+			state.diagnostics.set(published.uri, {
+				diagnostics: published.diagnostics,
+				version: typeof published.version === "number" ? published.version : null,
+			});
+			state.diagnosticsVersion += 1;
+		}
+		return;
+	}
+
+	if (method !== "$/progress" || !params || typeof params !== "object") {
+		return;
+	}
+
+	const progress = params as { token?: unknown; value?: { kind?: unknown } };
+	if ((typeof progress.token !== "string" && typeof progress.token !== "number") || !progress.value) {
+		return;
+	}
+	if (progress.value.kind === "begin") {
+		state.activeProgressTokens.add(progress.token);
+	} else if (progress.value.kind === "end") {
+		state.activeProgressTokens.delete(progress.token);
+	}
+}
+
+function toBackendLspConfig(serverConfig: ServerConfig, cwd: string, signal?: AbortSignal): BackendLspConfig {
+	return {
+		kind: "lsp",
+		command: serverConfig.resolvedCommand ?? serverConfig.command,
+		args: serverConfig.args ?? [],
+		root_uri: fileToUri(cwd),
+		initialization_options: serverConfig.initOptions,
+		signal,
+	};
+}
+
+async function openToolLspChannel(
+	backend: Backend,
+	serverName: string,
+	serverConfig: ServerConfig,
+	cwd: string,
+	signal?: AbortSignal,
+	trackedOpenFiles?: Set<string>,
+): Promise<{ channel: JsonRpcChannel; state: ToolLspChannelState; close: () => Promise<void> }> {
+	await backend.lsp.put(serverName, toBackendLspConfig(serverConfig, cwd, signal));
+	const status = await getBackendLspRuntimeStatus(backend, serverName);
+	if (trackedOpenFiles && getBackendOpenFilesCount(status) === 0) {
+		trackedOpenFiles.clear();
+	}
+	const backendOpenFiles = getBackendOpenFiles(status);
+	const initialOpenFiles = new Set(backendOpenFiles.keys());
+	const openFiles = new Map(backendOpenFiles);
+	if (trackedOpenFiles) {
+		for (const uri of trackedOpenFiles) {
+			if (openFiles.has(uri)) continue;
+			openFiles.set(uri, {
+				version: 1,
+				languageId: detectLanguageId(uriToFile(uri)),
+			});
+		}
+	}
+	const channel = await backend.lsp.openChannel(serverName, { signal });
+	const state = createToolLspChannelState({
+		diagnostics: getBackendDiagnostics(status),
+		openFiles,
+	});
+	const unsubscribe = channel.onNotification((method, params) => {
+		handleToolLspNotification(state, method, params);
+	});
+	mergeBackendLspRuntimeStatusIntoState(state, await getBackendLspRuntimeStatus(backend, serverName));
+	return {
+		channel,
+		state,
+		close: async () => {
+			unsubscribe();
+			const urisToClose = Array.from(state.openFiles.keys()).filter(uri => !initialOpenFiles.has(uri));
+			try {
+				for (const uri of urisToClose) {
+					channel.notify("textDocument/didClose", {
+						textDocument: { uri },
+					});
+				}
+			} finally {
+				for (const uri of urisToClose) {
+					trackedOpenFiles?.delete(uri);
+					state.openFiles.delete(uri);
+				}
+				await channel.close();
+			}
+		},
+	};
+}
+
+async function readLspToolFileText(backend: Backend, filePath: string): Promise<string> {
+	const { bytes } = await backend.fs.readBlob(filePath);
+	return new TextDecoder().decode(bytes);
+}
+
+function isBackendNotFoundError(err: unknown): boolean {
+	if (typeof err !== "object" || err === null) return false;
+	if ("code" in err && (err as { code?: unknown }).code === "ENOENT") return true;
+	if (err instanceof Error) {
+		return err.message.includes("ENOENT") || err.message.includes("not found");
+	}
+	return false;
+}
+
+async function ensureToolFileOpen(
+	backend: Backend,
+	channel: JsonRpcChannel,
+	state: ToolLspChannelState,
+	filePath: string,
+	signal?: AbortSignal,
+	trackedOpenFiles?: Set<string>,
+): Promise<void> {
+	throwIfAborted(signal);
+	const uri = fileToUri(filePath);
+	if (state.openFiles.has(uri)) {
+		return;
+	}
+
+	let content: string;
+	try {
+		content = await readLspToolFileText(backend, filePath);
+	} catch (err) {
+		if (isBackendNotFoundError(err)) return;
+		throw err;
+	}
+
+	const languageId = detectLanguageId(filePath);
+	channel.notify("textDocument/didOpen", {
+		textDocument: {
+			uri,
+			languageId,
+			version: 1,
+			text: content,
+		},
+	});
+	state.openFiles.set(uri, { version: 1, languageId });
+	trackedOpenFiles?.add(uri);
+}
+
+async function refreshToolFile(
+	backend: Backend,
+	channel: JsonRpcChannel,
+	state: ToolLspChannelState,
+	filePath: string,
+	signal?: AbortSignal,
+	trackedOpenFiles?: Set<string>,
+): Promise<void> {
+	throwIfAborted(signal);
+	const uri = fileToUri(filePath);
+	state.diagnostics.delete(uri);
+	const openFile = state.openFiles.get(uri);
+	if (!openFile) {
+		await ensureToolFileOpen(backend, channel, state, filePath, signal, trackedOpenFiles);
+		return;
+	}
+
+	let content: string;
+	try {
+		content = await readLspToolFileText(backend, filePath);
+	} catch (err) {
+		if (isBackendNotFoundError(err)) return;
+		throw err;
+	}
+
+	const version = openFile.version + 1;
+	openFile.version = version;
+	channel.notify("textDocument/didChange", {
+		textDocument: { uri, version },
+		contentChanges: [{ text: content }],
+	});
+	channel.notify("textDocument/didSave", {
+		textDocument: { uri },
+		text: content,
+	});
+	trackedOpenFiles?.add(uri);
+}
+
+async function waitForToolProjectLoaded(
+	backend: Backend,
+	serverName: string,
+	state: ToolLspChannelState,
+	signal?: AbortSignal,
+): Promise<void> {
+	for (;;) {
+		throwIfAborted(signal);
+		const status = await getBackendLspRuntimeStatus(backend, serverName);
+		const projectLoaded = getBackendProjectLoaded(status);
+		if (projectLoaded === true) {
+			return;
+		}
+		if (projectLoaded !== false) {
+			break;
+		}
+		await Bun.sleep(100);
+	}
+
+	const graceDeadline = Date.now() + PROJECT_LOAD_NOTIFICATION_GRACE_MS;
+	while (state.activeProgressTokens.size === 0 && Date.now() < graceDeadline) {
+		throwIfAborted(signal);
+		await Bun.sleep(25);
+	}
+	while (state.activeProgressTokens.size > 0) {
+		throwIfAborted(signal);
+		await Bun.sleep(100);
+	}
+}
+
+async function waitForToolDiagnostics(
+	state: ToolLspChannelState,
+	uri: string,
+	options: WaitForDiagnosticsOptions = {},
+): Promise<Diagnostic[]> {
+	const { timeoutMs = 3000, signal, minVersion, expectedDocumentVersion, allowUnversioned = true } = options;
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		throwIfAborted(signal);
+		const versionOk = minVersion === undefined || state.diagnosticsVersion > minVersion;
+		const diagnostics = getAcceptedDiagnostics(state.diagnostics.get(uri), expectedDocumentVersion, allowUnversioned);
+		if (diagnostics !== undefined && versionOk) {
+			return diagnostics;
+		}
+		await Bun.sleep(100);
+	}
+	const versionOk = minVersion === undefined || state.diagnosticsVersion > minVersion;
+	if (!versionOk) {
+		return [];
+	}
+	return getAcceptedDiagnostics(state.diagnostics.get(uri), expectedDocumentVersion, allowUnversioned) ?? [];
+}
+
+async function reloadServerViaChannel(
+	channel: JsonRpcChannel,
+	serverName: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	let output = `Restarted ${serverName}`;
+	const reloadMethods = ["rust-analyzer/reloadWorkspace", "workspace/didChangeConfiguration"];
+	for (const method of reloadMethods) {
+		try {
+			await channel.request(method, method.includes("Configuration") ? { settings: {} } : null, { signal });
+			output = `Reloaded ${serverName}`;
+			break;
+		} catch {
+			// Method not supported, try next
+		}
+	}
+	return output;
 }
 
 /** Project type detection result */
@@ -720,6 +1224,7 @@ const DEFAULT_FORMAT_OPTIONS = {
  * @param content - Content to format
  * @param cwd - Working directory for LSP config resolution
  * @param servers - Servers to try formatting with
+ * @param backend - Optional backend handle for routed LSP formatting
  * @returns Formatted content, or original if no formatter available
  */
 async function formatContent(
@@ -728,12 +1233,15 @@ async function formatContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	backend?: Backend,
 ): Promise<string> {
 	if (servers.length === 0) {
 		return content;
 	}
 
 	const uri = fileToUri(absolutePath);
+	const languageId = detectLanguageId(absolutePath);
+	const formatterErrors: string[] = [];
 
 	for (const [serverName, serverConfig] of servers) {
 		try {
@@ -744,33 +1252,73 @@ async function formatContent(
 				return await linterClient.format(absolutePath, content);
 			}
 
-			// Default: use LSP
-			const client = await getOrCreateClient(serverConfig, cwd);
-			throwIfAborted(signal);
-
-			const caps = client.serverCapabilities;
-			if (!caps?.documentFormattingProvider) {
-				continue;
+			if (!backend) {
+				throw new Error(
+					"LSP writethrough formatting requires a backend; pass session.backend to createLspWritethrough().",
+				);
 			}
 
-			// Request formatting (content already synced)
-			const edits = (await sendRequest(
-				client,
-				"textDocument/formatting",
-				{
-					textDocument: { uri },
-					options: DEFAULT_FORMAT_OPTIONS,
-				},
-				signal,
-			)) as TextEdit[] | null;
+			const lsp = await openToolLspChannel(backend, serverName, serverConfig, cwd, signal);
+			let opened = false;
+			try {
+				throwIfAborted(signal);
+				const caps = getBackendLspCapabilities(await getBackendLspRuntimeStatus(backend, serverName));
+				if (caps?.documentFormattingProvider === false) {
+					continue;
+				}
 
-			if (!edits || edits.length === 0) {
-				return content;
+				lsp.channel.notify("textDocument/didOpen", {
+					textDocument: {
+						uri,
+						languageId,
+						version: 1,
+						text: content,
+					},
+				});
+				opened = true;
+
+				const edits = (await lsp.channel.request(
+					"textDocument/formatting",
+					{
+						textDocument: { uri },
+						options: DEFAULT_FORMAT_OPTIONS,
+					},
+					{ signal },
+				)) as TextEdit[] | null;
+
+				if (!edits || edits.length === 0) {
+					return content;
+				}
+
+				return applyTextEditsToString(content, edits);
+			} catch (err) {
+				if (isAbortLikeError(err, signal)) {
+					throw err;
+				}
+				if (isMethodNotFoundError(err)) {
+					continue;
+				}
+				formatterErrors.push(
+					formatLspOperationError(serverName, "textDocument/formatting", absolutePath, cwd, err),
+				);
+			} finally {
+				if (opened) {
+					lsp.channel.notify("textDocument/didClose", {
+						textDocument: { uri },
+					});
+				}
+				await lsp.close();
 			}
+		} catch (err) {
+			if (isAbortLikeError(err, signal)) {
+				throw err;
+			}
+			formatterErrors.push(formatLspOperationError(serverName, "textDocument/formatting", absolutePath, cwd, err));
+		}
+	}
 
-			// Apply edits in-memory and return
-			return applyTextEditsToString(content, edits);
-		} catch {}
+	if (formatterErrors.length > 0) {
+		throw new Error(formatterErrors.join("\n"));
 	}
 
 	return content;
@@ -842,20 +1390,27 @@ interface LspWritethroughBatchRequest {
 interface LspWritethroughBatchState {
 	entries: Map<string, PendingWritethrough>;
 	options: ResolvedWritethroughOptions;
+	backend?: Backend;
 }
 
 const writethroughBatches = new Map<string, LspWritethroughBatchState>();
 
-function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughOptions): LspWritethroughBatchState {
+function getOrCreateWritethroughBatch(
+	id: string,
+	options: ResolvedWritethroughOptions,
+	backend?: Backend,
+): LspWritethroughBatchState {
 	const existing = writethroughBatches.get(id);
 	if (existing) {
 		existing.options.enableFormat ||= options.enableFormat;
 		existing.options.enableDiagnostics ||= options.enableDiagnostics;
+		existing.backend ??= backend;
 		return existing;
 	}
 	const batch: LspWritethroughBatchState = {
 		entries: new Map<string, PendingWritethrough>(),
 		options: { ...options },
+		backend,
 	};
 	writethroughBatches.set(id, batch);
 	return batch;
@@ -871,7 +1426,7 @@ export async function flushLspWritethroughBatch(
 		return undefined;
 	}
 	writethroughBatches.delete(id);
-	return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal);
+	return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, state.backend, signal);
 }
 
 function summarizeDiagnosticMessages(messages: string[]): { summary: string; errored: boolean } {
@@ -980,6 +1535,7 @@ async function runLspWritethrough(
 	content: string,
 	cwd: string,
 	options: ResolvedWritethroughOptions,
+	backend: Backend | undefined,
 	signal?: AbortSignal,
 	file?: BunFile,
 	deferred?: {
@@ -1021,7 +1577,7 @@ async function runLspWritethrough(
 			if (useCustomFormatter) {
 				// Custom linters (e.g. Biome CLI) require on-disk input.
 				await writeContent(content);
-				finalContent = await formatContent(dst, content, cwd, customLinterServers, operationSignal);
+				finalContent = await formatContent(dst, content, cwd, customLinterServers, operationSignal, backend);
 				formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				await writeContent(finalContent);
 				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
@@ -1031,7 +1587,7 @@ async function runLspWritethrough(
 
 				// 2. Format in-memory via LSP
 				if (enableFormat) {
-					finalContent = await formatContent(dst, content, cwd, lspServers, operationSignal);
+					finalContent = await formatContent(dst, content, cwd, lspServers, operationSignal, backend);
 					formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				}
 
@@ -1098,6 +1654,7 @@ async function flushWritethroughBatch(
 	batch: PendingWritethrough[],
 	cwd: string,
 	options: ResolvedWritethroughOptions,
+	backend: Backend | undefined,
 	signal?: AbortSignal,
 	getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
@@ -1113,7 +1670,16 @@ async function flushWritethroughBatch(
 				onDeferredDiagnostics: bundle.onDeferredDiagnostics,
 				signal: bundle.signal,
 			} as const);
-		const diag = await runLspWritethrough(entry.dst, entry.content, cwd, options, signal, entry.file, deferredInner);
+		const diag = await runLspWritethrough(
+			entry.dst,
+			entry.content,
+			cwd,
+			options,
+			backend,
+			signal,
+			entry.file,
+			deferredInner,
+		);
 		bundle?.finalize(diag);
 		results.push(diag);
 	}
@@ -1121,13 +1687,32 @@ async function flushWritethroughBatch(
 }
 
 /** Create a writethrough callback for LSP aware write operations */
-export function createLspWritethrough(cwd: string, options?: WritethroughOptions): WritethroughCallback {
+export function createLspWritethrough(
+	cwd: string,
+	options?: WritethroughOptions,
+	backend?: Backend,
+): WritethroughCallback {
 	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 	};
 	if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
 		return writethroughNoop;
+	}
+	if (isRemoteBackend(backend)) {
+		return async (
+			dst: string,
+			content: string,
+			signal?: AbortSignal,
+			file?: BunFile,
+			_batch?: LspWritethroughBatchRequest,
+			getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
+		) => {
+			await writethroughNoop(dst, content, signal, file);
+			const diagnostics = connectedLspDisabledDiagnostics();
+			getDeferred?.(dst)?.finalize(diagnostics);
+			return diagnostics;
+		};
 	}
 	return async (
 		dst: string,
@@ -1145,12 +1730,21 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 					onDeferredDiagnostics: bundle.onDeferredDiagnostics,
 					signal: bundle.signal,
 				} as const);
-			const diagnostics = await runLspWritethrough(dst, content, cwd, resolvedOptions, signal, file, deferredInner);
+			const diagnostics = await runLspWritethrough(
+				dst,
+				content,
+				cwd,
+				resolvedOptions,
+				backend,
+				signal,
+				file,
+				deferredInner,
+			);
 			bundle?.finalize(diagnostics);
 			return diagnostics;
 		}
 
-		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
+		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions, backend);
 		state.entries.set(dst, { dst, content, file });
 
 		if (!batch.flush) {
@@ -1159,7 +1753,14 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		}
 
 		writethroughBatches.delete(batch.id);
-		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal, getDeferred);
+		return flushWritethroughBatch(
+			Array.from(state.entries.values()),
+			cwd,
+			state.options,
+			state.backend,
+			signal,
+			getDeferred,
+		);
 	};
 }
 
@@ -1178,13 +1779,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	readonly mergeCallAndResult = true;
 	readonly inline = true;
 	readonly strict = true;
+	private readonly openFiles = new Set<string>();
 
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(lspDescription);
 	}
 
 	static createIf(session: ToolSession): LspTool | null {
-		return session.enableLsp === false ? null : new LspTool(session);
+		return session.enableLsp === false || isRemoteBackend(session.backend) ? null : new LspTool(session);
 	}
 
 	async execute(
@@ -1199,8 +1801,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		throwIfAborted(signal);
+		if (isRemoteBackend(this.session.backend)) {
+			throw new ToolError(CONNECTED_LSP_UNAVAILABLE_MESSAGE);
+		}
 
 		const config = getConfig(this.session.cwd);
+		const backend = this.session.backend;
 
 		// Status action doesn't need a file
 		if (action === "status") {
@@ -1271,6 +1877,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				: Math.min(SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS, timeoutSec * 1000);
 			const results: string[] = [];
 			const allServerNames = new Set<string>();
+			let hadDiagnosticsFailure = false;
 			if (truncatedGlobTargets) {
 				results.push(
 					`${theme.status.warning} Pattern matched more than ${MAX_GLOB_DIAGNOSTIC_TARGETS} files; showing first ${MAX_GLOB_DIAGNOSTIC_TARGETS}. Narrow the glob or use workspace diagnostics.`,
@@ -1283,12 +1890,15 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				const servers = getServersForFile(config, resolved);
 				if (servers.length === 0) {
 					results.push(`${theme.status.error} ${target}: No language server found`);
+					hadDiagnosticsFailure = true;
 					continue;
 				}
 
 				const uri = fileToUri(resolved);
 				const relPath = formatPathRelativeToCwd(resolved, this.session.cwd);
 				const allDiagnostics: Diagnostic[] = [];
+				const successfulServers: string[] = [];
+				const serverFailures: string[] = [];
 
 				// Query all applicable servers for this file
 				for (const [serverName, serverConfig] of servers) {
@@ -1299,29 +1909,63 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							const linterClient = getLinterClient(serverName, serverConfig, this.session.cwd);
 							const diagnostics = await linterClient.lint(resolved);
 							allDiagnostics.push(...diagnostics);
+							successfulServers.push(serverName);
 							continue;
 						}
-						const client = await getOrCreateClient(serverConfig, this.session.cwd);
-						if (isProjectAwareLspServer(serverConfig)) {
-							await waitForProjectLoaded(client, signal);
-							throwIfAborted(signal);
-						}
-						const minVersion = client.diagnosticsVersion;
-						await refreshFile(client, resolved, signal);
-						const expectedDocumentVersion = client.openFiles.get(uri)?.version;
-						const diagnostics = await waitForDiagnostics(client, uri, {
-							timeoutMs: diagnosticsWaitTimeoutMs,
+						const lsp = await openToolLspChannel(
+							backend,
+							serverName,
+							serverConfig,
+							this.session.cwd,
 							signal,
-							minVersion,
-							expectedDocumentVersion,
-						});
-						allDiagnostics.push(...diagnostics);
+							this.openFiles,
+						);
+						try {
+							if (isProjectAwareLspServer(serverConfig)) {
+								await waitForToolProjectLoaded(backend, serverName, lsp.state, signal);
+								throwIfAborted(signal);
+							}
+							const minVersion = lsp.state.diagnosticsVersion;
+							await refreshToolFile(backend, lsp.channel, lsp.state, resolved, signal, this.openFiles);
+							const expectedDocumentVersion = lsp.state.openFiles.get(uri)?.version;
+							const diagnostics = await waitForToolDiagnostics(lsp.state, uri, {
+								timeoutMs: diagnosticsWaitTimeoutMs,
+								signal,
+								minVersion,
+								expectedDocumentVersion,
+							});
+							allDiagnostics.push(...diagnostics);
+							successfulServers.push(serverName);
+						} finally {
+							await lsp.close();
+						}
 					} catch (err) {
-						if (err instanceof ToolAbortError || signal?.aborted) {
+						if (isAbortLikeError(err, signal)) {
 							throw err;
 						}
-						// Server failed, continue with others
+						serverFailures.push(
+							formatLspOperationError(serverName, "textDocument/diagnostic", resolved, this.session.cwd, err),
+						);
 					}
+				}
+
+				if (successfulServers.length === 0) {
+					hadDiagnosticsFailure = true;
+					const failureText = serverFailures.join("\n");
+					if (!detailed && targets.length === 1) {
+						return {
+							content: [{ type: "text", text: failureText }],
+							details: {
+								action,
+								serverName: Array.from(allServerNames).join(", "),
+								success: false,
+								request: params,
+							},
+						};
+					}
+					results.push(`${theme.status.error} ${relPath}: diagnostics failed`);
+					results.push(failureText);
+					continue;
 				}
 
 				// Deduplicate diagnostics
@@ -1366,7 +2010,11 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 			return {
 				content: [{ type: "text", text: results.join("\n") }],
-				details: { action, serverName: Array.from(allServerNames).join(", "), success: true },
+				details: {
+					action,
+					serverName: Array.from(allServerNames).join(", "),
+					success: !hadDiagnosticsFailure,
+				},
 			};
 		}
 
@@ -1452,63 +2100,125 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const respondingServers = new Set<string>();
 			const perServerEdits: Array<{ serverName: string; edit: WorkspaceEdit }> = [];
 			const serverNotes: string[] = [];
+			const activeServers: Array<{
+				serverName: string;
+				channel: JsonRpcChannel;
+				close: () => Promise<void>;
+			}> = [];
 
-			for (const [serverName, serverConfig] of servers) {
-				throwIfAborted(signal);
-				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd);
-					if (isProjectAwareLspServer(serverConfig)) {
-						await waitForProjectLoaded(client, signal);
+			try {
+				for (const [serverName, serverConfig] of servers) {
+					throwIfAborted(signal);
+					try {
+						const lsp = await openToolLspChannel(
+							backend,
+							serverName,
+							serverConfig,
+							this.session.cwd,
+							signal,
+							this.openFiles,
+						);
+						activeServers.push({ serverName, channel: lsp.channel, close: lsp.close });
+						if (isProjectAwareLspServer(serverConfig)) {
+							await waitForToolProjectLoaded(backend, serverName, lsp.state, signal);
+						}
+						const result = (await lsp.channel.request("workspace/willRenameFiles", lspParams, {
+							signal,
+						})) as WorkspaceEdit | null;
+						respondingServers.add(serverName);
+						if (result && (result.changes || result.documentChanges)) {
+							perServerEdits.push({ serverName, edit: result });
+						}
+					} catch (err) {
+						if (err instanceof ToolAbortError || signal?.aborted) {
+							throw err;
+						}
+						if (!isMethodNotFoundError(err)) {
+							const msg = err instanceof Error ? err.message : String(err);
+							serverNotes.push(`  ${serverName}: ${msg}`);
+						}
 					}
-					const result = (await sendRequest(
-						client,
-						"workspace/willRenameFiles",
-						lspParams,
-						signal,
-					)) as WorkspaceEdit | null;
-					respondingServers.add(serverName);
-					if (result && (result.changes || result.documentChanges)) {
-						perServerEdits.push({ serverName, edit: result });
+				}
+
+				const sourceLabel = formatPathRelativeToCwd(source, this.session.cwd);
+				const destLabel = formatPathRelativeToCwd(dest, this.session.cwd);
+				const fileCountLabel = sourceStat.isDirectory()
+					? `${pairs.length} file${pairs.length !== 1 ? "s" : ""} under ${sourceLabel}`
+					: sourceLabel;
+
+				const shouldApply = apply !== false;
+				if (!shouldApply) {
+					const lines: string[] = [];
+					lines.push(`Rename preview: ${fileCountLabel} → ${destLabel}`);
+					if (perServerEdits.length === 0) {
+						lines.push("  No LSP edits would be applied");
+					} else {
+						for (const { serverName, edit } of perServerEdits) {
+							const edits = formatWorkspaceEdit(edit, this.session.cwd);
+							if (edits.length === 0) continue;
+							lines.push(`  ${serverName}:`);
+							for (const e of edits) {
+								lines.push(`    ${e}`);
+							}
+						}
 					}
-				} catch (err) {
-					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
+					if (serverNotes.length > 0) {
+						lines.push("  Server notes:");
+						lines.push(...serverNotes);
 					}
-					if (!isMethodNotFoundError(err)) {
+					return {
+						content: [{ type: "text", text: lines.join("\n") }],
+						details: {
+							action,
+							serverName: Array.from(respondingServers).join(", "),
+							success: true,
+							request: params,
+						},
+					};
+				}
+
+				const summary: string[] = [];
+				for (const { serverName, edit } of perServerEdits) {
+					const applied = await applyWorkspaceEdit(edit, this.session.cwd);
+					if (applied.length > 0) {
+						summary.push(`  ${serverName}:`);
+						summary.push(...applied.map(line => `    ${line}`));
+					}
+				}
+
+				await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+				await fs.promises.rename(source, dest);
+				summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
+
+				for (const { serverName, channel } of activeServers) {
+					try {
+						for (const { oldUri } of pairs) {
+							if (!this.openFiles.has(oldUri)) {
+								continue;
+							}
+							channel.notify("textDocument/didClose", {
+								textDocument: { uri: oldUri },
+							});
+							this.openFiles.delete(oldUri);
+						}
+						channel.notify("workspace/didRenameFiles", lspParams);
+					} catch (err) {
+						if (err instanceof ToolAbortError || signal?.aborted) {
+							throw err;
+						}
 						const msg = err instanceof Error ? err.message : String(err);
 						serverNotes.push(`  ${serverName}: ${msg}`);
 					}
 				}
-			}
 
-			const sourceLabel = formatPathRelativeToCwd(source, this.session.cwd);
-			const destLabel = formatPathRelativeToCwd(dest, this.session.cwd);
-			const fileCountLabel = sourceStat.isDirectory()
-				? `${pairs.length} file${pairs.length !== 1 ? "s" : ""} under ${sourceLabel}`
-				: sourceLabel;
-
-			const shouldApply = apply !== false;
-			if (!shouldApply) {
-				const lines: string[] = [];
-				lines.push(`Rename preview: ${fileCountLabel} → ${destLabel}`);
-				if (perServerEdits.length === 0) {
-					lines.push("  No LSP edits would be applied");
-				} else {
-					for (const { serverName, edit } of perServerEdits) {
-						const edits = formatWorkspaceEdit(edit, this.session.cwd);
-						if (edits.length === 0) continue;
-						lines.push(`  ${serverName}:`);
-						for (const e of edits) {
-							lines.push(`    ${e}`);
-						}
-					}
-				}
 				if (serverNotes.length > 0) {
-					lines.push("  Server notes:");
-					lines.push(...serverNotes);
+					summary.push("  Server notes:");
+					summary.push(...serverNotes);
 				}
+
+				const header = `Renamed ${fileCountLabel} → ${destLabel}`;
 				return {
-					content: [{ type: "text", text: lines.join("\n") }],
+					content: [{ type: "text", text: `${header}\n${summary.join("\n")}` }],
 					details: {
 						action,
 						serverName: Array.from(respondingServers).join(", "),
@@ -1516,57 +2226,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						request: params,
 					},
 				};
+			} finally {
+				await Promise.allSettled(activeServers.map(server => server.close()));
 			}
-
-			const summary: string[] = [];
-			for (const { serverName, edit } of perServerEdits) {
-				const applied = await applyWorkspaceEdit(edit, this.session.cwd);
-				if (applied.length > 0) {
-					summary.push(`  ${serverName}:`);
-					summary.push(...applied.map(line => `    ${line}`));
-				}
-			}
-
-			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-			await fs.promises.rename(source, dest);
-			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
-
-			for (const [serverName, serverConfig] of servers) {
-				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd);
-					for (const { oldUri } of pairs) {
-						if (client.openFiles.has(oldUri)) {
-							await sendNotification(client, "textDocument/didClose", {
-								textDocument: { uri: oldUri },
-							});
-							client.openFiles.delete(oldUri);
-						}
-					}
-					await sendNotification(client, "workspace/didRenameFiles", lspParams);
-				} catch (err) {
-					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
-					}
-					const msg = err instanceof Error ? err.message : String(err);
-					serverNotes.push(`  ${serverName}: ${msg}`);
-				}
-			}
-
-			if (serverNotes.length > 0) {
-				summary.push("  Server notes:");
-				summary.push(...serverNotes);
-			}
-
-			const header = `Renamed ${fileCountLabel} → ${destLabel}`;
-			return {
-				content: [{ type: "text", text: `${header}\n${summary.join("\n")}` }],
-				details: {
-					action,
-					serverName: Array.from(respondingServers).join(", "),
-					success: true,
-					request: params,
-				},
-			};
 		}
 
 		if (action === "capabilities") {
@@ -1596,11 +2258,26 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [serverName, serverConfig] of serverList) {
 				throwIfAborted(signal);
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd);
-					respondingServers.add(serverName);
-					const caps = client.serverCapabilities ?? {};
-					sections.push(`${serverName}:`);
-					sections.push(`  capabilities: ${JSON.stringify(caps, null, 2).split("\n").join("\n  ")}`);
+					const lsp = await openToolLspChannel(
+						backend,
+						serverName,
+						serverConfig,
+						this.session.cwd,
+						signal,
+						this.openFiles,
+					);
+					try {
+						respondingServers.add(serverName);
+						const caps = getBackendLspCapabilities(await getBackendLspRuntimeStatus(backend, serverName));
+						sections.push(`${serverName}:`);
+						sections.push(
+							`  capabilities: ${JSON.stringify(caps ?? null, null, 2)
+								.split("\n")
+								.join("\n  ")}`,
+						);
+					} finally {
+						await lsp.close();
+					}
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
 						throw err;
@@ -1682,21 +2359,32 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 
 			try {
-				const client = await getOrCreateClient(chosenConfig, this.session.cwd);
-				if (resolvedTarget) {
-					await ensureFileOpen(client, resolvedTarget, signal);
+				const lsp = await openToolLspChannel(
+					backend,
+					chosenName,
+					chosenConfig,
+					this.session.cwd,
+					signal,
+					this.openFiles,
+				);
+				try {
+					if (resolvedTarget) {
+						await ensureToolFileOpen(backend, lsp.channel, lsp.state, resolvedTarget, signal, this.openFiles);
+					}
+					const result = await lsp.channel.request(method, requestParams, { signal });
+					const formatted =
+						result === null || result === undefined
+							? "null"
+							: typeof result === "string"
+								? result
+								: JSON.stringify(result, null, 2);
+					return {
+						content: [{ type: "text", text: `${chosenName} ← ${method}:\n${formatted}` }],
+						details: { action, serverName: chosenName, success: true, request: params },
+					};
+				} finally {
+					await lsp.close();
 				}
-				const result = await sendRequest(client, method, requestParams, signal);
-				const formatted =
-					result === null || result === undefined
-						? "null"
-						: typeof result === "string"
-							? result
-							: JSON.stringify(result, null, 2);
-				return {
-					content: [{ type: "text", text: `${chosenName} ← ${method}:\n${formatted}` }],
-					details: { action, serverName: chosenName, success: true, request: params },
-				};
 			} catch (err) {
 				if (err instanceof ToolAbortError || signal?.aborted) {
 					throw new ToolAbortError();
@@ -1746,18 +2434,28 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const workspaceClient = await getOrCreateClient(workspaceServerConfig, this.session.cwd);
-					const workspaceResult = (await sendRequest(
-						workspaceClient,
-						"workspace/symbol",
-						{ query: normalizedQuery },
+					const lsp = await openToolLspChannel(
+						backend,
+						workspaceServerName,
+						workspaceServerConfig,
+						this.session.cwd,
 						signal,
-					)) as SymbolInformation[] | null;
-					if (!workspaceResult || workspaceResult.length === 0) {
-						continue;
+						this.openFiles,
+					);
+					try {
+						const workspaceResult = (await lsp.channel.request(
+							"workspace/symbol",
+							{ query: normalizedQuery },
+							{ signal },
+						)) as SymbolInformation[] | null;
+						if (!workspaceResult || workspaceResult.length === 0) {
+							continue;
+						}
+						respondingServers.add(workspaceServerName);
+						aggregatedSymbols.push(...filterWorkspaceSymbols(workspaceResult, normalizedQuery));
+					} finally {
+						await lsp.close();
 					}
-					respondingServers.add(workspaceServerName);
-					aggregatedSymbols.push(...filterWorkspaceSymbols(workspaceResult, normalizedQuery));
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
 						throw err;
@@ -1810,8 +2508,19 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const workspaceClient = await getOrCreateClient(workspaceServerConfig, this.session.cwd);
-					outputs.push(await reloadServer(workspaceClient, workspaceServerName, signal));
+					const lsp = await openToolLspChannel(
+						backend,
+						workspaceServerName,
+						workspaceServerConfig,
+						this.session.cwd,
+						signal,
+						this.openFiles,
+					);
+					try {
+						outputs.push(await reloadServerViaChannel(lsp.channel, workspaceServerName, signal));
+					} finally {
+						await lsp.close();
+					}
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
 						throw err;
@@ -1837,341 +2546,356 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		const [serverName, serverConfig] = serverInfo;
 
 		try {
-			const client = await getOrCreateClient(serverConfig, this.session.cwd);
-			const targetFile = resolvedFile;
+			const lsp = await openToolLspChannel(
+				backend,
+				serverName,
+				serverConfig,
+				this.session.cwd,
+				signal,
+				this.openFiles,
+			);
+			try {
+				const targetFile = resolvedFile;
 
-			if (targetFile) {
-				await ensureFileOpen(client, targetFile, signal);
-			}
-
-			const uri = targetFile ? fileToUri(targetFile) : "";
-			const resolvedLine = line ?? 1;
-			const resolvedCharacter = targetFile ? await resolveSymbolColumn(targetFile, resolvedLine, symbol) : 0;
-			const position = { line: resolvedLine - 1, character: resolvedCharacter };
-
-			let output: string;
-
-			// Wait for project loading to complete before cross-file operations
-			// to ensure the server has indexed all project files.
-			const crossFileActions = new Set(["definition", "type_definition", "implementation", "references", "rename"]);
-			if (crossFileActions.has(action)) {
-				await waitForProjectLoaded(client, signal);
-			}
-
-			switch (action) {
-				// =====================================================================
-				// Standard LSP Operations
-				// =====================================================================
-
-				case "definition": {
-					const result = (await sendRequest(
-						client,
-						"textDocument/definition",
-						{
-							textDocument: { uri },
-							position,
-						},
-						signal,
-					)) as Location | Location[] | LocationLink | LocationLink[] | null;
-
-					const locations = normalizeLocationResult(result);
-
-					if (locations.length === 0) {
-						output = "No definition found";
-					} else {
-						const lines = await Promise.all(
-							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
-						);
-						output = `Found ${locations.length} definition(s):\n${lines.join("\n")}`;
-					}
-					break;
+				if (targetFile) {
+					await ensureToolFileOpen(backend, lsp.channel, lsp.state, targetFile, signal, this.openFiles);
 				}
 
-				case "type_definition": {
-					const result = (await sendRequest(
-						client,
-						"textDocument/typeDefinition",
-						{
-							textDocument: { uri },
-							position,
-						},
-						signal,
-					)) as Location | Location[] | LocationLink | LocationLink[] | null;
+				const uri = targetFile ? fileToUri(targetFile) : "";
+				const resolvedLine = line ?? 1;
+				const resolvedCharacter = targetFile ? await resolveSymbolColumn(targetFile, resolvedLine, symbol) : 0;
+				const position = { line: resolvedLine - 1, character: resolvedCharacter };
 
-					const locations = normalizeLocationResult(result);
+				let output: string;
 
-					if (locations.length === 0) {
-						output = "No type definition found";
-					} else {
-						const lines = await Promise.all(
-							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
-						);
-						output = `Found ${locations.length} type definition(s):\n${lines.join("\n")}`;
-					}
-					break;
+				const crossFileActions = new Set([
+					"definition",
+					"type_definition",
+					"implementation",
+					"references",
+					"rename",
+				]);
+				if (crossFileActions.has(action)) {
+					await waitForToolProjectLoaded(backend, serverName, lsp.state, signal);
 				}
 
-				case "implementation": {
-					const result = (await sendRequest(
-						client,
-						"textDocument/implementation",
-						{
-							textDocument: { uri },
-							position,
-						},
-						signal,
-					)) as Location | Location[] | LocationLink | LocationLink[] | null;
-
-					const locations = normalizeLocationResult(result);
-
-					if (locations.length === 0) {
-						output = "No implementation found";
-					} else {
-						const lines = await Promise.all(
-							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
-						);
-						output = `Found ${locations.length} implementation(s):\n${lines.join("\n")}`;
-					}
-					break;
-				}
-				case "references": {
-					let result: Location[] | null = null;
-					for (let attempt = 0; attempt <= REFERENCES_RETRY_COUNT; attempt++) {
-						result = (await sendRequest(
-							client,
-							"textDocument/references",
+				switch (action) {
+					case "definition": {
+						const result = (await lsp.channel.request(
+							"textDocument/definition",
 							{
 								textDocument: { uri },
 								position,
-								context: { includeDeclaration: true },
 							},
-							signal,
-						)) as Location[] | null;
+							{ signal },
+						)) as Location | Location[] | LocationLink | LocationLink[] | null;
 
-						const locations = result ?? [];
-						if (!isProjectAwareLspServer(serverConfig) || attempt === REFERENCES_RETRY_COUNT) {
-							break;
-						}
-						if (locations.length > 0 && !isOnlyQueriedDeclaration(locations, uri, position)) {
-							break;
-						}
-
-						await waitForProjectLoaded(client, signal);
-						throwIfAborted(signal);
-						await untilAborted(signal, () => Bun.sleep(REFERENCES_RETRY_DELAY_MS));
-					}
-
-					if (!result || result.length === 0) {
-						output = "No references found";
-					} else {
-						const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
-						const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
-						const contextualLines = await Promise.all(
-							contextualReferences.map(location => formatLocationWithContext(location, this.session.cwd)),
-						);
-						const plainLines = plainReferences.map(location => `  ${formatLocation(location, this.session.cwd)}`);
-						const lines = plainLines.length
-							? [
-									...contextualLines,
-									`  ... ${plainLines.length} additional reference(s) shown without context`,
-									...plainLines,
-								]
-							: contextualLines;
-						output = `Found ${result.length} reference(s):\n${lines.join("\n")}`;
-					}
-					break;
-				}
-
-				case "hover": {
-					const result = (await sendRequest(
-						client,
-						"textDocument/hover",
-						{
-							textDocument: { uri },
-							position,
-						},
-						signal,
-					)) as Hover | null;
-
-					if (!result?.contents) {
-						output = "No hover information";
-					} else {
-						output = extractHoverText(result.contents);
-					}
-					break;
-				}
-
-				case "code_actions": {
-					const diagnostics = client.diagnostics.get(uri)?.diagnostics ?? [];
-					const context: CodeActionContext = {
-						diagnostics,
-						only: !apply && query ? [query] : undefined,
-						triggerKind: 1,
-					};
-
-					const result = (await sendRequest(
-						client,
-						"textDocument/codeAction",
-						{
-							textDocument: { uri },
-							range: { start: position, end: position },
-							context,
-						},
-						signal,
-					)) as (CodeAction | Command)[] | null;
-
-					if (!result || result.length === 0) {
-						output = "No code actions available";
-						break;
-					}
-
-					if (apply === true && query) {
-						const normalizedQuery = query.trim();
-						if (normalizedQuery.length === 0) {
-							output = "Error: query parameter required when apply=true for code_actions";
-							break;
-						}
-						const parsedIndex = /^\d+$/.test(normalizedQuery) ? Number.parseInt(normalizedQuery, 10) : null;
-						const selectedAction = result.find(
-							(actionItem, index) =>
-								(parsedIndex !== null && index === parsedIndex) ||
-								actionItem.title.toLowerCase().includes(normalizedQuery.toLowerCase()),
-						);
-
-						if (!selectedAction) {
-							const actionLines = result.map((actionItem, index) => `  ${formatCodeAction(actionItem, index)}`);
-							output = `No code action matches "${normalizedQuery}". Available actions:\n${actionLines.join("\n")}`;
-							break;
-						}
-
-						const appliedAction = await applyCodeAction(selectedAction, {
-							resolveCodeAction: async actionItem =>
-								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd),
-							executeCommand: async commandItem => {
-								await sendRequest(
-									client,
-									"workspace/executeCommand",
-									{
-										command: commandItem.command,
-										arguments: commandItem.arguments ?? [],
-									},
-									signal,
-								);
-							},
-						});
-
-						if (!appliedAction) {
-							output = `Action "${selectedAction.title}" has no workspace edit or command to apply`;
-							break;
-						}
-
-						const summaryLines: string[] = [];
-						if (appliedAction.edits.length > 0) {
-							summaryLines.push("  Workspace edit:");
-							summaryLines.push(...appliedAction.edits.map(item => `    ${item}`));
-						}
-						if (appliedAction.executedCommands.length > 0) {
-							summaryLines.push("  Executed command(s):");
-							summaryLines.push(...appliedAction.executedCommands.map(commandName => `    ${commandName}`));
-						}
-
-						output = `Applied "${appliedAction.title}":\n${summaryLines.join("\n")}`;
-						break;
-					}
-
-					const actionLines = result.map((actionItem, index) => `  ${formatCodeAction(actionItem, index)}`);
-					output = `${result.length} code action(s):\n${actionLines.join("\n")}`;
-					break;
-				}
-				case "symbols": {
-					if (!targetFile) {
-						output = "Error: file parameter required for document symbols";
-						break;
-					}
-					// File-based document symbols
-					const result = (await sendRequest(
-						client,
-						"textDocument/documentSymbol",
-						{
-							textDocument: { uri },
-						},
-						signal,
-					)) as (DocumentSymbol | SymbolInformation)[] | null;
-
-					if (!result || result.length === 0) {
-						output = "No symbols found";
-					} else {
-						const relPath = formatPathRelativeToCwd(targetFile, this.session.cwd);
-						if ("selectionRange" in result[0]) {
-							const lines = (result as DocumentSymbol[]).flatMap(s => formatDocumentSymbol(s));
-							output = `Symbols in ${relPath}:\n${lines.join("\n")}`;
+						const locations = normalizeLocationResult(result);
+						if (locations.length === 0) {
+							output = "No definition found";
 						} else {
-							const lines = (result as SymbolInformation[]).map(s => {
-								const line = s.location.range.start.line + 1;
-								const icon = symbolKindToIcon(s.kind);
-								return `${icon} ${s.name} @ line ${line}`;
-							});
-							output = `Symbols in ${relPath}:\n${lines.join("\n")}`;
+							const lines = await Promise.all(
+								locations.map(location => formatLocationWithContext(location, this.session.cwd)),
+							);
+							output = `Found ${locations.length} definition(s):\n${lines.join("\n")}`;
 						}
+						break;
 					}
-					break;
-				}
 
-				case "rename": {
-					if (!new_name) {
-						return {
-							content: [{ type: "text", text: "Error: new_name parameter required for rename" }],
-							details: { action, serverName, success: false },
+					case "type_definition": {
+						const result = (await lsp.channel.request(
+							"textDocument/typeDefinition",
+							{
+								textDocument: { uri },
+								position,
+							},
+							{ signal },
+						)) as Location | Location[] | LocationLink | LocationLink[] | null;
+
+						const locations = normalizeLocationResult(result);
+						if (locations.length === 0) {
+							output = "No type definition found";
+						} else {
+							const lines = await Promise.all(
+								locations.map(location => formatLocationWithContext(location, this.session.cwd)),
+							);
+							output = `Found ${locations.length} type definition(s):\n${lines.join("\n")}`;
+						}
+						break;
+					}
+
+					case "implementation": {
+						const result = (await lsp.channel.request(
+							"textDocument/implementation",
+							{
+								textDocument: { uri },
+								position,
+							},
+							{ signal },
+						)) as Location | Location[] | LocationLink | LocationLink[] | null;
+
+						const locations = normalizeLocationResult(result);
+						if (locations.length === 0) {
+							output = "No implementation found";
+						} else {
+							const lines = await Promise.all(
+								locations.map(location => formatLocationWithContext(location, this.session.cwd)),
+							);
+							output = `Found ${locations.length} implementation(s):\n${lines.join("\n")}`;
+						}
+						break;
+					}
+
+					case "references": {
+						let result: Location[] | null = null;
+						for (let attempt = 0; attempt <= REFERENCES_RETRY_COUNT; attempt++) {
+							result = (await lsp.channel.request(
+								"textDocument/references",
+								{
+									textDocument: { uri },
+									position,
+									context: { includeDeclaration: true },
+								},
+								{ signal },
+							)) as Location[] | null;
+
+							const locations = result ?? [];
+							if (!isProjectAwareLspServer(serverConfig) || attempt === REFERENCES_RETRY_COUNT) {
+								break;
+							}
+							if (locations.length > 0 && !isOnlyQueriedDeclaration(locations, uri, position)) {
+								break;
+							}
+
+							await waitForToolProjectLoaded(backend, serverName, lsp.state, signal);
+							throwIfAborted(signal);
+							await untilAborted(signal, () => Bun.sleep(REFERENCES_RETRY_DELAY_MS));
+						}
+
+						if (!result || result.length === 0) {
+							output = "No references found";
+						} else {
+							const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
+							const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
+							const contextualLines = await Promise.all(
+								contextualReferences.map(location => formatLocationWithContext(location, this.session.cwd)),
+							);
+							const plainLines = plainReferences.map(
+								location => `  ${formatLocation(location, this.session.cwd)}`,
+							);
+							const lines = plainLines.length
+								? [
+										...contextualLines,
+										`  ... ${plainLines.length} additional reference(s) shown without context`,
+										...plainLines,
+									]
+								: contextualLines;
+							output = `Found ${result.length} reference(s):\n${lines.join("\n")}`;
+						}
+						break;
+					}
+
+					case "hover": {
+						const result = (await lsp.channel.request(
+							"textDocument/hover",
+							{
+								textDocument: { uri },
+								position,
+							},
+							{ signal },
+						)) as Hover | null;
+
+						if (!result?.contents) {
+							output = "No hover information";
+						} else {
+							output = extractHoverText(result.contents);
+						}
+						break;
+					}
+
+					case "code_actions": {
+						const diagnostics =
+							getBackendDiagnosticsForUri(await getBackendLspRuntimeStatus(backend, serverName), uri) ??
+							lsp.state.diagnostics.get(uri)?.diagnostics ??
+							[];
+						const context: CodeActionContext = {
+							diagnostics,
+							only: !apply && query ? [query] : undefined,
+							triggerKind: 1,
 						};
-					}
 
-					const result = (await sendRequest(
-						client,
-						"textDocument/rename",
-						{
-							textDocument: { uri },
-							position,
-							newName: new_name,
-						},
-						signal,
-					)) as WorkspaceEdit | null;
+						const result = (await lsp.channel.request(
+							"textDocument/codeAction",
+							{
+								textDocument: { uri },
+								range: { start: position, end: position },
+								context,
+							},
+							{ signal },
+						)) as (CodeAction | Command)[] | null;
 
-					if (!result) {
-						output = "Rename returned no edits";
-					} else {
-						const shouldApply = apply !== false;
-						if (shouldApply) {
-							const applied = await applyWorkspaceEdit(result, this.session.cwd);
-							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
-						} else {
-							const preview = formatWorkspaceEdit(result, this.session.cwd);
-							output = `Rename preview:\n${preview.map(p => `  ${p}`).join("\n")}`;
+						if (!result || result.length === 0) {
+							output = "No code actions available";
+							break;
 						}
+
+						if (apply === true && query) {
+							const normalizedQuery = query.trim();
+							if (normalizedQuery.length === 0) {
+								output = "Error: query parameter required when apply=true for code_actions";
+								break;
+							}
+							const parsedIndex = /^\d+$/.test(normalizedQuery) ? Number.parseInt(normalizedQuery, 10) : null;
+							const selectedAction = result.find(
+								(actionItem, index) =>
+									(parsedIndex !== null && index === parsedIndex) ||
+									actionItem.title.toLowerCase().includes(normalizedQuery.toLowerCase()),
+							);
+
+							if (!selectedAction) {
+								const actionLines = result.map(
+									(actionItem, index) => `  ${formatCodeAction(actionItem, index)}`,
+								);
+								output = `No code action matches "${normalizedQuery}". Available actions:\n${actionLines.join("\n")}`;
+								break;
+							}
+
+							const appliedAction = await applyCodeAction(selectedAction, {
+								resolveCodeAction: async actionItem =>
+									(await lsp.channel.request("codeAction/resolve", actionItem, { signal })) as CodeAction,
+								applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd),
+								executeCommand: async commandItem => {
+									await lsp.channel.request(
+										"workspace/executeCommand",
+										{
+											command: commandItem.command,
+											arguments: commandItem.arguments ?? [],
+										},
+										{ signal },
+									);
+								},
+							});
+
+							if (!appliedAction) {
+								output = `Action "${selectedAction.title}" has no workspace edit or command to apply`;
+								break;
+							}
+
+							const summaryLines: string[] = [];
+							if (appliedAction.edits.length > 0) {
+								summaryLines.push("  Workspace edit:");
+								summaryLines.push(...appliedAction.edits.map(item => `    ${item}`));
+							}
+							if (appliedAction.executedCommands.length > 0) {
+								summaryLines.push("  Executed command(s):");
+								summaryLines.push(...appliedAction.executedCommands.map(commandName => `    ${commandName}`));
+							}
+
+							output = `Applied "${appliedAction.title}":\n${summaryLines.join("\n")}`;
+							break;
+						}
+
+						const actionLines = result.map((actionItem, index) => `  ${formatCodeAction(actionItem, index)}`);
+						output = `${result.length} code action(s):\n${actionLines.join("\n")}`;
+						break;
 					}
-					break;
+
+					case "symbols": {
+						if (!targetFile) {
+							output = "Error: file parameter required for document symbols";
+							break;
+						}
+						const result = (await lsp.channel.request(
+							"textDocument/documentSymbol",
+							{
+								textDocument: { uri },
+							},
+							{ signal },
+						)) as (DocumentSymbol | SymbolInformation)[] | null;
+
+						if (!result || result.length === 0) {
+							output = "No symbols found";
+						} else {
+							const relPath = formatPathRelativeToCwd(targetFile, this.session.cwd);
+							if ("selectionRange" in result[0]) {
+								const lines = (result as DocumentSymbol[]).flatMap(s => formatDocumentSymbol(s));
+								output = `Symbols in ${relPath}:\n${lines.join("\n")}`;
+							} else {
+								const lines = (result as SymbolInformation[]).map(s => {
+									const symbolLine = s.location.range.start.line + 1;
+									const icon = symbolKindToIcon(s.kind);
+									return `${icon} ${s.name} @ line ${symbolLine}`;
+								});
+								output = `Symbols in ${relPath}:\n${lines.join("\n")}`;
+							}
+						}
+						break;
+					}
+
+					case "rename": {
+						if (!new_name) {
+							return {
+								content: [{ type: "text", text: "Error: new_name parameter required for rename" }],
+								details: { action, serverName, success: false },
+							};
+						}
+
+						const result = (await lsp.channel.request(
+							"textDocument/rename",
+							{
+								textDocument: { uri },
+								position,
+								newName: new_name,
+							},
+							{ signal },
+						)) as WorkspaceEdit | null;
+
+						if (!result) {
+							output = "Rename returned no edits";
+						} else {
+							const shouldApply = apply !== false;
+							if (shouldApply) {
+								const applied = await applyWorkspaceEdit(result, this.session.cwd);
+								output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
+							} else {
+								const preview = formatWorkspaceEdit(result, this.session.cwd);
+								output = `Rename preview:\n${preview.map(p => `  ${p}`).join("\n")}`;
+							}
+						}
+						break;
+					}
+
+					case "reload": {
+						output = await reloadServerViaChannel(lsp.channel, serverName, signal);
+						break;
+					}
+
+					default:
+						output = `Unknown action: ${action}`;
 				}
 
-				case "reload": {
-					output = await reloadServer(client, serverName, signal);
-					break;
-				}
-
-				default:
-					output = `Unknown action: ${action}`;
+				return {
+					content: [{ type: "text", text: output }],
+					details: { serverName, action, success: true, request: params },
+				};
+			} finally {
+				await lsp.close();
 			}
-
-			return {
-				content: [{ type: "text", text: output }],
-				details: { serverName, action, success: true, request: params },
-			};
 		} catch (err) {
-			if (err instanceof ToolAbortError || signal?.aborted) {
+			if (isAbortLikeError(err, signal)) {
 				throw new ToolAbortError();
 			}
 			const errorMessage = err instanceof Error ? err.message : String(err);
+			const targetLabel = resolvedFile ? formatPathRelativeToCwd(resolvedFile, this.session.cwd) : "workspace";
+			const methodLabel = describeActionMethod(action);
+			const actionLabel = methodLabel ? `${action} (${methodLabel})` : action;
 			return {
-				content: [{ type: "text", text: `LSP error: ${errorMessage}` }],
+				content: [
+					{
+						type: "text",
+						text: `LSP error from ${serverName} on ${targetLabel} during ${actionLabel}: ${errorMessage}`,
+					},
+				],
 				details: { serverName, action, success: false, request: params },
 			};
 		}

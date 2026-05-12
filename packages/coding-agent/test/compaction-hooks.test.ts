@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -87,6 +88,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		const toolSession: ToolSession = {
 			cwd: tempDir,
 			hasUI: false,
+			backend: new LocalBackend({ cwd: tempDir }),
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated(),

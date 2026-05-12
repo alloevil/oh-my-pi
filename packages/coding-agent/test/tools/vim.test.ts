@@ -11,6 +11,7 @@ import { VimBuffer } from "@oh-my-pi/pi-coding-agent/vim/buffer";
 import { VimEngine } from "@oh-my-pi/pi-coding-agent/vim/engine";
 import { parseKeySequences } from "@oh-my-pi/pi-coding-agent/vim/parser";
 import type { TUI } from "@oh-my-pi/pi-tui";
+import { LocalBackend } from "../../src/backend";
 
 function textResult(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
@@ -25,6 +26,7 @@ function createSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolS
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd }),
 		settings: Settings.isolated({ "lsp.enabled": false }),
 		...overrides,
 	};

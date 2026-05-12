@@ -31,6 +31,8 @@ import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { sanitizeText } from "@oh-my-pi/pi-natives";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { LocalBackend } from "../../src/backend";
+import { Settings } from "../../src/config/settings";
 
 describe("lsp regressions", () => {
 	afterEach(() => {
@@ -337,6 +339,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 			};
 
@@ -356,7 +360,14 @@ describe("lsp regressions", () => {
 				client.diagnosticsVersion += 1;
 			}, 80);
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			const result = await tool.execute("diag-stale", {
 				action: "diagnostics",
 				file: targetFile,
@@ -455,6 +466,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 			};
 
@@ -490,7 +503,14 @@ describe("lsp regressions", () => {
 				notifications.push({ method, params });
 			});
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			const result = await tool.execute("rename-file-test", {
 				action: "rename_file",
 				file: sourceFile,
@@ -556,6 +576,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 			};
 
@@ -569,7 +591,14 @@ describe("lsp regressions", () => {
 			});
 			const notifySpy = vi.spyOn(lspClient, "sendNotification").mockResolvedValue();
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			await tool.execute("rename-file-preview", {
 				action: "rename_file",
 				file: sourceFile,
@@ -616,6 +645,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 			};
 
@@ -632,7 +663,14 @@ describe("lsp regressions", () => {
 			});
 			vi.spyOn(lspClient, "sendNotification").mockResolvedValue();
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			await tool.execute("rename-dir-test", {
 				action: "rename_file",
 				file: srcDir,
@@ -685,6 +723,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 			};
 
@@ -703,7 +743,14 @@ describe("lsp regressions", () => {
 				return { expansion: "macro_rules!" };
 			});
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			const result = await tool.execute("request-test", {
 				action: "request",
 				file: filePath,
@@ -754,6 +801,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 			};
 
@@ -769,7 +818,14 @@ describe("lsp regressions", () => {
 				return null;
 			});
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			await tool.execute("request-payload", {
 				action: "request",
 				query: "workspace/executeCommand",
@@ -811,6 +867,8 @@ describe("lsp regressions", () => {
 				writeQueue: Promise.resolve(),
 				activeProgressTokens: new Set(),
 				projectLoaded: Promise.resolve(),
+				projectLoadedResolved: true,
+				notificationHandlers: new Set(),
 				resolveProjectLoaded: () => {},
 				serverCapabilities: {
 					hoverProvider: true,
@@ -826,7 +884,14 @@ describe("lsp regressions", () => {
 			});
 			vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
 
-			const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+			const tool = new LspTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				backend: new LocalBackend({ cwd: tempDir.path() }),
+			} as ToolSession);
 			const result = await tool.execute("caps-test", {
 				action: "capabilities",
 				timeout: 5,

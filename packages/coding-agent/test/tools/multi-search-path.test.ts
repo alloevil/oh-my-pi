@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { resolveExplicitSearchPaths } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import { LocalBackend } from "../../src/backend";
 
 const isWindows = process.platform === "win32";
 
@@ -14,6 +15,7 @@ function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): T
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd }),
 		settings: Settings.isolated(),
 		...overrides,
 	};

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { LocalBackend } from "../../src/backend";
 import { Settings } from "../../src/config/settings";
 // Back-compat import check — these re-exports from mcp/discoverable-tool-metadata should still work
 import { buildDiscoverableMCPSearchIndex, type DiscoverableMCPTool } from "../../src/mcp/discoverable-tool-metadata";
@@ -39,6 +40,7 @@ function createSession(
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 		settings: Settings.isolated({ "mcp.discoveryMode": true }),
 		isMCPDiscoveryEnabled: () => true,
 		getDiscoverableMCPTools: () => tools.map(toLegacyMCP),

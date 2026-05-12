@@ -6,6 +6,7 @@ import * as url from "node:url";
 import * as zlib from "node:zlib";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -186,9 +187,11 @@ function createTestToolSession(
 ): ToolSession {
 	const sessionFile = path.join(cwd, "session.jsonl");
 	const sessionDir = path.join(cwd, "session");
+	const { backend = new LocalBackend({ cwd }), ...rest } = overrides;
 	return {
 		cwd,
 		hasUI: false,
+		backend,
 		getSessionFile: () => sessionFile,
 		getSessionSpawns: () => "*",
 		getArtifactsDir: () => sessionDir,
@@ -198,7 +201,7 @@ function createTestToolSession(
 			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
 		},
 		settings,
-		...overrides,
+		...rest,
 	};
 }
 

@@ -274,26 +274,10 @@ export function getPluginsLockfile(): string {
 	return path.join(getPluginsDir(), "omp-plugins.lock.json");
 }
 
-/** Get the remote mount directory (~/.omp/remote). */
-export function getRemoteDir(): string {
-	return dirs.rootSubdir("remote", "data");
-}
-
 /** Get the PR worktrees directory (~/.omp/wt). */
 export function getWorktreesDir(): string {
 	return dirs.rootSubdir("wt", "data");
 }
-
-/** Get the SSH control socket directory (~/.omp/ssh-control). */
-export function getSshControlDir(): string {
-	return dirs.rootSubdir("ssh-control", "state");
-}
-
-/** Get the remote host info directory (~/.omp/remote-host). */
-export function getRemoteHostDir(): string {
-	return dirs.rootSubdir("remote-host", "data");
-}
-
 /** Get the managed Python venv directory (~/.omp/python-env). */
 export function getPythonEnvDir(): string {
 	return dirs.rootSubdir("python-env", "data");

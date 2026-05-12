@@ -87,12 +87,24 @@ function validateNotebook(value: unknown, displayPath: string): NotebookDocument
 	return value as unknown as NotebookDocument;
 }
 
+export function parseNotebookDocumentText(text: string, displayPath: string): NotebookDocument {
+	try {
+		return validateNotebook(JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text), displayPath);
+	} catch (error) {
+		if (error instanceof SyntaxError) throw new Error(`Invalid JSON in notebook: ${displayPath}`);
+		throw error;
+	}
+}
+
+export function parseNotebookDocumentBytes(bytes: Uint8Array, displayPath: string): NotebookDocument {
+	return parseNotebookDocumentText(new TextDecoder().decode(bytes), displayPath);
+}
+
 export async function readNotebookDocument(absolutePath: string, displayPath: string): Promise<NotebookDocument> {
 	try {
-		return validateNotebook(await Bun.file(absolutePath).json(), displayPath);
+		return parseNotebookDocumentText(await Bun.file(absolutePath).text(), displayPath);
 	} catch (error) {
 		if (isEnoent(error)) throw new Error(`File not found: ${displayPath}`);
-		if (error instanceof SyntaxError) throw new Error(`Invalid JSON in notebook: ${displayPath}`);
 		throw error;
 	}
 }
@@ -200,6 +212,10 @@ export function applyNotebookEditableText(
 
 export async function readEditableNotebookText(absolutePath: string, displayPath: string): Promise<string> {
 	return notebookToEditableText(await readNotebookDocument(absolutePath, displayPath));
+}
+
+export function readEditableNotebookTextFromBytes(bytes: Uint8Array, displayPath: string): string {
+	return notebookToEditableText(parseNotebookDocumentBytes(bytes, displayPath));
 }
 
 export async function serializeEditedNotebookText(

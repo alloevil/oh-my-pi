@@ -81,6 +81,23 @@ pub struct ListWorkspaceResult {
 	pub truncated:       bool,
 }
 
+/// Rust-callable input options for the single-pass workspace startup scan.
+pub struct ListWorkspaceBlockingOptions {
+	/// Directory to scan.
+	pub path:              String,
+	/// Maximum depth for returned tree entries. Root children are depth 1.
+	pub max_depth:         u32,
+	/// Include hidden files and directories. Default: false.
+	pub hidden:            Option<bool>,
+	/// Respect .gitignore files. Default: true.
+	pub gitignore:         Option<bool>,
+	/// Also surface AGENTS.md files in directories at depth 1..=4. Default:
+	/// false.
+	pub collect_agents_md: Option<bool>,
+	/// Timeout in milliseconds for the operation.
+	pub timeout_ms:        Option<u32>,
+}
+
 struct WorkspaceConfig {
 	root:              PathBuf,
 	max_depth:         usize,
@@ -343,6 +360,30 @@ fn run_list_workspace(
 		agents_md_files,
 		truncated: entries_truncated || agents_md_truncated,
 	})
+}
+
+/// Rust-callable wrapper around the same scanner exported through N-API.
+pub fn list_workspace_blocking(
+	options: ListWorkspaceBlockingOptions,
+) -> Result<ListWorkspaceResult> {
+	let max_depth = options.max_depth as usize;
+	let collect_agents_md = options.collect_agents_md.unwrap_or(false);
+	let walk_max_depth = if collect_agents_md {
+		max_depth.max(AGENTS_MD_MAX_DEPTH)
+	} else {
+		max_depth
+	};
+	run_list_workspace(
+		WorkspaceConfig {
+			root: fs_cache::resolve_search_path(&options.path)?,
+			max_depth,
+			walk_max_depth,
+			include_hidden: options.hidden.unwrap_or(false),
+			use_gitignore: options.gitignore.unwrap_or(true),
+			collect_agents_md,
+		},
+		task::CancelToken::new(options.timeout_ms, None),
+	)
 }
 
 /// Walk the workspace once and return tree entries plus AGENTS.md candidates.

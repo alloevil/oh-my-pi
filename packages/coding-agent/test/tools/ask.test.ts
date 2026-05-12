@@ -5,6 +5,7 @@ import { getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AskTool, askToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/ask";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { LocalBackend } from "../../src/backend";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -12,6 +13,7 @@ function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 		settings: Settings.isolated(),
 		...overrides,
 	};

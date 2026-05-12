@@ -10,6 +10,7 @@ import { GithubTool } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { LocalBackend } from "../../src/backend";
 
 function createSession(
 	cwd: string = "/tmp/test",
@@ -32,6 +33,7 @@ function createSession(
 				}
 			: undefined,
 		getSessionSpawns: () => null,
+		backend: new LocalBackend({ cwd }),
 		settings,
 	};
 }

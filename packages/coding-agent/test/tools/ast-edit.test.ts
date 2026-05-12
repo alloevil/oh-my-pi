@@ -6,6 +6,7 @@ import { adaptSchemaForStrict } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 type InvokedToolResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -19,6 +20,7 @@ function createTestSession(cwd = "/tmp/test", overrides: Partial<ToolSession> = 
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd }),
 		settings: Settings.isolated(),
 		...overrides,
 	};
@@ -47,7 +49,7 @@ describe("ast_edit tool schema", () => {
 		const itemProperties = asSchemaObject(items.properties);
 		expect(asSchemaObject(itemProperties.pat).type).toBe("string");
 		expect(asSchemaObject(itemProperties.out).type).toBe("string");
-		expect(properties.preview).toBeUndefined();
+		expect(asSchemaObject(properties.preview).type).toBe("boolean");
 	});
 
 	it("remains strict-representable after strict adaptation", async () => {

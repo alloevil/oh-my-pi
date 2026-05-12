@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { LocalBackend } from "../../src/backend";
 import { Settings } from "../../src/config/settings";
 import type { ToolSession } from "../../src/tools/index";
 import {
@@ -10,7 +11,6 @@ import {
 	IrcTool,
 	JobTool,
 	RecipeTool,
-	SshTool,
 } from "../../src/tools/index";
 
 const allToolsSettings = Settings.isolated({
@@ -37,6 +37,7 @@ const allToolsSettings = Settings.isolated({
 const toolSession: ToolSession = {
 	cwd: "/tmp/test",
 	hasUI: false,
+	backend: new LocalBackend({ cwd: "/tmp/test" }),
 	getSessionFile: () => null,
 	getSessionSpawns: () => null,
 	settings: allToolsSettings,
@@ -50,7 +51,6 @@ async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summa
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),
-		new SshTool(toolSession, [], new Map(), ""),
 		new JobTool(toolSession),
 		new RecipeTool(toolSession, []),
 		new IrcTool(toolSession),

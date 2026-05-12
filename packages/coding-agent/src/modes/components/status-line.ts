@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatCount, getProjectDir } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
+import { formatCount } from "@oh-my-pi/pi-utils";
+import type { Backend, ShellBackend } from "../../backend";
 import { settings } from "../../config/settings";
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
@@ -21,6 +22,15 @@ import { getPreset } from "./status-line/presets";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
 import { getSeparator } from "./status-line/separators";
 import { calculateTokensPerSecond } from "./status-line/token-rate";
+
+function getBackendFromTool(tool: AgentTool | undefined, seen = new Set<AgentTool>()): Backend | undefined {
+	if (!tool || seen.has(tool)) return undefined;
+	seen.add(tool);
+	const session = (tool as { session?: { backend: Backend } }).session;
+	if (session) return session.backend;
+	const wrappedTool = (tool as { tool?: AgentTool }).tool;
+	return getBackendFromTool(wrappedTool, seen);
+}
 
 export interface StatusLineSegmentOptions {
 	model?: { showThinkingLevel?: boolean };
@@ -64,16 +74,22 @@ export class StatusLineComponent implements Component {
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
 	#gitStatusLastFetch = 0;
 	#gitStatusInFlight = false;
+	#branchLastFetch = 0;
+	#branchInFlight = false;
 
 	// PR lookup caching (invalidated on branch/repo context changes)
 	#cachedPr: { number: number; url: string } | null | undefined = undefined;
 	#cachedPrContext: PrCacheContext | undefined = undefined;
 	#prLookupInFlight = false;
 	#defaultBranch?: string;
+	#defaultBranchRepoId: string | null | undefined = undefined;
 	#lastTokensPerSecond: number | null = null;
 	#lastTokensPerSecondTimestamp: number | null = null;
+	#connectedSession: boolean;
+	#cachedShellBackend: ShellBackend | undefined = undefined;
 
 	constructor(private readonly session: AgentSession) {
+		this.#connectedSession = this.session.sessionManager.getConnectedSessionContext() !== undefined;
 		this.#settings = {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
@@ -128,7 +144,9 @@ export class StatusLineComponent implements Component {
 			this.#gitWatcher = null;
 		}
 
-		const gitHeadPath = git.repo.resolveSync(getProjectDir())?.headPath ?? null;
+		if (this.#isConnectedSession()) return;
+
+		const gitHeadPath = git.repo.resolveSync(this.#executionCwd())?.headPath ?? null;
 		if (!gitHeadPath) return;
 
 		try {
@@ -158,9 +176,39 @@ export class StatusLineComponent implements Component {
 		this.#cachedBranch = undefined;
 		this.#cachedBranchRepoId = undefined;
 		this.#cachedPrContext = undefined;
+		this.#defaultBranch = undefined;
+		this.#defaultBranchRepoId = undefined;
+		this.#branchLastFetch = 0;
 	}
-	#getCurrentBranch(): string | null {
-		const head = git.head.resolveSync(getProjectDir());
+
+	#executionCwd(): string {
+		return this.session.sessionManager.getCwd();
+	}
+
+	#isConnectedSession(): boolean {
+		return this.#connectedSession;
+	}
+
+	#shellBackend(): ShellBackend | undefined {
+		if (this.#cachedShellBackend) return this.#cachedShellBackend;
+		for (const name of this.session.getAllToolNames()) {
+			const backend = getBackendFromTool(this.session.getToolByName(name));
+			if (backend?.shell) {
+				this.#cachedShellBackend = backend.shell;
+				return backend.shell;
+			}
+		}
+		return undefined;
+	}
+
+	#gitOptions(): git.GitShellOptions | undefined {
+		if (!this.#isConnectedSession()) return undefined;
+		const shell = this.#shellBackend();
+		return shell ? { shell } : undefined;
+	}
+
+	#getLocalBranch(): string | null {
+		const head = git.head.resolveSync(this.#executionCwd());
 		const gitHeadPath = head?.headPath ?? null;
 		if (this.#cachedBranch !== undefined && this.#cachedBranchRepoId === gitHeadPath) {
 			return this.#cachedBranch;
@@ -177,16 +225,76 @@ export class StatusLineComponent implements Component {
 		return this.#cachedBranch ?? null;
 	}
 
-	#isDefaultBranch(branch: string): boolean {
-		if (this.#defaultBranch === undefined) {
-			this.#defaultBranch = "main";
-			(async () => {
-				const resolved = await git.branch.default(getProjectDir());
-				if (resolved) {
-					this.#defaultBranch = resolved;
+	#getAsyncBranch(): string | null {
+		const options = this.#gitOptions();
+		if (!options) {
+			this.#cachedBranch = null;
+			this.#cachedBranchRepoId = null;
+			this.#branchLastFetch = Date.now();
+			return null;
+		}
+
+		const staleBranch = this.#cachedBranch ?? null;
+		if (this.#branchInFlight || Date.now() - this.#branchLastFetch < 1000) {
+			return staleBranch;
+		}
+
+		this.#branchInFlight = true;
+		const cwd = this.#executionCwd();
+
+		(async () => {
+			try {
+				const head = await git.head.resolve(cwd, options);
+				if (this.#executionCwd() !== cwd) return;
+				this.#cachedBranchRepoId = head?.headPath ?? null;
+				this.#cachedBranch = head ? (head.kind === "ref" ? (head.branchName ?? head.ref) : "detached") : null;
+			} catch {
+				if (this.#executionCwd() !== cwd) return;
+				this.#cachedBranch = null;
+				this.#cachedBranchRepoId = null;
+			} finally {
+				if (this.#executionCwd() === cwd) {
+					this.#branchLastFetch = Date.now();
+					this.#branchInFlight = false;
 					if (this.#onBranchChange) {
 						this.#onBranchChange();
 					}
+				} else {
+					this.#branchInFlight = false;
+				}
+			}
+		})();
+
+		return staleBranch;
+	}
+
+	#getCurrentBranch(): string | null {
+		return this.#isConnectedSession() ? this.#getAsyncBranch() : this.#getLocalBranch();
+	}
+
+	#isDefaultBranch(branch: string): boolean {
+		const repoId = this.#cachedBranchRepoId ?? null;
+		if (this.#defaultBranchRepoId !== repoId) {
+			this.#defaultBranchRepoId = repoId;
+			this.#defaultBranch = undefined;
+		}
+		if (this.#defaultBranch === undefined) {
+			this.#defaultBranch = "main";
+			const cwd = this.#executionCwd();
+			const options = this.#gitOptions();
+			if (this.#isConnectedSession() && !options) return branch === this.#defaultBranch;
+			(async () => {
+				try {
+					const resolved = await git.branch.default(cwd, options);
+					if (this.#executionCwd() !== cwd || this.#defaultBranchRepoId !== repoId) return;
+					if (resolved) {
+						this.#defaultBranch = resolved;
+						if (this.#onBranchChange) {
+							this.#onBranchChange();
+						}
+					}
+				} catch {
+					// Keep the optimistic "main" default.
 				}
 			})();
 		}
@@ -199,14 +307,24 @@ export class StatusLineComponent implements Component {
 		}
 
 		this.#gitStatusInFlight = true;
+		const cwd = this.#executionCwd();
+		const options = this.#gitOptions();
+		if (this.#isConnectedSession() && !options) {
+			this.#cachedGitStatus = null;
+			this.#gitStatusLastFetch = Date.now();
+			this.#gitStatusInFlight = false;
+			return null;
+		}
 
 		(async () => {
 			try {
-				this.#cachedGitStatus = await git.status.summary(getProjectDir());
+				this.#cachedGitStatus = await git.status.summary(cwd, options);
 			} catch {
 				this.#cachedGitStatus = null;
 			} finally {
-				this.#gitStatusLastFetch = Date.now();
+				if (this.#executionCwd() === cwd) {
+					this.#gitStatusLastFetch = Date.now();
+				}
 				this.#gitStatusInFlight = false;
 			}
 		})();
@@ -231,6 +349,12 @@ export class StatusLineComponent implements Component {
 
 		this.#prLookupInFlight = true;
 		const lookupContext = currentContext;
+		const cwd = this.#executionCwd();
+		const options = this.#gitOptions();
+		if (this.#isConnectedSession() && !options) {
+			this.#prLookupInFlight = false;
+			return stalePr ?? null;
+		}
 
 		// Fire async lookup, keep stale value visible until resolved
 		(async () => {
@@ -247,12 +371,12 @@ export class StatusLineComponent implements Component {
 			};
 			try {
 				// Requires `gh repo set-default` to be configured; fails gracefully if not
-				const result = await $`gh pr view --json number,url`.quiet().nothrow();
+				const result = await git.github.run(cwd, ["pr", "view", "--json", "number,url"], undefined, options);
 				if (result.exitCode !== 0) {
 					setCachedPr(null);
 					return;
 				}
-				const pr = JSON.parse(result.stdout.toString()) as { number: number; url: string };
+				const pr = JSON.parse(result.stdout) as { number: number; url: string };
 				if (typeof pr.number === "number") {
 					setCachedPr({ number: pr.number, url: pr.url });
 				} else {

@@ -1,12 +1,14 @@
 import { Database } from "bun:sqlite";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
+import type { BunFile } from "bun";
+import type { Backend } from "../backend/backend";
+import type { StatResult } from "../backend/types";
 import { stripHashlinePrefixes } from "../edit";
+import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
@@ -43,12 +45,6 @@ import {
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
-async function loadFflate(): Promise<typeof import("fflate")> {
-	if (!fflateModulePromise) fflateModulePromise = import("fflate");
-	return fflateModulePromise;
-}
-
 const writeSchema = Type.Object({
 	path: Type.String({ description: "file path", examples: ["src/new.ts"] }),
 	content: Type.String({ description: "file content" }),
@@ -76,6 +72,56 @@ function stripWriteContent(session: ToolSession, content: string): { text: strin
 	const cleaned = stripHashlinePrefixes(lines);
 	if (cleaned === lines) return { text: content, stripped: false };
 	return { text: cleaned.join("\n"), stripped: true };
+}
+
+interface WriteSink {
+	write(content: string, options?: { signal?: AbortSignal }): Promise<number>;
+}
+
+type WriteSinkWritethrough = (
+	dst: string,
+	content: string,
+	signal?: AbortSignal,
+	file?: WriteSink,
+	batch?: Parameters<WritethroughCallback>[4],
+	getDeferred?: Parameters<WritethroughCallback>[5],
+) => Promise<FileDiagnosticsResult | undefined>;
+
+function createWriteSinkWritethrough(callback: WritethroughCallback): WriteSinkWritethrough {
+	return async (dst, content, signal, file, batch, getDeferred) => {
+		let proxyFile: BunFile | undefined;
+		if (file) {
+			proxyFile = Bun.file(dst);
+			Object.defineProperty(proxyFile, "write", {
+				value: (value: string) => file.write(value, { signal }),
+				configurable: true,
+			});
+		}
+		return callback(dst, content, signal, proxyFile, batch, getDeferred);
+	};
+}
+
+function createBackendWriteProxy(args: {
+	backend: Backend;
+	path: string;
+	displayPath: string;
+	ifMatch: string | undefined;
+	signal?: AbortSignal;
+	onWrite: (content: string, written: number) => void;
+}): WriteSink {
+	let currentIfMatch = args.ifMatch;
+	return {
+		async write(content: string, options?: { signal?: AbortSignal }): Promise<number> {
+			await statWriteTarget(args.backend, args.path, args.displayPath, options?.signal ?? args.signal);
+			const result = await args.backend.fs.writeLines(args.path, content, {
+				ifMatch: currentIfMatch,
+				signal: options?.signal ?? args.signal,
+			});
+			currentIfMatch = result.etag;
+			args.onWrite(content, result.written);
+			return result.written;
+		},
+	};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -153,6 +199,33 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 	return { table, key };
 }
 
+function createToolErrorWithCause(message: string, cause: unknown): ToolError {
+	const error = new ToolError(message);
+	Object.defineProperty(error, "cause", {
+		value: cause,
+		enumerable: false,
+		configurable: true,
+		writable: true,
+	});
+	return error;
+}
+function rejectSymlinkWriteTarget(stat: StatResult, displayPath: string): void {
+	if (stat.exists && stat.kind === "symlink") {
+		throw new ToolError(`Refusing to write through symlink target '${displayPath}'`);
+	}
+}
+
+async function statWriteTarget(
+	backend: Backend,
+	absolutePath: string,
+	displayPath: string,
+	signal?: AbortSignal,
+): Promise<StatResult> {
+	const stat = await backend.fs.stat(absolutePath, { followSymlinks: false, signal });
+	rejectSymlinkWriteTarget(stat, displayPath);
+	return stat;
+}
+
 /**
  * Write tool implementation.
  *
@@ -170,24 +243,27 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly summary = "Write content to a file (creates or overwrites)";
 	readonly intent = (args: Partial<WriteToolInput>) => (args.path ? `writing ${args.path}` : "writing");
 
-	readonly #writethrough: WritethroughCallback;
+	readonly #writethrough: WriteSinkWritethrough;
 
 	constructor(private readonly session: ToolSession) {
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
-			: writethroughNoop;
+			? createWriteSinkWritethrough(
+					createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }, session.backend),
+				)
+			: createWriteSinkWritethrough(writethroughNoop);
 		this.description = prompt.render(writeDescription);
 	}
 
-	async #resolveArchiveWritePath(writePath: string): Promise<ResolvedArchiveWritePath | null> {
+	async #resolveArchiveWritePath(writePath: string, signal?: AbortSignal): Promise<ResolvedArchiveWritePath | null> {
 		const candidates = parseArchivePathCandidates(writePath).filter(candidate => candidate.archivePath !== writePath);
 		if (candidates.length === 0) {
 			return null;
 		}
 
+		const backend = this.session.backend;
 		const fallbackCandidate = candidates[candidates.length - 1]!;
 		const fallback: ResolvedArchiveWritePath = {
 			absolutePath: resolvePlanPath(this.session, fallbackCandidate.archivePath),
@@ -199,8 +275,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		for (const candidate of candidates) {
 			const absolutePath = resolvePlanPath(this.session, candidate.archivePath);
 			try {
-				const stat = await Bun.file(absolutePath).stat();
-				if (stat.isDirectory()) {
+				const stat = await statWriteTarget(backend, absolutePath, candidate.archivePath, signal);
+				if (!stat.exists || stat.kind === "dir") {
 					continue;
 				}
 
@@ -223,86 +299,41 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #writeArchiveEntry(
 		content: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
+		signal?: AbortSignal,
 	): Promise<AgentToolResult<WriteToolDetails>> {
-		const isZip = resolvedArchivePath.absolutePath.toLowerCase().endsWith(".zip");
-
-		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
-		if (parentDir && parentDir !== ".") {
-			await fs.mkdir(parentDir, { recursive: true });
-		}
-
-		if (isZip) {
-			const zipEntries: Record<string, Uint8Array> = {};
-
-			if (resolvedArchivePath.exists) {
-				try {
-					const bytes = await Bun.file(resolvedArchivePath.absolutePath).bytes();
-					const { unzipSync } = await loadFflate();
-					const existing = unzipSync(new Uint8Array(bytes));
-					for (const [entryPath, data] of Object.entries(existing)) {
-						zipEntries[entryPath.replace(/\\/g, "/")] = data;
-					}
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
-			}
-
-			zipEntries[resolvedArchivePath.archiveSubPath] = new TextEncoder().encode(content);
-
-			try {
-				const { zipSync } = await loadFflate();
-				const zipBuffer = zipSync(zipEntries);
-				await Bun.write(resolvedArchivePath.absolutePath, zipBuffer);
-			} catch (error) {
-				throw new ToolError(error instanceof Error ? error.message : String(error));
-			}
-		} else {
-			const archiveEntries: Record<string, string | File> = {};
-			if (resolvedArchivePath.exists) {
-				let archive: Bun.Archive;
-				try {
-					archive = new Bun.Archive(await Bun.file(resolvedArchivePath.absolutePath).bytes());
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
-
-				let files: Map<string, File>;
-				try {
-					files = await archive.files();
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
-
-				for (const [entryPath, file] of files) {
-					archiveEntries[entryPath.replace(/\\/g, "/")] = file;
-				}
-			}
-
-			archiveEntries[resolvedArchivePath.archiveSubPath] = content;
-
-			try {
-				await Bun.Archive.write(resolvedArchivePath.absolutePath, archiveEntries);
-			} catch (error) {
-				throw new ToolError(error instanceof Error ? error.message : String(error));
-			}
-		}
+		const backend = this.session.backend;
+		const encodedContent = new TextEncoder().encode(content);
+		const entries = [{ name: resolvedArchivePath.archiveSubPath, bytes: encodedContent }];
+		const stat = await statWriteTarget(
+			backend,
+			resolvedArchivePath.absolutePath,
+			resolvedArchivePath.archivePath,
+			signal,
+		);
+		const ifMatch = stat.exists ? (stat.etag ?? undefined) : undefined;
+		await backend.fs.archiveBulkWrite(resolvedArchivePath.absolutePath, entries, {
+			ifMatch,
+			signal,
+		});
 
 		invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath);
+		getFileReadCache(this.session).invalidate(resolvedArchivePath.absolutePath);
 		const outputPath = `${formatPathRelativeToCwd(resolvedArchivePath.absolutePath, this.session.cwd)}:${
 			resolvedArchivePath.archiveSubPath
 		}`;
 		return {
-			content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${outputPath}` }],
+			content: [{ type: "text", text: `Successfully wrote ${encodedContent.byteLength} bytes to ${outputPath}` }],
 			details: {},
 		};
 	}
 
-	async #resolveSqliteWritePath(writePath: string): Promise<ResolvedSqliteWritePath | null> {
+	async #resolveSqliteWritePath(writePath: string, signal?: AbortSignal): Promise<ResolvedSqliteWritePath | null> {
 		const candidates = parseSqlitePathCandidates(writePath).filter(candidate => candidate.sqlitePath !== writePath);
 		if (candidates.length === 0) {
 			return null;
 		}
 
+		const backend = this.session.backend;
 		const fallbackCandidate = candidates[candidates.length - 1]!;
 		const fallbackTarget = parseSqliteWriteTarget(fallbackCandidate.subPath, fallbackCandidate.queryString);
 		const fallback: ResolvedSqliteWritePath = {
@@ -318,11 +349,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const target = parseSqliteWriteTarget(candidate.subPath, candidate.queryString);
 			const absolutePath = resolvePlanPath(this.session, candidate.sqlitePath);
 			try {
-				const stat = await Bun.file(absolutePath).stat();
-				if (stat.isDirectory()) {
+				const stat = await statWriteTarget(backend, absolutePath, candidate.sqlitePath, signal);
+				if (!stat.exists || stat.kind === "dir") {
 					continue;
 				}
-				if (!(await isSqliteFile(absolutePath))) {
+				if (!(await isSqliteFile(absolutePath, backend))) {
 					sawExistingNonSqlite = true;
 					continue;
 				}
@@ -355,7 +386,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		let db: Database | null = null;
 		try {
-			if (!resolvedSqlitePath.exists) {
+			const stat = await statWriteTarget(
+				this.session.backend,
+				resolvedSqlitePath.absolutePath,
+				resolvedSqlitePath.sqlitePath,
+			);
+			if (!stat.exists) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
@@ -409,6 +445,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 
 			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
+			getFileReadCache(this.session).invalidate(resolvedSqlitePath.absolutePath);
 			return toolResult<WriteToolDetails>({}).text(resultText).sourcePath(resolvedSqlitePath.absolutePath).done();
 		} catch (error) {
 			if (isEnoent(error)) {
@@ -417,7 +454,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (error instanceof ToolError) {
 				throw error;
 			}
-			throw new ToolError(error instanceof Error ? error.message : String(error));
+			const target = `${displayPath}:${resolvedSqlitePath.table}${resolvedSqlitePath.key ? `:${resolvedSqlitePath.key}` : ""}`;
+			throw createToolErrorWithCause(
+				`SQLite write failed for ${target}: ${error instanceof Error ? error.message : String(error)}`,
+				error,
+			);
 		} finally {
 			db?.close();
 		}
@@ -433,13 +474,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		return untilAborted(signal, async () => {
 			// Strip hashline display prefixes (LINE+ID|) if the model copied them from read output
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
-			const resolvedArchivePath = await this.#resolveArchiveWritePath(path);
+			const resolvedArchivePath = await this.#resolveArchiveWritePath(path, signal);
 			if (resolvedArchivePath) {
 				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
 
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
+				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath, signal);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -452,7 +493,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return archiveResult;
 			}
 
-			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
+			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path, signal);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 
@@ -472,17 +513,41 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			enforcePlanModeWrite(this.session, path, { op: "create" });
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
+			const backend = this.session.backend;
+			let ifMatch: string | undefined;
 
 			// Check if file exists and is auto-generated before overwriting
-			if (await fs.exists(absolutePath)) {
-				await assertEditableFile(absolutePath, path);
+			const stat = await statWriteTarget(backend, absolutePath, path, signal);
+			if (stat.exists) {
+				await assertEditableFile(backend, absolutePath, path, { signal });
+				ifMatch = stat.etag ?? undefined;
 			}
 
-			const diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+			let writtenBytes: number | undefined;
+			getFileReadCache(this.session).invalidate(absolutePath);
+			const diagnostics = await this.#writethrough(
+				absolutePath,
+				cleanContent,
+				signal,
+				createBackendWriteProxy({
+					backend,
+					path: absolutePath,
+					displayPath: path,
+					ifMatch,
+					signal,
+					onWrite(_content, written) {
+						writtenBytes = written;
+					},
+				}),
+				batchRequest,
+			);
 			invalidateFsScanAfterWrite(absolutePath);
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
-			let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
+			if (writtenBytes === undefined) {
+				throw new ToolError(`Write backend did not report written bytes for ${displayPath}`);
+			}
+			let resultText = `Successfully wrote ${writtenBytes} bytes to ${displayPath}`;
 			if (stripped) {
 				resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 			}

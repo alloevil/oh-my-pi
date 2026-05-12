@@ -295,8 +295,12 @@ async function startMessageReader(client: LspClient): Promise<void> {
 							client.activeProgressTokens.delete(params.token);
 							if (client.activeProgressTokens.size === 0) {
 								client.resolveProjectLoaded();
+								client.projectLoadedResolved = true;
 							}
 						}
+					}
+					for (const handler of client.notificationHandlers) {
+						await handler(message.method, message.params ?? null);
 					}
 				}
 
@@ -458,9 +462,17 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			resolveProjectLoaded = resolve;
 		});
 		// Auto-resolve after timeout in case server doesn't use progress tokens
-		const projectLoadTimeout = setTimeout(resolveProjectLoaded, PROJECT_LOAD_TIMEOUT_MS);
+		let projectLoadedResolved = false;
+		const projectLoadTimeout = setTimeout(() => {
+			projectLoadedResolved = true;
+			resolveProjectLoaded();
+		}, PROJECT_LOAD_TIMEOUT_MS);
 		const originalResolve = resolveProjectLoaded;
 		resolveProjectLoaded = () => {
+			if (projectLoadedResolved) {
+				return;
+			}
+			projectLoadedResolved = true;
 			clearTimeout(projectLoadTimeout);
 			originalResolve();
 		};
@@ -481,8 +493,16 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			writeQueue: Promise.resolve(),
 			activeProgressTokens: new Set(),
 			projectLoaded,
+			projectLoadedResolved,
 			resolveProjectLoaded,
+			notificationHandlers: new Set(),
 		};
+		const markProjectLoaded = client.resolveProjectLoaded;
+		client.resolveProjectLoaded = () => {
+			client.projectLoadedResolved = true;
+			markProjectLoaded();
+		};
+
 		clients.set(key, client);
 
 		// Register crash recovery - remove client on process exit

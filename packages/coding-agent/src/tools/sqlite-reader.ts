@@ -1,4 +1,5 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
+import type { Backend } from "../backend/backend";
 import { formatBytes, replaceTabs, truncateToWidth } from "./render-utils";
 import { ToolError } from "./tool-errors";
 
@@ -410,9 +411,13 @@ export function parseSqlitePathCandidates(filePath: string): SqlitePathCandidate
 	return candidates.sort((left, right) => right.sqlitePath.length - left.sqlitePath.length);
 }
 
-export async function isSqliteFile(absolutePath: string): Promise<boolean> {
+export async function isSqliteFile(absolutePath: string, backend: Backend): Promise<boolean> {
 	try {
-		const bytes = await Bun.file(absolutePath).slice(0, SQLITE_MAGIC.byteLength).bytes();
+		const bytes = (
+			await backend.fs.readBlob(absolutePath, {
+				range: { start: 0, end: SQLITE_MAGIC.byteLength - 1 },
+			})
+		).bytes;
 		if (bytes.length !== SQLITE_MAGIC.byteLength) {
 			return false;
 		}

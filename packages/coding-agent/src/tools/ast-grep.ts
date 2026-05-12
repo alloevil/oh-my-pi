@@ -1,10 +1,11 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { type AstFindMatch, astGrep } from "@oh-my-pi/pi-natives";
+import type { AstFindMatch } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
+import type { Backend, GrepAstHit, StatResult } from "../backend";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import type { Theme } from "../modes/theme/theme";
@@ -21,7 +22,6 @@ import {
 	hasGlobPathChars,
 	normalizePathLikeInput,
 	parseSearchPath,
-	partitionExistingPaths,
 	resolveExplicitSearchPaths,
 	resolveToCwd,
 } from "./path-utils";
@@ -46,45 +46,165 @@ const astGrepSchema = Type.Object({
 		examples: [["src/"], ["src/foo.ts"], ["src/**/*.ts"], ["src/", "packages/"]],
 	}),
 	skip: Type.Optional(Type.Number({ description: "matches to skip", default: 0 })),
+	limit: Type.Optional(Type.Number({ description: "maximum matches to return", default: 50 })),
+	language: Type.Optional(Type.String({ description: "language override for AST parsing" })),
+	strictness: Type.Optional(
+		Type.Union([Type.Literal("smart"), Type.Literal("relaxed"), Type.Literal("strict")], {
+			description: "AST matching strictness",
+		}),
+	),
 });
 
-async function runMultiTargetAstGrep(
-	targets: Array<{ basePath: string; glob?: string }>,
-	options: { patterns: string[]; commonBasePath: string; skip: number; limit: number; signal?: AbortSignal },
+type AstGrepStrictness = "smart" | "relaxed" | "strict";
+
+type GrepAstParseError = string | { file?: string; message: string };
+
+interface GrepAstBackendResult {
+	parseErrors?: GrepAstParseError[];
+	filesSearched?: number;
+	limitReached?: boolean;
+}
+
+type GrepAstHitWithColumns = GrepAstHit & {
+	column: number;
+	endColumn: number;
+};
+
+type GrepAstBackendIterator = AsyncIterator<GrepAstHitWithColumns, GrepAstBackendResult, undefined>;
+
+type GrepAstBackendRequest = Parameters<Backend["edit"]["grepAst"]>[0] & {
+	strictness?: AstGrepStrictness;
+};
+function mapGrepAstHit(hit: GrepAstHitWithColumns): AstFindMatch {
+	return {
+		path: hit.file,
+		text: hit.matched,
+		byteStart: 0,
+		byteEnd: Buffer.byteLength(hit.matched, "utf8"),
+		startLine: hit.range.start,
+		startColumn: hit.column,
+		endLine: hit.range.end,
+		endColumn: hit.endColumn,
+		metaVariables: Object.keys(hit.meta).length > 0 ? hit.meta : undefined,
+	};
+}
+function normalizeGlobPath(filePath: string): string {
+	return filePath.replace(/\\/g, "/");
+}
+
+function joinBackendPath(basePath: string, glob: string | undefined, cwd: string): string {
+	const relativeBase = normalizeGlobPath(path.relative(cwd, basePath)) || ".";
+	if (!glob) {
+		return relativeBase;
+	}
+	const normalizedGlob = normalizeGlobPath(glob).replace(/^\/+/, "");
+	if (relativeBase === ".") {
+		return normalizedGlob;
+	}
+	return `${relativeBase.replace(/\/+$/, "")}/${normalizedGlob}`;
+}
+
+function joinBackendUnknownKindPath(basePath: string, cwd: string): string {
+	const relativeBase = normalizeGlobPath(path.relative(cwd, basePath)) || ".";
+	if (relativeBase === ".") return "**/*";
+	const normalizedBase = relativeBase.replace(/\/+$/, "");
+	return `{${normalizedBase},${normalizedBase}/**/*}`;
+}
+
+async function collectMissingAstGrepInputs(
+	backend: Backend,
+	pathInputs: string[],
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const statCache = new Map<string, StatResult | null>();
+	const statInputBase = async (targetPath: string): Promise<StatResult | null> => {
+		const cacheKey = path.resolve(targetPath);
+		if (statCache.has(cacheKey)) return statCache.get(cacheKey) ?? null;
+		try {
+			const stat = await backend.fs.stat(targetPath, { signal, followSymlinks: true });
+			const cached = stat.exists ? stat : null;
+			statCache.set(cacheKey, cached);
+			return cached;
+		} catch (err) {
+			if (isEnoent(err)) {
+				statCache.set(cacheKey, null);
+				return null;
+			}
+			throw err;
+		}
+	};
+	const missing: string[] = [];
+	await Promise.all(
+		pathInputs.map(async inputPath => {
+			const parsedPath = parseSearchPath(inputPath);
+			const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
+			const stat = await statInputBase(absoluteBasePath);
+			if (!stat) missing.push(inputPath);
+		}),
+	);
+	return pathInputs.filter(inputPath => missing.includes(inputPath));
+}
+
+async function runBackendAstGrep(
+	backend: Backend,
+	options: {
+		pattern: string;
+		paths: string[];
+		language?: string;
+		strictness?: AstGrepStrictness;
+		skip: number;
+		limit: number;
+		signal?: AbortSignal;
+	},
 ): Promise<{
 	matches: AstFindMatch[];
 	totalMatches: number;
 	filesWithMatches: number;
 	filesSearched: number;
 	limitReached: boolean;
-	parseErrors?: string[];
+	truncated: boolean;
+	parseErrors?: GrepAstParseError[];
 }> {
-	const aggregatedMatches: AstFindMatch[] = [];
-	const parseErrors: string[] = [];
+	const observedMatches: AstFindMatch[] = [];
+	const filesWithMatches = new Set<string>();
+	const maxObservedMatches = options.skip + options.limit + 1;
 	let totalMatches = 0;
-	let filesSearched = 0;
-	let limitReached = false;
-	for (const target of targets) {
-		const targetResult = await astGrep({
-			patterns: options.patterns,
-			path: target.basePath,
-			glob: target.glob,
-			offset: 0,
-			limit: options.skip + options.limit + 1,
-			includeMeta: true,
+	let truncated = false;
+	let finalResult: GrepAstBackendResult = {};
+	const iterator = backend.edit
+		.grepAst({
+			pattern: options.pattern,
+			paths: options.paths,
+			language: options.language,
+			strictness: options.strictness,
+			limit: maxObservedMatches,
 			signal: options.signal,
-		});
-		totalMatches += targetResult.totalMatches;
-		filesSearched += targetResult.filesSearched;
-		limitReached = limitReached || targetResult.limitReached;
-		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
-		for (const match of targetResult.matches) {
-			const absolute = path.resolve(target.basePath, match.path);
-			const rebased = path.relative(options.commonBasePath, absolute).replace(/\\/g, "/");
-			aggregatedMatches.push({ ...match, path: rebased });
+		} as GrepAstBackendRequest)
+		[Symbol.asyncIterator]() as GrepAstBackendIterator;
+	while (true) {
+		const next = await iterator.next();
+		if (next.done) {
+			finalResult = next.value ?? {};
+			break;
+		}
+		totalMatches += 1;
+		filesWithMatches.add(next.value.file);
+		observedMatches.push(mapGrepAstHit(next.value));
+		if (totalMatches >= maxObservedMatches) {
+			const done = await iterator.next();
+			if (done.done) {
+				finalResult = done.value ?? {};
+			} else {
+				truncated = true;
+				if (typeof iterator.return === "function") {
+					await iterator.return(undefined);
+				}
+			}
+			break;
 		}
 	}
-	aggregatedMatches.sort((left, right) => {
+	observedMatches.sort((left, right) => {
 		const pathCmp = left.path.localeCompare(right.path);
 		if (pathCmp !== 0) return pathCmp;
 		if (left.startLine !== right.startLine) return left.startLine - right.startLine;
@@ -92,16 +212,15 @@ async function runMultiTargetAstGrep(
 		if (left.byteStart !== right.byteStart) return left.byteStart - right.byteStart;
 		return left.byteEnd - right.byteEnd;
 	});
-	const visible = aggregatedMatches.slice(options.skip);
-	const paged = visible.slice(0, options.limit);
-	const filesWithMatches = new Set(aggregatedMatches.map(match => match.path)).size;
+	const matches = observedMatches.slice(options.skip, options.skip + options.limit);
 	return {
-		matches: paged,
+		matches,
 		totalMatches,
-		filesWithMatches,
-		filesSearched,
-		limitReached: limitReached || visible.length > options.limit,
-		parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+		filesWithMatches: filesWithMatches.size,
+		filesSearched: finalResult.filesSearched ?? 0,
+		limitReached: totalMatches > options.skip + options.limit,
+		truncated: truncated || finalResult.limitReached === true,
+		parseErrors: finalResult.parseErrors,
 	};
 }
 
@@ -110,6 +229,7 @@ export interface AstGrepToolDetails {
 	fileCount: number;
 	filesSearched: number;
 	limitReached: boolean;
+	truncated: boolean;
 	parseErrors?: string[];
 	scopePath?: string;
 	files?: string[];
@@ -118,6 +238,10 @@ export interface AstGrepToolDetails {
 	/** Pre-formatted text for the user-visible TUI render. Mirrors `result.text` lines but uses
 	 * a `│` gutter and `*` to mark match lines. The TUI uses this directly so it never parses model-facing text. */
 	displayContent?: string;
+	missingPaths?: string[];
+}
+function formatAstGrepCount(label: string, count: number, truncated: boolean): string {
+	return truncated ? `at least ${formatCount(label, count)}` : formatCount(label, count);
 }
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
@@ -145,7 +269,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			if (pattern.length === 0) {
 				throw new ToolError("`pat` must be a non-empty pattern");
 			}
-			const patterns = [pattern];
+
 			const skip = params.skip === undefined ? 0 : Math.floor(params.skip);
 			if (!Number.isFinite(skip) || skip < 0) {
 				throw new ToolError("skip must be a non-negative number");
@@ -154,6 +278,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			let searchPath: string;
 			let scopePath: string;
 			let globFilter: string | undefined;
+
 			let multiTargets: Array<{ basePath: string; glob?: string }> | undefined;
 			const rawPaths = params.paths.map(normalizePathLikeInput);
 			if (rawPaths.some(rawPath => rawPath.length === 0)) {
@@ -175,61 +300,90 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				}
 				resolvedPathInputs.push(resource.sourcePath);
 			}
-			let effectivePathInputs = resolvedPathInputs;
-			if (resolvedPathInputs.length > 1) {
-				const partition = await partitionExistingPaths(resolvedPathInputs, this.session.cwd, parseSearchPath);
-				if (partition.valid.length === 0) {
-					throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
-				}
-				effectivePathInputs = partition.valid;
-			}
-			if (effectivePathInputs.length === 1) {
-				const parsedPath = parseSearchPath(effectivePathInputs[0] ?? ".");
+			const backend = this.session.backend;
+			const uniqueResolvedPathInputs = [...new Set(resolvedPathInputs)];
+			const isMultiPathInput = uniqueResolvedPathInputs.length > 1;
+			if (uniqueResolvedPathInputs.length === 1) {
+				const parsedPath = parseSearchPath(uniqueResolvedPathInputs[0] ?? ".");
 				searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
 				globFilter = parsedPath.glob;
 				scopePath = formatScopePath(searchPath);
 			} else {
-				const multiSearchPath = await resolveExplicitSearchPaths(effectivePathInputs, this.session.cwd, globFilter);
+				const multiSearchPath = await resolveExplicitSearchPaths(
+					uniqueResolvedPathInputs,
+					this.session.cwd,
+					globFilter,
+				);
 				if (!multiSearchPath) {
 					throw new ToolError("`paths` must contain at least one path or glob");
 				}
 				searchPath = multiSearchPath.basePath;
 				globFilter = multiSearchPath.targets ? undefined : multiSearchPath.glob;
 				multiTargets = multiSearchPath.targets;
+
 				scopePath = multiSearchPath.scopePath;
 			}
 
 			const resolvedSearchPath = searchPath;
 			scopePath = scopePath ?? formatScopePath(resolvedSearchPath);
-			let isDirectory: boolean;
-			try {
-				const stat = await Bun.file(resolvedSearchPath).stat();
-				isDirectory = stat.isDirectory();
-			} catch {
-				throw new ToolError(`Path not found: ${scopePath}`);
+			let isDirectory = true;
+			if (!isMultiPathInput) {
+				const searchPathStat = await backend.fs.stat(resolvedSearchPath, { signal });
+				if (searchPathStat.exists === false) {
+					throw new ToolError(`Path not found: ${scopePath}`);
+				}
+				isDirectory = searchPathStat.kind === "dir";
+			}
+
+			let backendPaths: string[];
+			if (multiTargets && multiTargets.length > 0) {
+				backendPaths = [];
+				for (const target of multiTargets) {
+					if (target.glob) {
+						backendPaths.push(joinBackendPath(target.basePath, target.glob, this.session.cwd));
+					} else {
+						backendPaths.push(joinBackendUnknownKindPath(target.basePath, this.session.cwd));
+					}
+				}
+			} else {
+				const singleGlob = !globFilter && isDirectory ? "**/*" : globFilter;
+				backendPaths = [joinBackendPath(resolvedSearchPath, singleGlob, this.session.cwd)];
 			}
 
 			const DEFAULT_AST_LIMIT = 50;
-			const result = multiTargets
-				? await runMultiTargetAstGrep(multiTargets, {
-						patterns,
-						commonBasePath: resolvedSearchPath,
-						skip,
-						limit: DEFAULT_AST_LIMIT,
-						signal,
-					})
-				: await astGrep({
-						patterns,
-						path: resolvedSearchPath,
-						glob: globFilter,
-						offset: skip,
-						includeMeta: true,
-						signal,
-					});
+			const limit = params.limit === undefined ? DEFAULT_AST_LIMIT : Math.floor(params.limit);
+			if (!Number.isFinite(limit) || limit <= 0) {
+				throw new ToolError("limit must be a positive number");
+			}
+			const result = await runBackendAstGrep(backend, {
+				pattern,
+				paths: backendPaths,
+				skip,
+				limit,
+				language: params.language,
+				strictness: params.strictness,
+				signal,
+			});
+			let missingPaths: string[] = [];
+			if (isMultiPathInput) {
+				missingPaths = await collectMissingAstGrepInputs(
+					backend,
+					uniqueResolvedPathInputs,
+					this.session.cwd,
+					signal,
+				);
+			}
+			if (missingPaths.length === uniqueResolvedPathInputs.length) {
+				throw new ToolError(`Path not found: ${missingPaths.join(", ")}`);
+			}
+			const missingPathsNote =
+				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
 
 			const normalizedParseErrors = (result.parseErrors ?? []).map(error => {
-				const parseError = error.match(/^.+: (.+: parse error \(syntax tree contains error nodes\))$/);
-				return parseError?.[1] ?? error;
+				if (typeof error === "string") {
+					return error;
+				}
+				return error.file ? `${error.file}: ${error.message}` : error.message;
 			});
 			const dedupedParseErrors = dedupeParseErrors(normalizedParseErrors);
 			const formatPath = (filePath: string): string =>
@@ -252,10 +406,12 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				fileCount: result.filesWithMatches,
 				filesSearched: result.filesSearched,
 				limitReached: result.limitReached,
+				truncated: result.truncated,
 				...(dedupedParseErrors.length > 0 ? { parseErrors: dedupedParseErrors } : {}),
 				scopePath,
 				files: fileList,
 				fileMatches: [],
+				missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 			};
 
 			if (result.matches.length === 0) {
@@ -265,7 +421,8 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				const parseMessage = dedupedParseErrors.length
 					? `\n${formatParseErrors(dedupedParseErrors).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`${noMatchMessage}${parseMessage}`).done();
+				const missingMessage = missingPathsNote ? `\n${missingPathsNote}` : "";
+				return toolResult(baseDetails).text(`${noMatchMessage}${parseMessage}${missingMessage}`).done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -331,6 +488,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			if (dedupedParseErrors.length) {
 				outputLines.push("", ...formatParseErrors(dedupedParseErrors));
 			}
+			if (missingPathsNote) {
+				outputLines.push("", missingPathsNote);
+			}
 
 			return toolResult(details).text(outputLines.join("\n")).done();
 		});
@@ -345,6 +505,7 @@ interface AstGrepRenderArgs {
 	pat?: string;
 	paths?: string[];
 	skip?: number;
+	limit?: number;
 }
 
 const COLLAPSED_MATCH_LIMIT = PREVIEW_LIMITS.COLLAPSED_LINES * 2;
@@ -355,6 +516,7 @@ export const astGrepToolRenderer = {
 		const meta: string[] = [];
 		if (args.paths?.length) meta.push(`in ${args.paths.join(", ")}`);
 		if (args.skip !== undefined && args.skip > 0) meta.push(`skip:${args.skip}`);
+		if (args.limit !== undefined) meta.push(`limit:${args.limit}`);
 
 		const description = args.pat ?? "?";
 		const text = renderStatusLine({ icon: "pending", title: "AST Grep", description, meta }, uiTheme);
@@ -377,7 +539,7 @@ export const astGrepToolRenderer = {
 		const matchCount = details?.matchCount ?? 0;
 		const fileCount = details?.fileCount ?? 0;
 		const filesSearched = details?.filesSearched ?? 0;
-		const limitReached = details?.limitReached ?? false;
+		const truncated = details?.truncated ?? false;
 
 		if (matchCount === 0) {
 			const description = args?.pat;
@@ -386,6 +548,9 @@ export const astGrepToolRenderer = {
 			if (filesSearched > 0) meta.push(`searched ${filesSearched}`);
 			const header = renderStatusLine({ icon: "warning", title: "AST Grep", description, meta }, uiTheme);
 			const lines = [header, formatEmptyMessage("No matches found", uiTheme)];
+			if (details?.missingPaths?.length) {
+				lines.push(uiTheme.fg("warning", `skipped missing: ${details.missingPaths.join(", ")}`));
+			}
 			if (details?.parseErrors?.length) {
 				lines.push(uiTheme.fg("warning", "Query may be mis-scoped; narrow `paths` before concluding absence"));
 				const capped = details.parseErrors.slice(0, PARSE_ERRORS_LIMIT);
@@ -399,14 +564,17 @@ export const astGrepToolRenderer = {
 			return new Text(lines.join("\n"), 0, 0);
 		}
 
-		const summaryParts = [formatCount("match", matchCount), formatCount("file", fileCount)];
+		const summaryParts = [
+			formatAstGrepCount("match", matchCount, truncated),
+			formatAstGrepCount("file", fileCount, truncated),
+		];
 		const meta = [...summaryParts];
 		if (details?.scopePath) meta.push(`in ${details.scopePath}`);
 		meta.push(`searched ${filesSearched}`);
-		if (limitReached) meta.push(uiTheme.fg("warning", "limit reached"));
+		if (truncated) meta.push(uiTheme.fg("warning", "limit reached"));
 		const description = args?.pat;
 		const header = renderStatusLine(
-			{ icon: limitReached ? "warning" : "success", title: "AST Grep", description, meta },
+			{ icon: truncated ? "warning" : "success", title: "AST Grep", description, meta },
 			uiTheme,
 		);
 
@@ -438,8 +606,10 @@ export const astGrepToolRenderer = {
 		);
 
 		const extraLines: string[] = [];
-		if (limitReached) {
-			extraLines.push(uiTheme.fg("warning", "limit reached; narrow paths or increase limit"));
+		if (truncated) {
+			extraLines.push(
+				uiTheme.fg("warning", "limit reached; totals shown are lower bounds; narrow paths or increase limit"),
+			);
 		}
 		if (details?.parseErrors?.length) {
 			const total = details.parseErrors.length;
@@ -448,6 +618,9 @@ export const astGrepToolRenderer = {
 					? `${PARSE_ERRORS_LIMIT} / ${total} parse issues`
 					: `${total} parse issue${total !== 1 ? "s" : ""}`;
 			extraLines.push(uiTheme.fg("warning", label));
+		}
+		if (details?.missingPaths?.length) {
+			extraLines.push(uiTheme.fg("warning", `skipped missing: ${details.missingPaths.join(", ")}`));
 		}
 
 		let cached: RenderCache | undefined;

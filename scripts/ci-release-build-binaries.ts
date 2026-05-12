@@ -2,6 +2,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@oh-my-pi/pi-utils";
 
 interface BinaryTarget {
 	id: string;
@@ -15,6 +16,7 @@ const repoRoot = path.join(import.meta.dir, "..");
 const binariesDir = path.join(repoRoot, "packages", "coding-agent", "binaries");
 const entrypoint = "./packages/coding-agent/src/cli.ts";
 const isDryRun = process.argv.includes("--dry-run");
+const buildRwpServer = process.argv.includes("--with-rwp-server") || Bun.env.RELEASE_INCLUDE_RWP_SERVER === "1";
 const targets: BinaryTarget[] = [
 	{
 		id: "darwin-arm64",
@@ -54,6 +56,15 @@ const targets: BinaryTarget[] = [
 ];
 
 function parseRequestedTargets(): Set<string> | null {
+	const onlyFlagIndex = process.argv.findIndex(arg => arg === "--only");
+	const onlyValue =
+		onlyFlagIndex >= 0
+			? process.argv[onlyFlagIndex + 1]
+			: process.argv.find(arg => arg.startsWith("--only="))?.split("=", 2)[1];
+	if (onlyValue) {
+		return new Set([onlyValue]);
+	}
+
 	const flagIndex = process.argv.findIndex(arg => arg === "--targets");
 	const flagValue =
 		flagIndex >= 0
@@ -91,7 +102,7 @@ async function runCommand(command: string[], cwd: string, env: NodeJS.ProcessEnv
 
 async function embedNative(target: BinaryTarget): Promise<void> {
 	if (isDryRun) {
-		console.log(`DRY RUN bun --cwd=packages/natives run embed:native [${target.platform}/${target.arch}]`);
+		logger.debug(`DRY RUN bun --cwd=packages/natives run embed:native [${target.platform}/${target.arch}]`);
 		return;
 	}
 
@@ -103,10 +114,12 @@ async function embedNative(target: BinaryTarget): Promise<void> {
 }
 
 async function buildBinary(target: BinaryTarget): Promise<void> {
-	console.log(`Building ${target.outfile}...`);
+	logger.debug(`Building ${target.outfile}...`);
 	await embedNative(target);
 	if (isDryRun) {
-		console.log(`DRY RUN bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --define process.env.PI_COMPILED="true" --root . --external mupdf --target=${target.target} ${entrypoint} --outfile ${target.outfile}`);
+		logger.debug(
+			`DRY RUN bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --define process.env.PI_COMPILED=\"true\" --root . --external mupdf --target=${target.target} ${entrypoint} --outfile ${target.outfile}`,
+		);
 		return;
 	}
 
@@ -144,7 +157,7 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 
 async function generateBundle(): Promise<void> {
 	if (isDryRun) {
-		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --generate");
+		logger.debug("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --generate");
 		return;
 	}
 	await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--generate"], repoRoot);
@@ -152,13 +165,26 @@ async function generateBundle(): Promise<void> {
 
 async function resetArtifacts(): Promise<void> {
 	if (isDryRun) {
-		console.log("DRY RUN bun --cwd=packages/natives run embed:native --reset");
-		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --reset");
+		logger.debug("DRY RUN bun --cwd=packages/natives run embed:native --reset");
+		logger.debug("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --reset");
 		return;
 	}
 	await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native", "--reset"], repoRoot);
 	await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--reset"], repoRoot);
 }
+async function buildBundledRwpServer(target: BinaryTarget): Promise<void> {
+	if (!buildRwpServer) {
+		return;
+	}
+
+	if (isDryRun) {
+		logger.debug(`DRY RUN bun scripts/ci-build-rwp-server.ts --only ${target.id}`);
+		return;
+	}
+
+	await runCommand(["bun", "scripts/ci-build-rwp-server.ts", "--only", target.id], repoRoot);
+}
+
 
 async function main(): Promise<void> {
 	const requestedTargets = parseRequestedTargets();
@@ -184,6 +210,7 @@ async function main(): Promise<void> {
 	try {
 		for (const target of selectedTargets) {
 			await buildBinary(target);
+			await buildBundledRwpServer(target);
 		}
 	} finally {
 		await resetArtifacts();

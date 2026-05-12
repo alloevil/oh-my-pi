@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, HIDDEN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 
@@ -10,6 +11,7 @@ function createTestSession(overrides: Partial<ToolSession> = {}): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 		settings: Settings.isolated(),
 		...overrides,
 	};

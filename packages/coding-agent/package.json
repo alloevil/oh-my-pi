@@ -51,6 +51,7 @@
 		"@oh-my-pi/pi-agent-core": "catalog:",
 		"@oh-my-pi/pi-ai": "catalog:",
 		"@oh-my-pi/pi-natives": "catalog:",
+		"@oh-my-pi/rwp-client": "workspace:^",
 		"@oh-my-pi/pi-tui": "catalog:",
 		"@oh-my-pi/pi-utils": "catalog:",
 		"@puppeteer/browsers": "catalog:",
@@ -80,6 +81,7 @@
 		"src",
 		"scripts",
 		"examples",
+		"binaries/rwp-server-*",
 		"README.md",
 		"CHANGELOG.md"
 	],
@@ -87,6 +89,14 @@
 		".": {
 			"types": "./src/index.ts",
 			"import": "./src/index.ts"
+		},
+		"./backend": {
+			"types": "./src/backend/index.ts",
+			"import": "./src/backend/index.ts"
+		},
+		"./backend/*": {
+			"types": "./src/backend/*.ts",
+			"import": "./src/backend/*.ts"
 		},
 		"./*": {
 			"types": "./src/*.ts",

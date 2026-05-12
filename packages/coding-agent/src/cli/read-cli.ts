@@ -7,6 +7,7 @@
  */
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
+import { pickBackend } from "../backend";
 import { Settings } from "../config/settings";
 import type { ToolSession } from "../tools";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
@@ -25,10 +26,12 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 
 	const cwd = getProjectDir();
 	const settings = await Settings.init({ cwd });
+	const backend = pickBackend({ cwd, env: Bun.env });
 
 	const session: ToolSession = {
 		cwd,
 		hasUI: false,
+		backend,
 		settings,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",

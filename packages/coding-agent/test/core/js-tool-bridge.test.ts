@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { Type } from "@sinclair/typebox";
@@ -24,6 +25,7 @@ function createSession(tools: AgentTool[]): ToolSession {
 	return {
 		cwd: "/tmp/test",
 		hasUI: false,
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
 		settings: Settings.isolated(),

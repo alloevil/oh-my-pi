@@ -1,10 +1,11 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
+import type { Backend, StatResult } from "../backend";
+import type { AstEditResult as BackendAstEditResult } from "../backend/types";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import { InternalUrlRouter } from "../internal-urls";
@@ -21,7 +22,6 @@ import {
 	hasGlobPathChars,
 	normalizePathLikeInput,
 	parseSearchPath,
-	partitionExistingPaths,
 	resolveExplicitSearchPaths,
 	resolveToCwd,
 } from "./path-utils";
@@ -54,13 +54,27 @@ const astEditSchema = Type.Object({
 		description: "files, directories, globs, or internal URLs to rewrite",
 		examples: [["src/"], ["src/foo.ts"], ["src/**/*.ts"], ["src/", "packages/"]],
 	}),
+	language: Type.Optional(Type.String({ description: "language override for every matched file" })),
+	preview: Type.Optional(Type.Boolean({ description: "preview changes without writing files" })),
 });
 
+interface AstReplaceChange {
+	path: string;
+	before: string;
+	after: string;
+	startLine: number;
+	startColumn: number;
+}
+
+interface AstReplaceFileChange {
+	path: string;
+	count: number;
+}
+
 interface AstEditCallOptions {
-	rewrites: Record<string, string>;
-	dryRun: boolean;
-	maxFiles: number;
-	failOnParseError: boolean;
+	ops: Array<{ pat: string; out: string }>;
+	language?: string;
+	dryRun?: boolean;
 	signal?: AbortSignal;
 }
 
@@ -75,78 +89,277 @@ interface AstEditAggregatedResult {
 	parseErrors?: string[];
 }
 
-async function runAstEditTargets(
-	targets: Array<{ basePath: string; glob?: string }>,
-	commonBasePath: string,
-	options: AstEditCallOptions,
-): Promise<AstEditAggregatedResult> {
-	const aggregatedChanges: AstReplaceChange[] = [];
-	const fileCounts = new Map<string, number>();
-	const parseErrors: string[] = [];
-	let totalReplacements = 0;
-	let filesSearched = 0;
-	let limitReached = false;
-	let applied = !options.dryRun;
-	for (const target of targets) {
-		const targetResult = await astEdit({
-			rewrites: options.rewrites,
-			path: target.basePath,
-			glob: target.glob,
-			dryRun: options.dryRun,
-			maxFiles: options.maxFiles,
-			failOnParseError: options.failOnParseError,
-			signal: options.signal,
-		});
-		totalReplacements += targetResult.totalReplacements;
-		filesSearched += targetResult.filesSearched;
-		limitReached = limitReached || targetResult.limitReached;
-		applied = applied && targetResult.applied;
-		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
-		for (const change of targetResult.changes) {
-			const absolute = path.resolve(target.basePath, change.path);
-			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
-			aggregatedChanges.push({ ...change, path: rebased });
-		}
-		for (const fileChange of targetResult.fileChanges) {
-			const absolute = path.resolve(target.basePath, fileChange.path);
-			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
-			fileCounts.set(rebased, (fileCounts.get(rebased) ?? 0) + fileChange.count);
-		}
-	}
-	const fileChanges: AstReplaceFileChange[] = Array.from(fileCounts, ([changePath, count]) => ({
-		path: changePath,
-		count,
-	}));
+type LegacyAstEditFileChange = {
+	path: string;
+	replacements: number;
+	diff: string;
+};
+
+type StructuredAstEditResult = {
+	fileChanges: NonNullable<BackendAstEditResult["fileChanges"]>;
+	filesSearched?: number;
+	limitReached?: boolean;
+	parseErrors?: Array<string | { file?: string; message: string }>;
+};
+
+interface ParsedAstEditDiffLine {
+	op: "+" | "-";
+	line: number;
+	text: string;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
+function isLegacyAstEditFileChange(value: unknown): value is LegacyAstEditFileChange {
+	return (
+		isObjectRecord(value) &&
+		typeof value.path === "string" &&
+		typeof value.replacements === "number" &&
+		typeof value.diff === "string"
+	);
+}
+
+function isBackendAstEditHunk(
+	value: unknown,
+): value is NonNullable<BackendAstEditResult["fileChanges"]>[number]["hunks"][number] {
+	return (
+		isObjectRecord(value) &&
+		typeof value.beforeStart === "number" &&
+		Array.isArray(value.beforeLines) &&
+		value.beforeLines.every(line => typeof line === "string") &&
+		Array.isArray(value.afterLines) &&
+		value.afterLines.every(line => typeof line === "string")
+	);
+}
+
+function isBackendAstEditFileChange(value: unknown): value is NonNullable<BackendAstEditResult["fileChanges"]>[number] {
+	return (
+		isObjectRecord(value) &&
+		typeof value.path === "string" &&
+		typeof value.replacements === "number" &&
+		Array.isArray(value.beforeLines) &&
+		value.beforeLines.every(line => typeof line === "string") &&
+		Array.isArray(value.afterLines) &&
+		value.afterLines.every(line => typeof line === "string") &&
+		Array.isArray(value.hunks) &&
+		value.hunks.every(isBackendAstEditHunk)
+	);
+}
+
+function isStructuredAstEditResult(
+	value: BackendAstEditResult,
+): value is BackendAstEditResult & StructuredAstEditResult {
+	return (
+		isObjectRecord(value) && Array.isArray(value.fileChanges) && value.fileChanges.every(isBackendAstEditFileChange)
+	);
+}
+
+function parseAstEditDiffLine(line: string): ParsedAstEditDiffLine | null {
+	if (line.length < 3) return null;
+	const op = line[0];
+	if (op !== "+" && op !== "-") return null;
+	const pipeIndex = line.indexOf("|");
+	if (pipeIndex <= 1) return null;
+	const lineNumber = Number(line.slice(1, pipeIndex));
+	if (!Number.isInteger(lineNumber) || lineNumber <= 0) return null;
 	return {
-		changes: aggregatedChanges,
-		fileChanges,
-		totalReplacements,
-		filesTouched: fileChanges.length,
-		filesSearched,
-		applied,
-		limitReached,
-		parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+		op,
+		line: lineNumber,
+		text: line.slice(pipeIndex + 1),
 	};
 }
 
-function runAstEditOnce(
-	targets: Array<{ basePath: string; glob?: string }> | undefined,
-	resolvedSearchPath: string,
-	globFilter: string | undefined,
-	options: AstEditCallOptions,
-): Promise<AstEditAggregatedResult> {
-	if (targets) {
-		return runAstEditTargets(targets, resolvedSearchPath, options);
+function parseAstEditDiff(filePath: string, diff: string): AstReplaceChange[] {
+	if (diff.length === 0) return [];
+	const rawLines = diff.split("\n");
+	const changes: AstReplaceChange[] = [];
+	for (let index = 0; index < rawLines.length; index += 1) {
+		const current = parseAstEditDiffLine(rawLines[index] ?? "");
+		if (!current) continue;
+		const next = parseAstEditDiffLine(rawLines[index + 1] ?? "");
+		if (current.op === "-" && next?.op === "+" && next.line === current.line) {
+			changes.push({
+				path: filePath,
+				before: current.text,
+				after: next.text,
+				startLine: current.line,
+				startColumn: 1,
+			});
+			index += 1;
+			continue;
+		}
+		changes.push({
+			path: filePath,
+			before: current.op === "-" ? current.text : "",
+			after: current.op === "+" ? current.text : "",
+			startLine: current.line,
+			startColumn: 1,
+		});
 	}
-	return astEdit({
-		rewrites: options.rewrites,
-		path: resolvedSearchPath,
-		glob: globFilter,
-		dryRun: options.dryRun,
-		maxFiles: options.maxFiles,
-		failOnParseError: options.failOnParseError,
-		signal: options.signal,
-	});
+	return changes;
+}
+
+function expandStructuredFileChanges(
+	fileChanges: NonNullable<BackendAstEditResult["fileChanges"]>,
+): AstReplaceChange[] {
+	const changes: AstReplaceChange[] = [];
+	for (const fileChange of fileChanges) {
+		for (const hunk of fileChange.hunks) {
+			const lineCount = Math.max(hunk.beforeLines.length, hunk.afterLines.length);
+			for (let index = 0; index < lineCount; index += 1) {
+				changes.push({
+					path: fileChange.path,
+					before: hunk.beforeLines[index] ?? "",
+					after: hunk.afterLines[index] ?? "",
+					startLine: Math.max(1, hunk.beforeStart + index),
+					startColumn: 1,
+				});
+			}
+		}
+	}
+	return changes;
+}
+
+function aggregateLegacyFileChanges(changes: LegacyAstEditFileChange[]): AstReplaceFileChange[] {
+	return changes.map(change => ({
+		path: change.path,
+		count: change.replacements,
+	}));
+}
+
+function aggregateStructuredFileChanges(
+	fileChanges: NonNullable<BackendAstEditResult["fileChanges"]>,
+): AstReplaceFileChange[] {
+	return fileChanges.map(change => ({
+		path: change.path,
+		count: change.replacements,
+	}));
+}
+
+function getNumericMetadata(value: Record<string, unknown>, key: string): number | undefined {
+	const candidate = value[key];
+	return typeof candidate === "number" ? candidate : undefined;
+}
+
+function getBooleanMetadata(value: Record<string, unknown>, key: string): boolean | undefined {
+	const candidate = value[key];
+	return typeof candidate === "boolean" ? candidate : undefined;
+}
+
+function normalizeParseError(entry: unknown): string | null {
+	if (typeof entry === "string") return entry;
+	if (!isObjectRecord(entry) || typeof entry.message !== "string") return null;
+	if (typeof entry.file === "string" && entry.file.length > 0) {
+		return `${entry.file}: ${entry.message}`;
+	}
+	return entry.message;
+}
+
+function getParseErrorsMetadata(value: Record<string, unknown>): string[] | undefined {
+	const candidate = value.parseErrors;
+	if (!Array.isArray(candidate)) {
+		return undefined;
+	}
+	const parseErrors = candidate.map(normalizeParseError).filter((entry): entry is string => entry !== null);
+	return parseErrors;
+}
+
+function aggregateAstEditResult(result: BackendAstEditResult, applied: boolean): AstEditAggregatedResult {
+	const metadata = isObjectRecord(result) ? result : {};
+	const parseErrors = getParseErrorsMetadata(metadata);
+	if (isStructuredAstEditResult(result)) {
+		const fileChanges = aggregateStructuredFileChanges(result.fileChanges);
+		return {
+			changes: expandStructuredFileChanges(result.fileChanges),
+			fileChanges,
+			totalReplacements:
+				getNumericMetadata(metadata, "totalReplacements") ??
+				fileChanges.reduce((total, change) => total + change.count, 0),
+			filesTouched: getNumericMetadata(metadata, "filesTouched") ?? fileChanges.length,
+			filesSearched: getNumericMetadata(metadata, "filesSearched") ?? result.filesSearched ?? 0,
+			applied,
+			limitReached: getBooleanMetadata(metadata, "limitReached") ?? result.limitReached ?? false,
+			...(parseErrors?.length ? { parseErrors } : {}),
+		};
+	}
+
+	const legacyChanges = result.changes.filter(isLegacyAstEditFileChange);
+	return {
+		changes: legacyChanges.flatMap(change => parseAstEditDiff(change.path, change.diff)),
+		fileChanges: aggregateLegacyFileChanges(legacyChanges),
+		totalReplacements:
+			getNumericMetadata(metadata, "totalReplacements") ??
+			legacyChanges.reduce((total, change) => total + change.replacements, 0),
+		filesTouched: getNumericMetadata(metadata, "filesTouched") ?? legacyChanges.length,
+		filesSearched: getNumericMetadata(metadata, "filesSearched") ?? 0,
+		applied,
+		limitReached: getBooleanMetadata(metadata, "limitReached") ?? false,
+		...(parseErrors?.length ? { parseErrors } : {}),
+	};
+}
+
+function toBackendEditPath(inputPath: string, cwd: string): string {
+	const parsedPath = parseSearchPath(inputPath);
+	const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
+	const backendBasePath = formatPathRelativeToCwd(absoluteBasePath, cwd);
+	if (!parsedPath.glob) return backendBasePath;
+	if (backendBasePath === ".") return parsedPath.glob;
+	return `${backendBasePath.replace(/\/+$/, "")}/${parsedPath.glob.replace(/^\/+/, "")}`;
+}
+
+async function collectMissingAstEditInputs(
+	backend: Backend,
+	pathInputs: string[],
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<Set<string>> {
+	const statCache = new Map<string, StatResult | null>();
+	const statInputBase = async (targetPath: string): Promise<StatResult | null> => {
+		const cacheKey = path.resolve(targetPath);
+		if (statCache.has(cacheKey)) return statCache.get(cacheKey) ?? null;
+		try {
+			const stat = await backend.fs.stat(targetPath, { signal, followSymlinks: true });
+			const cached = stat.exists ? stat : null;
+			statCache.set(cacheKey, cached);
+			return cached;
+		} catch (err) {
+			if (isEnoent(err)) {
+				statCache.set(cacheKey, null);
+				return null;
+			}
+			throw err;
+		}
+	};
+	const missing = new Set<string>();
+	await Promise.all(
+		pathInputs.map(async inputPath => {
+			const parsedPath = parseSearchPath(inputPath);
+			const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
+			const stat = await statInputBase(absoluteBasePath);
+			if (!stat) missing.add(inputPath);
+		}),
+	);
+	return missing;
+}
+
+async function runAstEditOnce(
+	backend: Backend,
+	paths: string[],
+	options: AstEditCallOptions,
+	applied: boolean,
+): Promise<AstEditAggregatedResult> {
+	return aggregateAstEditResult(
+		await backend.edit.editAst({
+			ops: options.ops,
+			paths,
+			language: options.language,
+			dryRun: options.dryRun,
+			signal: options.signal,
+		}),
+		applied,
+	);
 }
 
 export interface AstEditToolDetails {
@@ -163,6 +376,7 @@ export interface AstEditToolDetails {
 	/** Pre-formatted text for the user-visible TUI render. Mirrors `result.text` lines but uses
 	 * a `│` gutter (no model-only hashline anchors). The TUI uses this directly so it never parses model-facing text. */
 	displayContent?: string;
+	missingPaths?: string[];
 }
 
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
@@ -190,26 +404,24 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				if (entry.pat.length === 0) {
 					throw new ToolError(`\`ops[${index}].pat\` must be a non-empty pattern`);
 				}
-				return [entry.pat, entry.out] as const;
+				return { pat: entry.pat, out: entry.out };
 			});
 			if (ops.length === 0) {
 				throw new ToolError("`ops` must include at least one op entry");
 			}
 			const seenPatterns = new Set<string>();
-			for (const [pat] of ops) {
+			for (const { pat } of ops) {
 				if (seenPatterns.has(pat)) {
 					throw new ToolError(`Duplicate rewrite pattern: ${pat}`);
 				}
 				seenPatterns.add(pat);
 			}
-			const normalizedRewrites = Object.fromEntries(ops);
-			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
 
+			const backend = this.session.backend;
 			const formatScopePath = (targetPath: string): string => formatPathRelativeToCwd(targetPath, this.session.cwd);
 			let searchPath: string;
 			let scopePath: string;
 			let globFilter: string | undefined;
-			let multiTargets: Array<{ basePath: string; glob?: string }> | undefined;
 			const rawPaths = params.paths.map(normalizePathLikeInput);
 			if (rawPaths.some(rawPath => rawPath.length === 0)) {
 				throw new ToolError("`paths` must contain non-empty paths or globs");
@@ -230,67 +442,98 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				}
 				resolvedPathInputs.push(resource.sourcePath);
 			}
-			let effectivePathInputs = resolvedPathInputs;
-			if (resolvedPathInputs.length > 1) {
-				const partition = await partitionExistingPaths(resolvedPathInputs, this.session.cwd, parseSearchPath);
-				if (partition.valid.length === 0) {
-					throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
-				}
-				effectivePathInputs = partition.valid;
-			}
-			if (effectivePathInputs.length === 1) {
-				const parsedPath = parseSearchPath(effectivePathInputs[0] ?? ".");
+			const uniqueResolvedPathInputs = [...new Set(resolvedPathInputs)];
+			const isMultiPathInput = uniqueResolvedPathInputs.length > 1;
+			if (uniqueResolvedPathInputs.length === 1) {
+				const parsedPath = parseSearchPath(uniqueResolvedPathInputs[0] ?? ".");
 				searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
 				globFilter = parsedPath.glob;
 				scopePath = formatScopePath(searchPath);
 			} else {
-				const multiSearchPath = await resolveExplicitSearchPaths(effectivePathInputs, this.session.cwd, globFilter);
+				const multiSearchPath = await resolveExplicitSearchPaths(
+					uniqueResolvedPathInputs,
+					this.session.cwd,
+					globFilter,
+				);
 				if (!multiSearchPath) {
 					throw new ToolError("`paths` must contain at least one path or glob");
 				}
 				searchPath = multiSearchPath.basePath;
 				globFilter = multiSearchPath.targets ? undefined : multiSearchPath.glob;
-				multiTargets = multiSearchPath.targets;
 				scopePath = multiSearchPath.scopePath;
 			}
 			const resolvedSearchPath = searchPath;
 			scopePath = scopePath ?? formatScopePath(resolvedSearchPath);
-			let isDirectory: boolean;
-			try {
-				const stat = await Bun.file(resolvedSearchPath).stat();
-				isDirectory = stat.isDirectory();
-			} catch {
-				throw new ToolError(`Path not found: ${scopePath}`);
+			const missingInputSet = isMultiPathInput
+				? await collectMissingAstEditInputs(backend, uniqueResolvedPathInputs, this.session.cwd, signal)
+				: new Set<string>();
+			if (missingInputSet.size === uniqueResolvedPathInputs.length) {
+				throw new ToolError(`Path not found: ${uniqueResolvedPathInputs.join(", ")}`);
+			}
+			const missingPaths = uniqueResolvedPathInputs.filter(inputPath => missingInputSet.has(inputPath));
+			const backendPathInputs =
+				missingInputSet.size > 0
+					? uniqueResolvedPathInputs.filter(inputPath => !missingInputSet.has(inputPath))
+					: uniqueResolvedPathInputs;
+			const backendPaths = backendPathInputs.map(inputPath => toBackendEditPath(inputPath, this.session.cwd));
+
+			let isDirectory = true;
+			if (!isMultiPathInput) {
+				const searchPathStat = await backend.fs.stat(resolvedSearchPath, { signal });
+				if (searchPathStat.exists === false) {
+					throw new ToolError(`Path not found: ${scopePath}`);
+				}
+				isDirectory = searchPathStat.kind === "dir";
 			}
 
-			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-				rewrites: normalizedRewrites,
-				dryRun: true,
-				maxFiles,
-				failOnParseError: false,
-				signal,
-			});
+			const shouldPreview = params.preview !== false;
+			const result = await runAstEditOnce(
+				backend,
+				backendPaths,
+				{
+					ops,
+					language: params.language,
+					dryRun: shouldPreview,
+					signal,
+				},
+				!shouldPreview,
+			);
 
 			const dedupedParseErrors = dedupeParseErrors(result.parseErrors);
+			const missingPathsNote =
+				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
 			const formatPath = (filePath: string): string =>
-				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
+				isDirectory
+					? formatPathRelativeToCwd(path.resolve(this.session.cwd, filePath), this.session.cwd)
+					: formatResultPath(filePath, false, resolvedSearchPath, this.session.cwd);
 
-			const { record: recordFile, list: fileList } = createFileRecorder();
-			const fileReplacementCounts = new Map<string, number>();
-			const changesByFile = new Map<string, AstReplaceChange[]>();
-			for (const fileChange of result.fileChanges) {
-				const relativePath = formatPath(fileChange.path);
-				recordFile(relativePath);
-				fileReplacementCounts.set(relativePath, (fileReplacementCounts.get(relativePath) ?? 0) + fileChange.count);
-			}
-			for (const change of result.changes) {
-				const relativePath = formatPath(change.path);
-				recordFile(relativePath);
-				if (!changesByFile.has(relativePath)) {
-					changesByFile.set(relativePath, []);
+			const summarizeFiles = (astResult: AstEditAggregatedResult) => {
+				const { record, list } = createFileRecorder();
+				const replacementCounts = new Map<string, number>();
+				const perFileChanges = new Map<string, AstReplaceChange[]>();
+				for (const fileChange of astResult.fileChanges) {
+					const relativePath = formatPath(fileChange.path);
+					record(relativePath);
+					replacementCounts.set(relativePath, (replacementCounts.get(relativePath) ?? 0) + fileChange.count);
 				}
-				changesByFile.get(relativePath)!.push(change);
-			}
+				for (const change of astResult.changes) {
+					const relativePath = formatPath(change.path);
+					record(relativePath);
+					const existing = perFileChanges.get(relativePath);
+					if (existing) {
+						existing.push(change);
+						continue;
+					}
+					perFileChanges.set(relativePath, [change]);
+				}
+				return {
+					fileList: list,
+					fileReplacementCounts: replacementCounts,
+					changesByFile: perFileChanges,
+				};
+			};
+
+			const { fileList, fileReplacementCounts, changesByFile } = summarizeFiles(result);
 
 			const baseDetails: AstEditToolDetails = {
 				totalReplacements: result.totalReplacements,
@@ -302,13 +545,15 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				scopePath,
 				files: fileList,
 				fileReplacements: [],
+				missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 			};
 
 			if (result.totalReplacements === 0) {
 				const parseMessage = dedupedParseErrors.length
 					? `\n${formatParseErrors(dedupedParseErrors).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`No replacements made${parseMessage}`).done();
+				const missingMessage = missingPathsNote ? `\n${missingPathsNote}` : "";
+				return toolResult(baseDetails).text(`No replacements made${parseMessage}${missingMessage}`).done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -372,38 +617,84 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			if (dedupedParseErrors.length) {
 				outputLines.push("", ...formatParseErrors(dedupedParseErrors));
 			}
+			if (missingPathsNote) {
+				outputLines.push("", missingPathsNote);
+			}
 
-			// Register pending action so `resolve` can apply or discard these previewed changes
-			if (!result.applied && result.totalReplacements > 0) {
+			// Register pending action so `resolve` can apply or discard these previewed changes.
+			// TODO(server): queued apply still reuses the original tool-call signal because queueResolveHandler() cannot accept the later resolve-time AbortSignal yet.
+			if (shouldPreview && !result.applied && result.totalReplacements > 0) {
 				const previewReplacementPlural = result.totalReplacements !== 1 ? "s" : "";
 				const previewFilePlural = result.filesTouched !== 1 ? "s" : "";
 				queueResolveHandler(this.session, {
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
-						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-							rewrites: normalizedRewrites,
-							dryRun: false,
-							maxFiles,
-							failOnParseError: false,
-						});
-						const dedupedApplyParseErrors = dedupeParseErrors(applyResult.parseErrors);
-						const { record: recordAppliedFile, list: appliedFileList } = createFileRecorder();
-						const appliedFileReplacementCounts = new Map<string, number>();
-						for (const fileChange of applyResult.fileChanges) {
-							const relativePath = formatPath(fileChange.path);
-							recordAppliedFile(relativePath);
-							appliedFileReplacementCounts.set(
-								relativePath,
-								(appliedFileReplacementCounts.get(relativePath) ?? 0) + fileChange.count,
+						const freshPreview = await runAstEditOnce(
+							backend,
+							backendPaths,
+							{
+								ops,
+								language: params.language,
+								dryRun: true,
+								signal,
+							},
+							false,
+						);
+						const dedupedFreshParseErrors = dedupeParseErrors(freshPreview.parseErrors);
+						const freshSummary = summarizeFiles(freshPreview);
+						const stalePreview =
+							freshPreview.totalReplacements !== result.totalReplacements ||
+							freshPreview.filesTouched !== result.filesTouched ||
+							fileList.some(
+								filePath =>
+									freshSummary.fileReplacementCounts.get(filePath) !== fileReplacementCounts.get(filePath),
+							) ||
+							freshSummary.fileList.some(
+								filePath =>
+									fileReplacementCounts.get(filePath) !== freshSummary.fileReplacementCounts.get(filePath),
 							);
+						if (stalePreview) {
+							const freshFileReplacements = freshSummary.fileList.map(filePath => ({
+								path: filePath,
+								count: freshSummary.fileReplacementCounts.get(filePath) ?? 0,
+							}));
+							const freshDetails: AstEditToolDetails = {
+								totalReplacements: freshPreview.totalReplacements,
+								filesTouched: freshPreview.filesTouched,
+								filesSearched: freshPreview.filesSearched,
+								applied: freshPreview.applied,
+								limitReached: freshPreview.limitReached,
+								...(dedupedFreshParseErrors.length > 0 ? { parseErrors: dedupedFreshParseErrors } : {}),
+								scopePath,
+								files: freshSummary.fileList,
+								fileReplacements: freshFileReplacements,
+								missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
+							};
+							const text =
+								freshPreview.totalReplacements === 0
+									? `Preview is stale / no longer matches; no replacements were applied. Preview expected ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}.`
+									: freshPreview.totalReplacements < result.totalReplacements
+										? `Preview is stale / no longer matches; preview now shows ${freshPreview.totalReplacements} of ${result.totalReplacements} replacements in ${freshPreview.filesTouched} of ${result.filesTouched} files.`
+										: `Preview is stale / no longer matches; preview now shows ${freshPreview.totalReplacements} replacements but the queued preview expected ${result.totalReplacements}.`;
+							return { ...toolResult(freshDetails).text(text).done(), isError: true };
 						}
-						for (const change of applyResult.changes) {
-							recordAppliedFile(formatPath(change.path));
-						}
-						const appliedFileReplacements = appliedFileList.map(filePath => ({
+						const applyResult = await runAstEditOnce(
+							backend,
+							backendPaths,
+							{
+								ops,
+								language: params.language,
+								dryRun: false,
+								signal,
+							},
+							true,
+						);
+						const dedupedApplyParseErrors = dedupeParseErrors(applyResult.parseErrors);
+						const appliedSummary = summarizeFiles(applyResult);
+						const appliedFileReplacements = appliedSummary.fileList.map(filePath => ({
 							path: filePath,
-							count: appliedFileReplacementCounts.get(filePath) ?? 0,
+							count: appliedSummary.fileReplacementCounts.get(filePath) ?? 0,
 						}));
 						const appliedDetails: AstEditToolDetails = {
 							totalReplacements: applyResult.totalReplacements,
@@ -413,27 +704,10 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							limitReached: applyResult.limitReached,
 							...(dedupedApplyParseErrors.length > 0 ? { parseErrors: dedupedApplyParseErrors } : {}),
 							scopePath,
-							files: appliedFileList,
+							files: appliedSummary.fileList,
 							fileReplacements: appliedFileReplacements,
+							missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 						};
-						const stalePreview =
-							applyResult.totalReplacements !== result.totalReplacements ||
-							applyResult.filesTouched !== result.filesTouched ||
-							fileList.some(
-								filePath => appliedFileReplacementCounts.get(filePath) !== fileReplacementCounts.get(filePath),
-							) ||
-							appliedFileList.some(
-								filePath => fileReplacementCounts.get(filePath) !== appliedFileReplacementCounts.get(filePath),
-							);
-						if (stalePreview) {
-							const text =
-								applyResult.totalReplacements === 0
-									? `Preview is stale / no longer matches; no replacements were applied. Preview expected ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}.`
-									: applyResult.totalReplacements < result.totalReplacements
-										? `Preview is stale / no longer matches; only ${applyResult.totalReplacements} of ${result.totalReplacements} replacements were applied in ${applyResult.filesTouched} of ${result.filesTouched} files.`
-										: `Preview is stale / no longer matches; applied ${applyResult.totalReplacements} replacements but preview expected ${result.totalReplacements}.`;
-							return { ...toolResult(appliedDetails).text(text).done(), isError: true };
-						}
 						const appliedReplacementPlural = applyResult.totalReplacements !== 1 ? "s" : "";
 						const appliedFilePlural = applyResult.filesTouched !== 1 ? "s" : "";
 						const text = `Applied ${applyResult.totalReplacements} replacement${appliedReplacementPlural} in ${applyResult.filesTouched} file${appliedFilePlural}.`;
@@ -502,6 +776,9 @@ export const astEditToolRenderer = {
 			if (filesSearched > 0) meta.push(`searched ${filesSearched}`);
 			const header = renderStatusLine({ icon: "warning", title: "AST Edit", description, meta }, uiTheme);
 			const lines = [header, formatEmptyMessage("No replacements made", uiTheme)];
+			if (details?.missingPaths?.length) {
+				lines.push(uiTheme.fg("warning", `skipped missing: ${details.missingPaths.join(", ")}`));
+			}
 			if (details?.parseErrors?.length) {
 				const capped = details.parseErrors.slice(0, PARSE_ERRORS_LIMIT);
 				for (const err of capped) {
@@ -549,7 +826,9 @@ export const astEditToolRenderer = {
 			group => !group[0]?.startsWith("Safety cap reached") && !group[0]?.startsWith("Parse issues:"),
 		);
 
-		const badge = { label: "proposed", color: "warning" as const };
+		const badge = details?.applied
+			? { label: "applied", color: "success" as const }
+			: { label: "proposed", color: "warning" as const };
 		const header = renderStatusLine(
 			{ icon: limitReached ? "warning" : "success", title: "AST Edit", description, badge, meta },
 			uiTheme,
@@ -566,6 +845,9 @@ export const astEditToolRenderer = {
 					? `${PARSE_ERRORS_LIMIT} / ${total} parse issues`
 					: `${total} parse issue${total !== 1 ? "s" : ""}`;
 			extraLines.push(uiTheme.fg("warning", label));
+		}
+		if (details?.missingPaths?.length) {
+			extraLines.push(uiTheme.fg("warning", `skipped missing: ${details.missingPaths.join(", ")}`));
 		}
 		let cached: RenderCache | undefined;
 		return {

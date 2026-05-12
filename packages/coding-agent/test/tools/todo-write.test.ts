@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type TodoPhase, TodoWriteTool } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
@@ -10,6 +11,7 @@ function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 		settings: Settings.isolated(),
 		getTodoPhases: () => phases,
 		setTodoPhases: next => {

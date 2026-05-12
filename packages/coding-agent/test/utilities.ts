@@ -14,6 +14,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { e2eApiKey } from "../../ai/test/oauth";
+import { LocalBackend } from "../src/backend";
 
 export { e2eApiKey };
 
@@ -82,6 +83,7 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: tempDir }),
 		settings: Settings.isolated(options.settingsOverrides),
 	};
 	const tools = await createTools(toolSession);

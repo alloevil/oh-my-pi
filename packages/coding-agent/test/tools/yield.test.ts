@@ -5,6 +5,7 @@ import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
+import { LocalBackend } from "../../src/backend";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -12,6 +13,7 @@ function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp" }),
 		settings: Settings.isolated(),
 		...overrides,
 	};

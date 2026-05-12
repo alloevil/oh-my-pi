@@ -20,9 +20,9 @@ Tool params:
 
 ```ts
 {
-  cells: Array<{ code: string; title?: string }>;
-  timeout?: number; // seconds, clamped to 1..600, default 30
-  reset?: boolean; // reset selected runtime before the first cell only
+  input: string;
+  transport?: "stdio" | "jupyter";
+  idleTimeoutMs?: number;
 }
 ```
 
@@ -70,6 +70,16 @@ There are two gateway paths:
 
 ## Kernel lifecycle
 
+The `eval` tool parses `input` into one or more cells, then resolves Python cells onto a retained kernel handle name via `getEvalKernelName(...)`. `transport` and `idleTimeoutMs` are request-level overrides on that retained handle config, not per-cell fields in `input`.
+
+Before a Python cell runs, `ensureEvalKernel(...)` on the tool side:
+- reads `backend.kernel.get(name)`
+- compares `{ lang, transport, idleTimeoutMs }`
+- deletes the handle on `*** Reset` or config mismatch
+- recreates it with `backend.kernel.put(name, { kind: "eval", lang: "python", transport, idleTimeoutMs })`
+
+Cells then stream through `backend.kernel.exec(name, { code, cwd, signal })`.
+
 Kernels are created via `POST /api/kernels` on the selected gateway when a retained session needs a kernel or when `per-call` mode starts a request.
 
 Kernel startup sequence:
@@ -116,7 +126,7 @@ If an intermediate cell fails:
 - Tool returns a targeted error indicating which cell failed.
 - Later cells are not executed.
 
-`reset=true` only applies to the first cell execution in that call.
+`*** Reset` applies per parsed cell. For Python cells it forces retained-handle recreation before that cell executes.
 
 ## Environment filtering and runtime resolution
 
@@ -164,7 +174,7 @@ If Python preflight fails and `eval.js` is enabled, `eval` remains available and
 
 ### Tool-level timeout
 
-`eval` timeout is in seconds, default 30, clamped to `1..600`.
+The tool schema no longer takes `{ timeout, reset, cells }` JSON fields. Timeout and reset live inside the parsed cell program (`*** Timeout: ...`, `*** Reset`), while top-level tool params are `{ input, transport, idleTimeoutMs }`.
 
 The tool combines:
 

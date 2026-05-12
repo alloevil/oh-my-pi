@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
-import * as pyKernel from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
+import { LocalBackend } from "../../src/backend";
+import * as jsExecutor from "../../src/eval/js/executor";
+import * as pyExecutor from "../../src/eval/py/executor";
+import * as pyKernel from "../../src/eval/py/kernel";
+import type { ToolSession } from "../../src/tools";
+import { EvalTool } from "../../src/tools/eval";
 
 function makeSession(): ToolSession {
 	return {
@@ -11,6 +13,7 @@ function makeSession(): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
+		backend: new LocalBackend({ cwd: "/tmp/eval-test" }),
 		settings: Settings.isolated(),
 	};
 }
@@ -26,6 +29,7 @@ const mockResult = {
 	outputLines: 1,
 	outputBytes: 2,
 	displayOutputs: [],
+	stdinRequested: false,
 };
 
 describe("EvalTool language resolution", () => {
@@ -35,12 +39,12 @@ describe("EvalTool language resolution", () => {
 
 	it("dispatches to js when fenced code declares ```js", async () => {
 		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		const jsExecuteSpy = vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(mockResult);
-		const pythonExecuteSpy = vi.spyOn(evalIndex.pythonBackend, "execute");
+		const jsExecuteSpy = vi.spyOn(jsExecutor, "executeJs").mockResolvedValue(mockResult);
+		const pythonExecuteSpy = vi.spyOn(pyExecutor, "executePython");
 
 		const tool = new EvalTool(makeSession());
 		await tool.execute("call-1", {
-			input: "```js one\nconst x = 1;\n```\n",
+			input: "```js\nconst x = 1;\n```\n",
 		});
 
 		expect(jsExecuteSpy).toHaveBeenCalledTimes(1);
@@ -48,13 +52,13 @@ describe("EvalTool language resolution", () => {
 	});
 
 	it("dispatches to python when fenced code declares ```python", async () => {
-		const pythonExecuteSpy = vi.spyOn(evalIndex.pythonBackend, "execute").mockResolvedValue(mockResult);
-		vi.spyOn(evalIndex.pythonBackend, "isAvailable").mockResolvedValue(true);
-		const jsExecuteSpy = vi.spyOn(evalIndex.jsBackend, "execute");
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const pythonExecuteSpy = vi.spyOn(pyExecutor, "executePython").mockResolvedValue(mockResult);
+		const jsExecuteSpy = vi.spyOn(jsExecutor, "executeJs");
 
 		const tool = new EvalTool(makeSession());
 		await tool.execute("call-2", {
-			input: "```python one\nprint('hi')\n```\n",
+			input: "```python\nprint('hi')\n```\n",
 		});
 
 		expect(pythonExecuteSpy).toHaveBeenCalledTimes(1);
@@ -62,9 +66,9 @@ describe("EvalTool language resolution", () => {
 	});
 
 	it("auto-detects python via syntactic markers when fence is bare", async () => {
-		const pythonExecuteSpy = vi.spyOn(evalIndex.pythonBackend, "execute").mockResolvedValue(mockResult);
-		vi.spyOn(evalIndex.pythonBackend, "isAvailable").mockResolvedValue(true);
-		const jsExecuteSpy = vi.spyOn(evalIndex.jsBackend, "execute");
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const pythonExecuteSpy = vi.spyOn(pyExecutor, "executePython").mockResolvedValue(mockResult);
+		const jsExecuteSpy = vi.spyOn(jsExecutor, "executeJs");
 
 		const tool = new EvalTool(makeSession());
 		await tool.execute("call-3", {

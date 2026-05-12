@@ -4,6 +4,7 @@ import { getThemeByName } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ResolveTool, resolveToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/resolve";
 import { sanitizeText } from "@oh-my-pi/pi-natives";
+import { LocalBackend } from "../../src/backend";
 
 function createSession(handler?: (input: unknown) => Promise<unknown>): ToolSession {
 	return {
@@ -11,6 +12,7 @@ function createSession(handler?: (input: unknown) => Promise<unknown>): ToolSess
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp" }),
 		settings: Settings.isolated(),
 		peekQueueInvoker: handler ? () => handler : () => undefined,
 	};

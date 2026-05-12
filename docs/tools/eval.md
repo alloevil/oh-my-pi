@@ -25,6 +25,8 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `input` | `string` | Yes | Cell program text. Parsed by `parseEvalInput()` in `packages/coding-agent/src/eval/parse.ts`, not by JSON subfields. |
+| `transport` | `"stdio" \| "jupyter"` | No | Kernel transport override for retained backend handles. Passed through `ensureEvalKernel(...)` before execution. |
+| `idleTimeoutMs` | `number` | No | Positive integer idle timeout for the retained kernel handle. If the existing handle was created with different transport/idle-timeout settings, the tool recreates it before running cells. |
 
 `input` syntax accepted at runtime:
 
@@ -87,13 +89,20 @@ Side-channel artifacts:
    - if no explicit language was present, later cells prefer the previous runtime language before re-sniffing
    - Python is preferred when available; JS is the fallback when Python is unavailable or disabled
 4. The tool allocates an `OutputSink`, a `TailBuffer`, per-cell result objects, and a `sessionAbortController`. `session.trackEvalExecution?.(...)` can wrap the whole run for external cancellation tracking.
-5. Cells execute sequentially. For each cell, `execute()`:
+5. Before each cell executes, `execute()` ensures the retained runtime handle exists for that language:
+   - it computes the session-derived handle name with `getEvalKernelName(...)`
+   - it calls `ensureEvalKernel(...)`, which reads `backend.kernel.get(name)` and recreates the handle with `backend.kernel.delete/put` when `*** Reset`, `transport`, or `idleTimeoutMs` changed
+   - the local backend then maps `lang: "python"` to the Python kernel executor and `lang: "js"` to the persistent JS runtime
+6. Cells execute sequentially. For each cell, `execute()`:
    - clamps the cell timeout through `clampTimeout("eval", ...)`
    - builds a combined abort signal from the tool signal, the timeout, and the session abort controller
    - marks the cell `running` and emits an update
-   - calls the backend’s `execute()` with `cwd`, `sessionId`, `sessionFile`, `kernelOwnerId`, `deadlineMs`, `reset`, artifact info, and chunk callback
-6. JS cells dispatch through `packages/coding-agent/src/eval/js/index.ts` into `executeJs()`; Python cells dispatch through `packages/coding-agent/src/eval/py/index.ts` into `executePython()`.
-7. Backend text chunks stream into the shared `OutputSink`; rich outputs are accumulated separately as JSON, images, markdown markers, and status events.
+   - runs the cell through `backend.kernel.exec(kernelName, { code, cwd, signal })`
+7. Kernel/runtime events are normalized while the cell runs:
+   - plain text appends to the shared `OutputSink`
+   - `application/json` becomes `details.jsonOutputs`
+   - images and markdown are captured separately
+   - `application/x-omp-status` is parsed as `EvalStatusEvent` records and streamed into both per-cell and aggregate `statusEvents`
 8. After each cell:
    - text output is trimmed and stored on that cell result
    - multi-cell runs prefix text with `[i/n]` and the optional title
@@ -143,9 +152,10 @@ Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packa
 
 Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding-agent/src/eval/py/kernel.ts`, and `packages/coding-agent/src/eval/py/prelude.py`. See `docs/python-repl.md` for gateway and kernel details.
 
-- Default mode is retained `session` kernels keyed by `python:${sessionId}`
+- Retained backend handles are named by `getEvalKernelName(...)`: Python uses `kernelOwnerId` when present, otherwise `${sessionId}:python`; JS uses `${sessionId}:js`.
 - Optional `python.kernelMode = "per-call"` creates a fresh kernel for each cell and shuts it down afterward
-- `*** Reset` disposes the retained kernel for that session before the cell runs; later Python cells in the same tool call reuse the fresh kernel
+- `*** Reset` deletes the retained backend kernel handle before the cell runs; later Python cells in the same tool call reuse the freshly created handle
+- `transport` and `idleTimeoutMs` are handle-level knobs. Changing either forces handle recreation before execution so one call cannot silently reuse a mismatched retained kernel.
 - Startup path:
   - availability check
   - create/connect kernel

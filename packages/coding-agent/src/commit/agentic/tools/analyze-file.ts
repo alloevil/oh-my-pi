@@ -1,5 +1,6 @@
 import { prompt } from "@oh-my-pi/pi-utils";
 import { Type } from "@sinclair/typebox";
+import { type Backend, pickBackend } from "../../../backend";
 import analyzeFilePrompt from "../../../commit/agentic/prompts/analyze-file.md" with { type: "text" };
 import type { CommitAgentState } from "../../../commit/agentic/state";
 import type { NumstatEntry } from "../../../commit/types";
@@ -33,11 +34,13 @@ function buildToolSession(
 		modelRegistry: ModelRegistry;
 		settings: Settings;
 		spawns: string;
+		backend: Backend;
 	},
 ): ToolSession {
 	return {
 		cwd: options.cwd,
 		hasUI: false,
+		backend: options.backend,
 		getSessionFile: () => ctx.sessionManager.getSessionFile() ?? null,
 		getSessionSpawns: () => options.spawns,
 		settings: options.settings,
@@ -60,28 +63,33 @@ export function createAnalyzeFileTool(options: {
 		description: "Spawn quick_task agents to analyze files.",
 		parameters: analyzeFileSchema,
 		async execute(toolCallId, params, onUpdate, ctx, signal) {
-			const toolSession = buildToolSession(ctx, options);
-			const taskTool = await TaskTool.create(toolSession);
-			const numstat = options.state.overview?.numstat ?? [];
-			const tasks = params.files.map((file, index) => {
-				const relatedFiles = formatRelatedFiles(params.files, file, numstat);
-				const assignment = prompt.render(analyzeFilePrompt, {
-					file,
-					goal: params.goal,
-					related_files: relatedFiles,
+			const backend = pickBackend({ cwd: options.cwd, env: Bun.env });
+			try {
+				const toolSession = buildToolSession(ctx, { ...options, backend });
+				const taskTool = await TaskTool.create(toolSession);
+				const numstat = options.state.overview?.numstat ?? [];
+				const tasks = params.files.map((file, index) => {
+					const relatedFiles = formatRelatedFiles(params.files, file, numstat);
+					const assignment = prompt.render(analyzeFilePrompt, {
+						file,
+						goal: params.goal,
+						related_files: relatedFiles,
+					});
+					return {
+						id: `AnalyzeFile${index + 1}`,
+						description: `Analyze ${file}`,
+						assignment,
+					};
 				});
-				return {
-					id: `AnalyzeFile${index + 1}`,
-					description: `Analyze ${file}`,
-					assignment,
+				const taskParams: TaskParams = {
+					agent: "quick_task",
+					schema: JSON.stringify(analyzeFileOutputSchema),
+					tasks,
 				};
-			});
-			const taskParams: TaskParams = {
-				agent: "quick_task",
-				schema: JSON.stringify(analyzeFileOutputSchema),
-				tasks,
-			};
-			return taskTool.execute(toolCallId, taskParams, signal, onUpdate);
+				return await taskTool.execute(toolCallId, taskParams, signal, onUpdate);
+			} finally {
+				await backend.dispose();
+			}
 		},
 	};
 }

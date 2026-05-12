@@ -14,6 +14,7 @@ import {
 	tasksFromCargoMetadata,
 	titleFromOp,
 } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 const detectedRunners: DetectedRunner[] = [
 	{
@@ -52,13 +53,16 @@ const detectedRunners: DetectedRunner[] = [
 const tempDirs: string[] = [];
 
 function createTestSession(cwd: string, settings = Settings.isolated()): ToolSession {
-	return {
+	const session = {
 		cwd,
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings,
-	};
+	} as ToolSession;
+
+	session.backend = new LocalBackend({ cwd: session.cwd });
+	return session;
 }
 
 describe("recipe", () => {

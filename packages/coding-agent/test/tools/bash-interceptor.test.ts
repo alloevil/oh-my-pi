@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { LocalBackend } from "../../src/backend";
 import type { BashInterceptorRule } from "../../src/config/settings-schema";
 import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
@@ -18,6 +19,8 @@ function createBashTool(rules: BashInterceptorRule[]): BashTool {
 				return rules;
 			},
 		},
+		cwd: "/tmp/test",
+		backend: new LocalBackend({ cwd: "/tmp/test" }),
 	} as unknown as ToolSession;
 
 	return new BashTool(session);

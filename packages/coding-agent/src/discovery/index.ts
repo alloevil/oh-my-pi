@@ -16,7 +16,6 @@ import "../capability/rule";
 import "../capability/settings";
 import "../capability/skill";
 import "../capability/slash-command";
-import "../capability/ssh";
 import "../capability/system-prompt";
 import "../capability/tool";
 // Import providers (each registers itself on import)
@@ -32,7 +31,6 @@ import "./gemini";
 import "./opencode";
 import "./github";
 import "./mcp-json";
-import "./ssh";
 import "./vscode";
 import "./windsurf";
 
@@ -72,7 +70,6 @@ export type { Rule, RuleFrontmatter } from "../capability/rule";
 export type { Settings } from "../capability/settings";
 export type { Skill, SkillFrontmatter } from "../capability/skill";
 export type { SlashCommand } from "../capability/slash-command";
-export type { SSHHost } from "../capability/ssh";
 export type { SystemPrompt } from "../capability/system-prompt";
 export type { CustomTool } from "../capability/tool";
 // Re-export types

@@ -1,7 +1,14 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
+import { logger } from "@oh-my-pi/pi-utils";
+import {
+	type DetectedRunner,
+	execRecipeCommand,
+	isBackendFile,
+	type RecipeBackend,
+	type RunnerTask,
+	readBackendText,
+	type TaskRunner,
+} from "../runner";
 
 const MAKEFILE_NAMES = ["Makefile", "makefile", "GNUmakefile"] as const;
 const TARGET_PATTERN = /^(?<name>[A-Za-z_][A-Za-z0-9_-]*)\s*:(?!=).*?(?:##\s*(?<doc>.+))?$/u;
@@ -14,17 +21,17 @@ interface MakeTargetInfo {
 	phony: boolean;
 }
 
-async function findMakefile(cwd: string): Promise<string | null> {
+async function findMakefile(cwd: string, backend: RecipeBackend): Promise<string | null> {
 	for (const name of MAKEFILE_NAMES) {
 		const candidate = path.join(cwd, name);
-		try {
-			const stat = await fs.stat(candidate);
-			if (stat.isFile()) return candidate;
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
-		}
+		if (await isBackendFile(backend, candidate)) return candidate;
 	}
 	return null;
+}
+
+async function probeMake(cwd: string, backend: RecipeBackend): Promise<boolean> {
+	const result = await execRecipeCommand(backend, cwd, "make -p -q");
+	return result.exitCode === 0 || result.exitCode === 1;
 }
 
 function isVariableAssignment(line: string, name: string): boolean {
@@ -85,12 +92,12 @@ function parseMakeTargets(text: string): RunnerTask[] {
 export const makeRunner: TaskRunner = {
 	id: "make",
 	label: "Make",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, backend: RecipeBackend): Promise<DetectedRunner | null> {
 		try {
-			if (!$which("make")) return null;
-			const makefile = await findMakefile(cwd);
+			const makefile = await findMakefile(cwd, backend);
 			if (!makefile) return null;
-			const tasks = parseMakeTargets(await Bun.file(makefile).text());
+			if (!(await probeMake(cwd, backend))) return null;
+			const tasks = parseMakeTargets(await readBackendText(backend, makefile));
 			if (tasks.length === 0) return null;
 			return { id: "make", label: "Make", commandPrefix: "make", tasks };
 		} catch (err) {

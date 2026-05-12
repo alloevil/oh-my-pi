@@ -1,17 +1,25 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL, Text } from "@oh-my-pi/pi-tui";
-import { $env, getProjectDir, isEnoent, prompt } from "@oh-my-pi/pi-utils";
+import { $env, getProjectDir, logger, prompt } from "@oh-my-pi/pi-utils";
 import { Type } from "@sinclair/typebox";
 import { AsyncJobManager } from "../async";
-import { type BashResult, executeBash } from "../exec/bash-executor";
+import type { BashEvent, BashExecRequest, StatResult } from "../backend/types";
+import type { BashResult } from "../exec/bash-executor";
+
+declare module "../exec/bash-executor" {
+	interface BashResult {
+		timedOut?: boolean;
+	}
+}
+
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import type { Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
-import { DEFAULT_MAX_BYTES, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import { DEFAULT_MAX_BYTES, OutputSink, streamTailUpdates, TailBuffer } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
@@ -31,17 +39,6 @@ export const BASH_DEFAULT_PREVIEW_LINES = 10;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 
-async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
-	try {
-		const alloc = await session.allocateOutputArtifact?.("bash-original");
-		if (!alloc?.path || !alloc.id) return undefined;
-		await Bun.write(alloc.path, originalText);
-		return alloc.id;
-	} catch {
-		return undefined;
-	}
-}
-
 const bashSchemaBase = Type.Object({
 	command: Type.String({ description: "command to execute", examples: ["ls -la", "echo hi"] }),
 	env: Type.Optional(
@@ -55,6 +52,11 @@ const bashSchemaBase = Type.Object({
 	pty: Type.Optional(
 		Type.Boolean({
 			description: "run in pty mode",
+		}),
+	),
+	outputStreams: Type.Optional(
+		Type.Union([Type.Literal("merged"), Type.Literal("split")], {
+			description: "output stream mode",
 		}),
 	),
 });
@@ -75,6 +77,7 @@ export interface BashToolInput {
 	env?: Record<string, string>;
 	timeout?: number;
 	cwd?: string;
+	outputStreams?: "merged" | "split";
 
 	async?: boolean;
 	pty?: boolean;
@@ -111,12 +114,106 @@ interface ManagedBashJobHandle {
 	setBackgrounded: (backgrounded: boolean) => void;
 }
 
+type BashExecRequestWithSignal = BashExecRequest & {
+	signal?: AbortSignal;
+};
+
+type ToolBashOutputEvent =
+	| (Extract<BashEvent, { type: "output" }> & {
+			data?: string;
+	  })
+	| {
+			type: "stdout" | "stderr";
+			text?: string;
+			data?: string;
+	  };
+
+type ToolBashExitEvent = {
+	type: "exit";
+	exitCode: number | null;
+	signaled: boolean;
+	cancelled?: boolean;
+	timedOut?: boolean;
+	minimizer?: {
+		minimized: boolean;
+		originalLines: number;
+		minimizedLines: number;
+		omittedLines: number;
+		truncated: boolean;
+		rawArtifact?: { kind: "path"; path: string } | { kind: "bytes"; bytes: Uint8Array };
+	};
+};
+
+type ToolBashEvent = ToolBashOutputEvent | ToolBashExitEvent;
+
+function assertNever(value: never): never {
+	throw new ToolError(`Unhandled bash event: ${JSON.stringify(value)}`);
+}
+
+function getBashEventText(event: Extract<ToolBashEvent, { type: "output" | "stdout" | "stderr" }>): string {
+	return event.text ?? event.data ?? "";
+}
+
+type BashRawArtifact = NonNullable<NonNullable<ToolBashExitEvent["minimizer"]>["rawArtifact"]>;
+
+async function saveBashOriginalArtifact(
+	session: ToolSession,
+	options:
+		| { backendKind: "local" | "remote"; text: string }
+		| {
+				backendKind: "local" | "remote";
+				rawArtifact: BashRawArtifact;
+		  },
+): Promise<string | undefined> {
+	try {
+		const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.("bash-original")) ?? {};
+		if (!artifactPath || !artifactId) {
+			return undefined;
+		}
+		if ("text" in options) {
+			await Bun.write(artifactPath, options.text);
+			return artifactId;
+		}
+		if (options.rawArtifact.kind === "path") {
+			if (options.backendKind === "remote") {
+				logger.warn("refusing remote path artifact");
+				return undefined;
+			}
+			const bytes = await Bun.file(options.rawArtifact.path).bytes();
+			await Bun.write(artifactPath, bytes);
+			await fs.unlink(options.rawArtifact.path);
+			return artifactId;
+		}
+		await Bun.write(artifactPath, options.rawArtifact.bytes);
+		return artifactId;
+	} catch (error) {
+		logger.warn("failed to save bash original artifact", { error });
+		return undefined;
+	}
+}
+
 function normalizeResultOutput(result: BashResult | BashInteractiveResult): string {
 	return result.output || "";
 }
 
-function isInteractiveResult(result: BashResult | BashInteractiveResult): result is BashInteractiveResult {
-	return "timedOut" in result;
+function formatManagedBashJobError(error: unknown): string {
+	if (error instanceof ToolError) {
+		return error.render();
+	}
+	if (error instanceof ToolAbortError) {
+		return error.message;
+	}
+	if (!(error instanceof Error)) {
+		return String(error);
+	}
+	const lines = [error.name && error.name !== "Error" ? `${error.name}: ${error.message}` : error.message];
+	const cause = error.cause;
+	if (cause instanceof Error) {
+		lines.push(`Cause: ${cause.name && cause.name !== "Error" ? `${cause.name}: ${cause.message}` : cause.message}`);
+	} else if (typeof cause === "string" && cause.length > 0) {
+		lines.push(`Cause: ${cause}`);
+	}
+	return lines.join("\n");
 }
 
 function normalizeBashEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
@@ -232,14 +329,27 @@ function formatTimeoutClampNotice(requestedTimeoutSec: number, effectiveTimeoutS
  *
  * Executes bash commands with optional timeout and working directory.
  */
-export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
+export class BashTool implements AgentTool<BashToolSchema, BashToolDetails, Theme> {
 	readonly name = "bash";
 	readonly label = "Bash";
 	readonly loadMode = "essential";
 	readonly description: string;
 	readonly parameters: BashToolSchema;
 	readonly concurrency = "exclusive";
+	readonly inline = true;
+	readonly mergeCallAndResult = true;
 	readonly strict = true;
+	readonly renderCall: (args: BashRenderArgs, options: RenderResultOptions, uiTheme: Theme) => Component;
+	readonly renderResult: (
+		result: {
+			content: Array<{ type: string; text?: string }>;
+			details?: BashToolDetails;
+			isError?: boolean;
+		},
+		options: RenderResultOptions & { renderContext?: BashRenderContext },
+		uiTheme: Theme,
+		args?: BashRenderArgs,
+	) => Component;
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;
@@ -263,6 +373,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasSearch: this.session.settings.get("search.enabled"),
 			hasFind: this.session.settings.get("find.enabled"),
 		});
+		const renderer = createShellRenderer<BashRenderArgs>({
+			resolveTitle: () => "Bash",
+			resolveBaseCwd: () => this.session.cwd,
+			resolveCommand: args => args?.command,
+			resolveCwd: args => args?.cwd,
+			resolveEnv: args => args?.env,
+		});
+		this.renderCall = renderer.renderCall;
+		this.renderResult = renderer.renderResult;
 	}
 
 	#formatResultOutput(result: BashResult | BashInteractiveResult): string {
@@ -271,11 +390,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	#buildResultText(result: BashResult | BashInteractiveResult, timeoutSec: number, outputText: string): string {
+		if (result.timedOut) {
+			throw new ToolError(normalizeResultOutput(result) || `Command timed out after ${timeoutSec} seconds`);
+		}
 		if (result.cancelled) {
 			throw new ToolError(normalizeResultOutput(result) || "Command aborted");
-		}
-		if (isInteractiveResult(result) && result.timedOut) {
-			throw new ToolError(normalizeResultOutput(result) || `Command timed out after ${timeoutSec} seconds`);
 		}
 		if (result.exitCode === undefined) {
 			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status`);
@@ -341,6 +460,137 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return result.content.find(block => block.type === "text")?.text ?? "";
 	}
 
+	async #executeBackendBash(options: {
+		command: string;
+		commandCwd: string;
+		timeoutMs: number;
+		signal?: AbortSignal;
+		env?: Record<string, string>;
+		pty?: boolean;
+		outputStreams?: "merged" | "split";
+		artifactPath?: string;
+		artifactId?: string;
+		onChunk?: (chunk: string) => void;
+	}): Promise<BashResult> {
+		const sink = new OutputSink({
+			onChunk: options.onChunk,
+			artifactPath: options.artifactPath,
+			artifactId: options.artifactId,
+			chunkThrottleMs: options.onChunk ? 50 : 0,
+		});
+		if (options.signal?.aborted) {
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				timedOut: false,
+				...(await sink.dump("Command cancelled")),
+			};
+		}
+
+		const backend = this.session.backend;
+		const shellMinimizer = this.session.settings.getGroup("shellMinimizer");
+		const request: BashExecRequestWithSignal = {
+			command: options.command,
+			cwd: options.commandCwd,
+			env: options.env,
+			timeout_ms: options.timeoutMs,
+			pty: options.pty ?? false,
+			outputStreams: options.outputStreams,
+			minimizer: {
+				enabled: shellMinimizer.enabled,
+				aggressive: undefined,
+				minLines: undefined,
+				contextLines: undefined,
+			},
+			sessionKey: this.session.getSessionId?.() ?? undefined,
+			signal: options.signal,
+		};
+
+		let exitEvent: ToolBashExitEvent | undefined;
+		const interleavedChunks: string[] = [];
+		const outputTail = new TailBuffer(DEFAULT_MAX_BYTES);
+		for await (const rawEvent of backend.shell.exec(request)) {
+			const event: ToolBashEvent = rawEvent;
+			switch (event.type) {
+				case "output": {
+					const text = getBashEventText(event);
+					interleavedChunks.push(text);
+					outputTail.append(text);
+					sink.push(text);
+					continue;
+				}
+				case "stdout": {
+					const text = getBashEventText(event);
+					interleavedChunks.push(text);
+					outputTail.append(text);
+					sink.push(text);
+					continue;
+				}
+				case "stderr": {
+					const text = getBashEventText(event);
+					interleavedChunks.push(text);
+					outputTail.append(text);
+					sink.push(text);
+					continue;
+				}
+				case "exit":
+					exitEvent = event;
+					continue;
+				default:
+					assertNever(event);
+			}
+		}
+
+		if (!exitEvent) {
+			const bufferedTail = outputTail.text().trimEnd();
+			throw new ToolError(
+				bufferedTail.length > 0
+					? `${bufferedTail}\n\nCommand failed: missing exit event`
+					: "Command failed: missing exit event",
+			);
+		}
+		if (exitEvent.minimizer?.minimized) {
+			const rawArtifactId = exitEvent.minimizer.rawArtifact
+				? await saveBashOriginalArtifact(this.session, {
+						backendKind: backend.kind,
+						rawArtifact: exitEvent.minimizer.rawArtifact,
+					})
+				: interleavedChunks.length > 0
+					? await saveBashOriginalArtifact(this.session, {
+							backendKind: backend.kind,
+							text: interleavedChunks.join(""),
+						})
+					: undefined;
+			if (rawArtifactId) {
+				sink.push(`\n[raw output: artifact://${rawArtifactId}]\n`);
+			}
+		}
+		// The backend owns hard-timeout enforcement; this tool consumes the streamed exit event
+		// instead of layering a second kill path on top.
+		if (exitEvent.timedOut) {
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				timedOut: true,
+				...(await sink.dump(`Command timed out after ${Math.round(options.timeoutMs / 1000)} seconds`)),
+			};
+		}
+		if (exitEvent.cancelled || (exitEvent.signaled && exitEvent.exitCode === null)) {
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				timedOut: false,
+				...(await sink.dump("Command cancelled")),
+			};
+		}
+		return {
+			exitCode: exitEvent.exitCode ?? undefined,
+			cancelled: false,
+			timedOut: false,
+			...(await sink.dump()),
+		};
+	}
+
 	#startManagedBashJob(options: {
 		command: string;
 		commandCwd: string;
@@ -348,6 +598,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		timeoutSec: number;
 		requestedTimeoutSec?: number;
 		timeoutClampNotice?: string;
+		outputStreams?: "merged" | "split";
 
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
@@ -370,12 +621,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 				try {
-					const result = await executeBash(options.command, {
-						cwd: options.commandCwd,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
-						timeout: options.timeoutMs,
+					const result = await this.#executeBackendBash({
+						command: options.command,
+						commandCwd: options.commandCwd,
+						timeoutMs: options.timeoutMs,
 						signal: runSignal,
 						env: options.resolvedEnv,
+						outputStreams: options.outputStreams,
 						artifactPath,
 						artifactId,
 						onChunk: chunk => {
@@ -383,7 +635,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							latestText = tailBuffer.text();
 							void reportProgress(latestText, { async: { state: "running", jobId, type: "bash" } });
 						},
-						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -395,7 +646,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					await reportProgress(finalText, { async: { state: "completed", jobId, type: "bash" } });
 					return finalText;
 				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
+					const message = formatManagedBashJobError(error);
+					if (error instanceof Error && error.message !== message) {
+						error.message = message;
+					}
 					latestText = message;
 					completion.resolve({ kind: "failed", error });
 					await reportProgress(message, { async: { state: "failed", jobId, type: "bash" } });
@@ -466,6 +720,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			env: rawEnv,
 			timeout: rawTimeout = 300,
 			cwd,
+			outputStreams,
 
 			async: asyncRequested = false,
 			pty = false,
@@ -532,18 +787,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
 		}
 
+		const requestedCwd = cwd;
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
-		let cwdStat: fs.Stats;
+		const backend = this.session.backend;
+		const displayCwd = requestedCwd ?? ".";
+		let cwdStat: StatResult;
 		try {
-			cwdStat = await fs.promises.stat(commandCwd);
-		} catch (err) {
-			if (isEnoent(err)) {
-				throw new ToolError(`Working directory does not exist: ${commandCwd}`);
-			}
-			throw err;
+			cwdStat = await backend.fs.stat(commandCwd, { signal });
+		} catch {
+			throw new ToolError(`Working directory does not exist: ${displayCwd}`);
 		}
-		if (!cwdStat.isDirectory()) {
-			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
+		if (!cwdStat.exists) {
+			throw new ToolError(`Working directory does not exist: ${displayCwd}`);
+		}
+		if (cwdStat.kind !== "dir") {
+			throw new ToolError(`Working directory is not a directory: ${displayCwd}`);
 		}
 
 		// Clamp to reasonable range: 1s - 3600s (1 hour)
@@ -563,6 +821,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutSec,
 				requestedTimeoutSec,
 				timeoutClampNotice,
+				outputStreams,
 
 				resolvedEnv,
 				onUpdate,
@@ -585,6 +844,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutSec,
 				requestedTimeoutSec,
 				timeoutClampNotice,
+				outputStreams,
 
 				resolvedEnv,
 				onUpdate,
@@ -634,25 +894,26 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactPath,
 					artifactId,
 				})
-			: await executeBash(command, {
-					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
-					timeout: timeoutMs,
+			: await this.#executeBackendBash({
+					command,
+					commandCwd,
+					timeoutMs,
 					signal,
 					env: resolvedEnv,
+					pty: pty ?? false,
+					outputStreams,
 					artifactPath,
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 				});
+		if (result.timedOut) {
+			throw new ToolError(normalizeResultOutput(result) || `Command timed out after ${timeoutSec} seconds`);
+		}
 		if (result.cancelled) {
 			if (signal?.aborted) {
 				throw new ToolAbortError(normalizeResultOutput(result) || "Command aborted");
 			}
 			throw new ToolError(normalizeResultOutput(result) || "Command aborted");
-		}
-		if (isInteractiveResult(result) && result.timedOut) {
-			throw new ToolError(normalizeResultOutput(result) || `Command timed out after ${timeoutSec} seconds`);
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {
 			requestedTimeoutSec,
@@ -665,6 +926,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 // TUI Renderer
 // =============================================================================
 export interface BashRenderArgs {
+	baseCwd?: string;
 	command?: string;
 	env?: Record<string, string>;
 	timeout?: number;
@@ -688,6 +950,7 @@ export interface BashRenderContext {
 
 export interface ShellRendererConfig<TArgs> {
 	resolveTitle: (args: TArgs | undefined, options: RenderResultOptions) => string;
+	resolveBaseCwd?: (args: TArgs | undefined) => string | undefined;
 	resolveCommand?: (args: TArgs | undefined) => string | undefined;
 	resolveCwd?: (args: TArgs | undefined) => string | undefined;
 	resolveEnv?: (args: TArgs | undefined) => Record<string, string> | undefined;
@@ -711,7 +974,7 @@ export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, strin
 export function formatBashCommand(args: BashRenderArgs): string {
 	const command = replaceTabs(args.command || "…");
 	const prompt = "$";
-	const cwd = getProjectDir();
+	const cwd = args.baseCwd ?? getProjectDir();
 	const displayWorkdir = formatToolWorkingDirectory(args.cwd, cwd);
 	const renderedCommand = [formatBashEnvAssignments(getBashEnvForDisplay(args)), command].filter(Boolean).join(" ");
 	return displayWorkdir ? `${prompt} cd ${displayWorkdir} && ${renderedCommand}` : `${prompt} ${renderedCommand}`;
@@ -719,6 +982,7 @@ export function formatBashCommand(args: BashRenderArgs): string {
 
 function toBashRenderArgs<TArgs>(args: TArgs | undefined, config: ShellRendererConfig<TArgs>): BashRenderArgs {
 	return {
+		baseCwd: config.resolveBaseCwd?.(args),
 		command: config.resolveCommand?.(args),
 		cwd: config.resolveCwd?.(args),
 		env: config.resolveEnv?.(args),
@@ -845,6 +1109,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 
 export const bashToolRenderer = createShellRenderer<BashRenderArgs>({
 	resolveTitle: () => "Bash",
+	resolveBaseCwd: args => args?.baseCwd,
 	resolveCommand: args => args?.command,
 	resolveCwd: args => args?.cwd,
 	resolveEnv: args => args?.env,

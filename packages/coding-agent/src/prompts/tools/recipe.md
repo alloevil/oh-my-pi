@@ -12,5 +12,8 @@ Run a recipe / script / target from the project's task runners.
 {{#each tasks}}
 - `{{name}}{{#if paramSig}} {{paramSig}}{{/if}}`{{#if doc}} — {{doc}}{{/if}}{{#if command}} (`{{command}}`{{#if cwd}} in `{{cwd}}`{{/if}}){{/if}}
 {{/each}}
+{{#if hiddenTaskCount}}
+_(+ {{hiddenTaskCount}} more tasks omitted)_
+{{/if}}
 </runner>
 {{/each}}

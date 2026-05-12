@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -49,6 +50,7 @@ describe("executeJs", () => {
 		session = {
 			cwd: tempDir.path(),
 			hasUI: false,
+			backend: new LocalBackend({ cwd: tempDir.path() }),
 			getSessionFile: () => sessionFile,
 			getSessionSpawns: () => null,
 			settings: Settings.isolated(),

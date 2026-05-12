@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { isEnoent } from "@oh-my-pi/pi-utils";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+)?|raw)$/i;
@@ -370,6 +369,10 @@ function toScopeDisplay(items: string[], cwd: string): string {
 		.join(", ");
 }
 
+function unknownKindSearchPatterns(relativeBasePath: string): string[] {
+	return [relativeBasePath, joinRelativeGlob(relativeBasePath, "**/*")];
+}
+
 async function resolveSearchPathItems(
 	pathItems: string[],
 	cwd: string,
@@ -378,32 +381,34 @@ async function resolveSearchPathItems(
 	if (pathItems.length < 1) {
 		return undefined;
 	}
+	if (pathItems.length === 1) {
+		const parsedPath = parseSearchPath(pathItems[0] ?? ".");
+		const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
+		return {
+			basePath: absoluteBasePath,
+			glob: parsedPath.glob ? combineSearchGlobs(parsedPath.glob, suffixGlob) : suffixGlob,
+			scopePath: toScopeDisplay(pathItems, cwd),
+		};
+	}
 
-	const parsedItems = await Promise.all(
-		pathItems.map(async item => {
-			const parsedPath = parseSearchPath(item);
-			const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
-			const stat = await fs.promises.stat(absoluteBasePath);
-			return { raw: item, parsedPath, absoluteBasePath, stat };
-		}),
-	);
+	const parsedItems = pathItems.map(item => {
+		const parsedPath = parseSearchPath(item);
+		const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
+		return { parsedPath, absoluteBasePath };
+	});
 
-	const allExactFiles = !suffixGlob && parsedItems.every(item => !item.parsedPath.glob && item.stat.isFile());
 	const commonBasePath = findCommonBasePath(parsedItems.map(item => item.absoluteBasePath));
-	const combinedPatterns = parsedItems.map(item => {
+	const combinedPatterns = parsedItems.flatMap(item => {
 		const relativeBasePath = normalizePosixPath(path.relative(commonBasePath, item.absoluteBasePath)) || ".";
 		if (item.parsedPath.glob) {
 			const pathGlob = joinRelativeGlob(relativeBasePath, item.parsedPath.glob);
-			return combineSearchGlobs(pathGlob, suffixGlob) ?? pathGlob;
+			return [combineSearchGlobs(pathGlob, suffixGlob) ?? pathGlob];
 		}
 		if (suffixGlob) {
 			const pathPrefix = relativeBasePath === "." ? undefined : relativeBasePath;
-			return combineSearchGlobs(pathPrefix, suffixGlob) ?? suffixGlob;
+			return [combineSearchGlobs(pathPrefix, suffixGlob) ?? suffixGlob];
 		}
-		if (item.stat.isDirectory()) {
-			return joinRelativeGlob(relativeBasePath, "**/*");
-		}
-		return relativeBasePath === "." ? path.basename(item.absoluteBasePath) : relativeBasePath;
+		return unknownKindSearchPatterns(relativeBasePath);
 	});
 	const rootPath = path.parse(commonBasePath).root;
 	const isDegenerateRoot = commonBasePath === rootPath && parsedItems.length > 1;
@@ -418,7 +423,6 @@ async function resolveSearchPathItems(
 		basePath: commonBasePath,
 		glob: buildBraceUnion(combinedPatterns),
 		scopePath: toScopeDisplay(pathItems, cwd),
-		exactFilePaths: allExactFiles ? parsedItems.map(item => item.absoluteBasePath) : undefined,
 		targets,
 	};
 }
@@ -431,6 +435,10 @@ export async function resolveExplicitSearchPaths(
 	return resolveSearchPathItems([...new Set(pathItems)], cwd, suffixGlob);
 }
 
+function unknownKindFindPatterns(relativeBasePath: string): string[] {
+	return [relativeBasePath, joinRelativeGlob(relativeBasePath, "**/*")];
+}
+
 async function resolveFindPatternItems(
 	patternItems: string[],
 	cwd: string,
@@ -439,25 +447,19 @@ async function resolveFindPatternItems(
 		return undefined;
 	}
 
-	const parsedItems = await Promise.all(
-		patternItems.map(async item => {
-			const parsedPattern = parseFindPattern(item);
-			const absoluteBasePath = resolveToCwd(parsedPattern.basePath, cwd);
-			const stat = await fs.promises.stat(absoluteBasePath);
-			return { raw: item, parsedPattern, absoluteBasePath, stat };
-		}),
-	);
+	const parsedItems = patternItems.map(item => {
+		const parsedPattern = parseFindPattern(item);
+		const absoluteBasePath = resolveToCwd(parsedPattern.basePath, cwd);
+		return { parsedPattern, absoluteBasePath };
+	});
 
 	const commonBasePath = findCommonBasePath(parsedItems.map(item => item.absoluteBasePath));
-	const combinedPatterns = parsedItems.map(item => {
+	const combinedPatterns = parsedItems.flatMap(item => {
 		const relativeBasePath = normalizePosixPath(path.relative(commonBasePath, item.absoluteBasePath)) || ".";
 		if (item.parsedPattern.hasGlob) {
-			return joinRelativeGlob(relativeBasePath, item.parsedPattern.globPattern);
+			return [joinRelativeGlob(relativeBasePath, item.parsedPattern.globPattern)];
 		}
-		if (item.stat.isDirectory()) {
-			return joinRelativeGlob(relativeBasePath, "**/*");
-		}
-		return relativeBasePath === "." ? path.basename(item.absoluteBasePath) : relativeBasePath;
+		return unknownKindFindPatterns(relativeBasePath);
 	});
 
 	return {
@@ -472,60 +474,6 @@ export async function resolveExplicitFindPatterns(
 	cwd: string,
 ): Promise<ResolvedMultiFindPattern | undefined> {
 	return resolveFindPatternItems([...new Set(patternItems)], cwd);
-}
-
-/**
- * Result of partitioning a list of user-supplied paths/globs into entries whose
- * base directory currently exists on disk versus those that do not.
- *
- * Used by multi-path tools (search, find, ast_grep, ast_edit) to tolerate one
- * or more missing entries in a multi-path call: the surviving entries should
- * still be searched, with the missing entries surfaced as a non-fatal warning.
- */
-export interface PartitionedPaths {
-	/** Raw input strings whose resolved base path exists. */
-	valid: string[];
-	/** Raw input strings whose resolved base path is missing (ENOENT). */
-	missing: string[];
-}
-
-/**
- * Stat each input's base path concurrently; return entries split by existence.
- *
- * `splitter` is expected to be {@link parseFindPattern} or
- * {@link parseSearchPath}: both return a `basePath` field that this helper
- * resolves against `cwd` and stats. ENOENT is the only swallowed error — every
- * other stat failure (permission, IO, etc.) propagates so callers do not silently
- * skip paths that exist but are unreadable.
- *
- * Order of `valid` and `missing` follows the input order, so callers can rely
- * on `valid[0]` matching the first surviving user-supplied entry.
- */
-export async function partitionExistingPaths(
-	items: string[],
-	cwd: string,
-	splitter: (item: string) => { basePath: string },
-): Promise<PartitionedPaths> {
-	const settled = await Promise.all(
-		items.map(async item => {
-			const { basePath } = splitter(item);
-			const absoluteBasePath = resolveToCwd(basePath, cwd);
-			try {
-				await fs.promises.stat(absoluteBasePath);
-				return { item, exists: true } as const;
-			} catch (err) {
-				if (isEnoent(err)) return { item, exists: false } as const;
-				throw err;
-			}
-		}),
-	);
-	const valid: string[] = [];
-	const missing: string[] = [];
-	for (const entry of settled) {
-		if (entry.exists) valid.push(entry.item);
-		else missing.push(entry.item);
-	}
-	return { valid, missing };
 }
 
 export function resolveReadPath(filePath: string, cwd: string): string {

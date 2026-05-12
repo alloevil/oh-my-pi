@@ -41,6 +41,8 @@ function createClient(cwd: string, config: ServerConfig): LspClient {
 		writeQueue: Promise.resolve(),
 		activeProgressTokens: new Set(),
 		projectLoaded: Promise.resolve(),
+		projectLoadedResolved: true,
+		notificationHandlers: new Set(),
 		resolveProjectLoaded: () => {},
 	};
 }

@@ -137,7 +137,7 @@ export declare class Shell {
    * the exit code when the command completes, or flags when cancelled or
    * timed out.
    */
-  run(options: ShellRunOptions, onChunk?: ((error: Error | null, chunk: string) => void) | undefined | null): Promise<ShellRunResult>
+  run(options: ShellRunOptions, onChunk?: ((error: Error | null, chunk: { stream: "stdout" | "stderr", text: string }) => void) | undefined | null): Promise<ShellRunResult>
   /**
    * Abort all running commands for this shell session.
    *
@@ -415,7 +415,7 @@ export declare enum Encoding {
  * streamed stdout/stderr output. Returns the exit code when the command
  * completes, or flags when cancelled or timed out.
  */
-export declare function executeShell(options: ShellExecuteOptions, onChunk?: ((error: Error | null, chunk: string) => void) | undefined | null): Promise<ShellRunResult>
+export declare function executeShell(options: ShellExecuteOptions, onChunk?: ((error: Error | null, chunk: { stream: "stdout" | "stderr", text: string }) => void) | undefined | null): Promise<ShellRunResult>
 
 /**
  * Extract the before/after slices around an overlay region.
@@ -1138,6 +1138,11 @@ export interface SearchResult {
   limitReached: boolean
   /** Error message, if any. */
   error?: string
+}
+
+export interface ShellChunk {
+  stream: string
+  text: string
 }
 
 /** Options for executing a shell command via brush-core. */

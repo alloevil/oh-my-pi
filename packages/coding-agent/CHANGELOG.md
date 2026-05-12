@@ -8,6 +8,10 @@
 - Changed internal URL routing to use a shared process-global `InternalUrlRouter` and protocol handlers, so built-in tools resolve `agent://`, `artifact://`, `memory://`, `skill://`, `rule://`, `mcp://`, `local://`, and `jobs://` URLs without requiring session-specific router wiring
 - Changed `jobs://` and `mcp://` handlers to use globally registered async-job and MCP managers so background-job and MCP resource links work for agents sharing session context
 
+
+### Breaking Changes
+
+- Removed the `ssh` built-in tool and the `omp ssh` CLI subcommand. Remote workspaces are now exposed through `omp --connect <ssh-url>` which routes the session through `RemoteBackend`. SSHFS-mount-based remote filesystem access (and its macFUSE dependency) is gone with this change.
 ### Fixed
 
 - Fixed multi-entry edits silently rendering a fake success when every entry failed (e.g. all hit the auto-generated guard), by surfacing `isError: true` from the single-path edit orchestrator so the renderer takes the error branch instead of falling through to the streaming-preview fallback that displays the *proposed* diff

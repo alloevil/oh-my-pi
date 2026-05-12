@@ -36,7 +36,7 @@ The tool returns a single text block plus structured `details`.
   - `resultLimitReached`: reached result limit.
   - `missingPaths`: skipped missing inputs in multi-path calls.
   - `truncation` / `meta.limits`: structured truncation and limit metadata for renderers.
-- Streaming: when the runtime supplies `onUpdate`, the local implementation emits incremental newline-delimited text snapshots during globbing, throttled to 200 ms.
+- Streaming: when the runtime supplies `onUpdate`, the tool may emit post-glob formatting snapshots every 100 formatted paths. Updates are cumulative newline-delimited path lists plus `details.{scopePath,fileCount,files,truncated,missingPaths}`; there is no per-match backend streaming contract.
 
 ## Flow
 1. `FindTool.execute()` normalizes each `paths` entry with `normalizePathLikeInput()` and `/\\/g -> "/"` (`packages/coding-agent/src/tools/find.ts`). Empty normalized entries fail with `` `paths` must contain non-empty globs or paths ``.
@@ -50,9 +50,9 @@ The tool returns a single text block plus structured `details`.
 6. `limit` is defaulted to `DEFAULT_LIMIT` (`1000`) and validated as a positive finite integer. `hidden` defaults to `true`. The tool also creates a 5 s timeout via `AbortSignal.timeout(GLOB_TIMEOUT_MS)`.
 7. Execution then branches:
    - **Custom operations branch**: if `FindToolOptions.operations.glob` exists, the tool checks existence with `operations.exists()`, short-circuits exact-file inputs via `operations.stat()` when available, then calls `operations.glob(globPattern, searchPath, { ignore: ["**/node_modules/**", "**/.git/**"], limit })`.
-   - **Built-in local branch**: the tool stats `searchPath`. Exact-file inputs return immediately. Directory inputs call `natives.glob()` with `fileType: File`, `hidden`, `maxResults: limit`, `sortByMtime: true`, `gitignore: true`, and the combined abort signal.
-8. In the local branch, optional `onMatch` callbacks convert each match to a cwd-relative display path and emit throttled progress updates.
-9. After native glob returns, JS sorts `result.matches` by `mtime` descending (`(b.mtime ?? 0) - (a.mtime ?? 0)`) before formatting paths.
+   - **Built-in backend branch**: the tool stats `searchPath`. Exact-file inputs return immediately. Directory inputs call `backend.fs.glob({ patterns: [globPattern], paths: [rootRelativeSearchPath], includeHidden: hidden ?? true, types: ["file"], limit, signal })`.
+8. After `backend.fs.glob(...)` resolves, the tool applies a belt-and-suspenders root filter: an entry is kept only when `entry.path === requestedRoot` or starts with `requestedRoot + path.sep` after normalization. Leaked siblings are dropped and the result is treated as truncated.
+9. Only after the backend call completes does JS format returned paths relative to the session cwd. If `onUpdate` is present, updates fire every 100 formatted paths from this already-materialized list.
 10. `buildResult()` applies `applyListLimit()` to cap the array again at `limit`, joins paths with `\n`, then runs `truncateHead()` with `maxLines: Number.MAX_SAFE_INTEGER`. In practice this leaves the 50 KB byte cap in place while disabling the default 3000-line cap.
 11. `toolResult()` packages text plus `details`, and records result-limit / truncation metadata for renderers.
 
@@ -69,7 +69,7 @@ The tool returns a single text block plus structured `details`.
   - Stats the resolved base path, and in local multi-path mode stats every candidate base path up front.
   - Does not write files.
 - Subprocesses / native bindings
-  - Built-in local mode calls the native `@oh-my-pi/pi-natives` glob implementation.
+  - Built-in mode calls `backend.fs.glob(...)` and `backend.fs.stat(...)`.
 - Session state (transcript, memory, jobs, checkpoints, registries)
   - Emits structured progress updates when `onUpdate` is provided.
   - Adds truncation / limit metadata to the tool result.
@@ -81,8 +81,8 @@ The tool returns a single text block plus structured `details`.
 - Local glob timeout: `5000` ms (`GLOB_TIMEOUT_MS` in `packages/coding-agent/src/tools/find.ts`).
 - Output byte cap: `50 * 1024` bytes (`DEFAULT_MAX_BYTES` in `packages/coding-agent/src/session/streaming-output.ts`).
 - Default generic line cap in `truncateHead()` is `3000`, but `find` overrides `maxLines` to `Number.MAX_SAFE_INTEGER`, so byte size — not line count — is the practical output truncation cap.
-- Streaming update throttle: `200` ms between `onUpdate` emissions.
-- Sort order: most recent `mtime` first in the built-in local branch and promised in the prompt. The tool re-sorts in JS even though native glob receives `sortByMtime: true` so native code can still stop early at `maxResults`.
+- Progress-update cadence: every `ROOT_SCOPE_UPDATE_INTERVAL = 100` formatted paths, and only after `backend.fs.glob(...)` has already returned.
+- Result ordering is whatever `backend.fs.glob(...)` returns. The prompt promises most-recent-first ordering, so backend implementations must satisfy that contract.
 
 ## Errors
 - User-facing `ToolError`s from `FindTool.execute()` include:

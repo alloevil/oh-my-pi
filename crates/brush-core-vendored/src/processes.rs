@@ -146,6 +146,12 @@ impl ChildProcess {
 		}
 		#[cfg(unix)]
 		{
+		if let Some(pgid) = self.pgid {
+			let _ = nix::sys::signal::kill(
+				nix::unistd::Pid::from_raw(-pgid),
+				nix::sys::signal::Signal::SIGKILL,
+			);
+		}
 			let Some(pid) = self.pid else { return };
 			let _ = nix::sys::signal::kill(
 				nix::unistd::Pid::from_raw(pid),

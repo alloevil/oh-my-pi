@@ -1,7 +1,13 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
+import { logger } from "@oh-my-pi/pi-utils";
+import {
+	type DetectedRunner,
+	execRecipeCommand,
+	isBackendFile,
+	type RecipeBackend,
+	type RunnerTask,
+	type TaskRunner,
+} from "../runner";
 
 export interface CargoMetadataTarget {
 	kind?: string[];
@@ -21,14 +27,8 @@ export interface CargoMetadata {
 
 type CargoTargetKind = "bin" | "example" | "test";
 
-async function hasCargoManifest(cwd: string): Promise<boolean> {
-	try {
-		const stat = await fs.stat(path.join(cwd, "Cargo.toml"));
-		return stat.isFile();
-	} catch (err) {
-		if (isEnoent(err)) return false;
-		throw err;
-	}
+async function hasCargoManifest(cwd: string, backend: RecipeBackend): Promise<boolean> {
+	return isBackendFile(backend, path.join(cwd, "Cargo.toml"));
 }
 
 function shellQuote(value: string): string {
@@ -94,17 +94,11 @@ export function tasksFromCargoMetadata(metadata: CargoMetadata): RunnerTask[] {
 	return tasks;
 }
 
-async function readCargoMetadata(cwd: string): Promise<CargoMetadata | null> {
+async function readCargoMetadata(cwd: string, backend: RecipeBackend): Promise<CargoMetadata | null> {
 	try {
-		const proc = Bun.spawn(["cargo", "metadata", "--no-deps", "--format-version=1"], {
-			cwd,
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-		if (exit !== 0) return null;
-		return JSON.parse(stdout) as CargoMetadata;
+		const result = await execRecipeCommand(backend, cwd, "cargo metadata --no-deps --format-version=1");
+		if (result.exitCode !== 0) return null;
+		return JSON.parse(result.stdout) as CargoMetadata;
 	} catch (err) {
 		logger.debug("cargo metadata failed", { error: err instanceof Error ? err.message : String(err) });
 		return null;
@@ -114,11 +108,10 @@ async function readCargoMetadata(cwd: string): Promise<CargoMetadata | null> {
 export const cargoRunner: TaskRunner = {
 	id: "cargo",
 	label: "Cargo",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, backend: RecipeBackend): Promise<DetectedRunner | null> {
 		try {
-			if (!$which("cargo")) return null;
-			if (!(await hasCargoManifest(cwd))) return null;
-			const metadata = await readCargoMetadata(cwd);
+			if (!(await hasCargoManifest(cwd, backend))) return null;
+			const metadata = await readCargoMetadata(cwd, backend);
 			if (!metadata) return null;
 			const tasks = tasksFromCargoMetadata(metadata);
 			if (tasks.length === 0) return null;

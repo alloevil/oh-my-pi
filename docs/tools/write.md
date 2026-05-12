@@ -52,9 +52,9 @@ Single-shot result.
 1. `WriteTool.execute()` in `packages/coding-agent/src/tools/write.ts` strips `LINE+ID|` hashline prefixes from `content` when the session is in hashline display mode.
 2. It calls `#resolveArchiveWritePath()` first. That uses `parseArchivePathCandidates()` from `packages/coding-agent/src/tools/archive-reader.ts`, checks candidate archive files on disk, and falls back to the longest matching archive suffix even when the archive file does not exist yet.
 3. Archive writes call `enforcePlanModeWrite(..., { op: exists ? "update" : "create" })`, then `#writeArchiveEntry()`.
-   - The parent directory of the archive file is created with `fs.mkdir(..., { recursive: true })`.
-   - `.zip` archives are read with `fflate.unzipSync()`, the target entry is replaced in an in-memory map, and the archive is rewritten with `fflate.zipSync()` + `Bun.write()`.
-   - `.tar`, `.tar.gz`, and `.tgz` archives are read with `Bun.Archive`, existing entries are copied into an object map, the target entry is replaced, and `Bun.Archive.write()` rewrites the archive.
+   - The content is UTF-8 encoded into one `{ name, bytes }` archive entry payload.
+   - Existing archive files contribute `ifMatch` from `backend.fs.stat(...)` when an etag is available.
+   - The actual mutation goes through `backend.fs.archiveBulkWrite(archivePath, entries, { ifMatch, signal })`.
    - `invalidateFsScanAfterWrite()` runs on the archive file path.
 4. If the path is not treated as an archive, `execute()` calls `#resolveSqliteWritePath()`. That uses `parseSqlitePathCandidates()` and `isSqliteFile()` from `packages/coding-agent/src/tools/sqlite-reader.ts`. Existing non-SQLite files suppress the SQLite path interpretation.
 5. SQLite writes call `enforcePlanModeWrite(..., { op: "update" })`, then `#writeSqliteRow()`.
@@ -66,7 +66,7 @@ Single-shot result.
 6. Otherwise the tool treats `path` as a plain filesystem file.
    - `enforcePlanModeWrite(..., { op: "create" })` runs before path resolution.
    - Existing files are checked by `assertEditableFile()` to block overwriting detected generated files.
-   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes directly with `Bun.write()` or `file.write()`.
+   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes directly through `backend.fs.writeLines(...)`.
    - `invalidateFsScanAfterWrite()` runs on the file path.
 7. The tool returns a text result and optional diagnostics metadata.
 
@@ -173,5 +173,5 @@ content: ""
 - SQLite detection declines when an existing file with a `.sqlite` / `.db` suffix is present but does not have SQLite magic bytes; then the path falls back to a plain file write.
 - ZIP entry content is encoded with `new TextEncoder().encode(content)` in `#writeArchiveEntry()`. Non-ZIP archive writes pass the string directly to `Bun.Archive.write()`.
 - The prompt forbids two common anti-patterns: using `write` for routine edits that should use `edit`, and creating `*.md` / `README` files unless explicitly requested. It also forbids emojis unless requested.
-- Plain file writes report byte count using `cleanContent.length`, which is UTF-16 code units in JS, not an on-disk byte measurement.
+- Plain file writes report bytes from backend `WriteResult.written`. If the backend fails to return `written`, the tool throws instead of guessing.
 - `stripWriteContent()` only removes hashline prefixes when the session’s file display mode has `hashLines` enabled; otherwise content is written unchanged.

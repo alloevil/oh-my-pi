@@ -1,4 +1,62 @@
+import * as path from "node:path";
+import type { Backend } from "../../backend/backend";
 import { ToolError } from "../tool-errors";
+
+export type RecipeBackend = Pick<Backend, "fs" | "shell">;
+
+export interface RecipeShellResult {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+}
+
+const textDecoder = new TextDecoder();
+
+function shellQuote(value: string): string {
+	if (/^[A-Za-z0-9_@%+=:,./-]+$/u.test(value)) return value;
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+async function readBackendTextIfExists(backend: RecipeBackend, filePath: string): Promise<string> {
+	try {
+		return readBackendText(backend, filePath);
+	} catch {
+		return "";
+	}
+}
+
+export async function isBackendFile(backend: RecipeBackend, filePath: string): Promise<boolean> {
+	const stat = await backend.fs.stat(filePath);
+	return stat.exists && stat.kind === "file";
+}
+
+export async function readBackendText(backend: RecipeBackend, filePath: string): Promise<string> {
+	const blob = await backend.fs.readBlob(filePath);
+	return textDecoder.decode(blob.bytes);
+}
+
+export async function execRecipeCommand(
+	backend: RecipeBackend,
+	cwd: string,
+	command: string,
+): Promise<RecipeShellResult> {
+	const stdoutPath = path.join(cwd, `.omp-recipe-stdout-${crypto.randomUUID()}`);
+	const stderrPath = path.join(cwd, `.omp-recipe-stderr-${crypto.randomUUID()}`);
+	const redirected = `${command} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}`;
+	let exitCode: number | null = null;
+	for await (const event of backend.shell.exec({ command: redirected, cwd })) {
+		if (event.type === "exit") exitCode = event.exitCode;
+	}
+	try {
+		const [stdout, stderr] = await Promise.all([
+			readBackendTextIfExists(backend, stdoutPath),
+			readBackendTextIfExists(backend, stderrPath),
+		]);
+		return { exitCode: exitCode ?? 0, stdout, stderr };
+	} finally {
+		await Promise.allSettled([backend.fs.delete(stdoutPath), backend.fs.delete(stderrPath)]);
+	}
+}
 
 export interface RunnerTask {
 	name: string;
@@ -28,7 +86,7 @@ export interface TaskRunner {
 	 * Probe `cwd` for the manifest, the binary, and the task list.
 	 * Returns null when this runner does not apply.
 	 */
-	detect(cwd: string): Promise<DetectedRunner | null>;
+	detect(cwd: string, backend: RecipeBackend): Promise<DetectedRunner | null>;
 }
 
 interface ParsedOp {
@@ -69,10 +127,6 @@ function parseOp(op: string): ParsedOp {
 	return { head: match?.[1] ?? "", tail: match?.[2] ?? "" };
 }
 
-function findRunnerById(id: string, runners: DetectedRunner[]): DetectedRunner | undefined {
-	return runners.find(runner => runner.id === id);
-}
-
 function hasTask(runner: DetectedRunner, taskName: string): boolean {
 	return runner.tasks.some(task => task.name === taskName);
 }
@@ -93,6 +147,23 @@ function formatAvailableTasks(runners: DetectedRunner[]): string {
 function formatRunnerIds(runners: DetectedRunner[]): string {
 	return runners.map(runner => runner.id).join(", ");
 }
+function findExplicitRunnerTask(
+	head: string,
+	runners: DetectedRunner[],
+): { runner: DetectedRunner; task: RunnerTask } | undefined {
+	for (const runner of runners) {
+		const runnerPrefix = `${runner.id}:`;
+		if (!head.startsWith(runnerPrefix)) continue;
+		const taskName = head.slice(runnerPrefix.length);
+		if (!taskName) return undefined;
+		const task = runner.tasks.find(candidate => candidate.name === taskName);
+		if (task) {
+			return { runner, task };
+		}
+		return undefined;
+	}
+	return undefined;
+}
 
 function buildCommand(commandPrefix: string, taskName: string, tail: string): string {
 	return [commandPrefix, taskName, tail]
@@ -110,22 +181,6 @@ function resolveRunnerAndTask(
 		throw new ToolError(`recipe op is empty. Available tasks:\n${formatAvailableTasks(runners)}`);
 	}
 
-	const colonIndex = head.indexOf(":");
-	if (colonIndex > 0) {
-		const maybeRunnerId = head.slice(0, colonIndex);
-		const explicitRunner = findRunnerById(maybeRunnerId, runners);
-		if (explicitRunner) {
-			const taskName = head.slice(colonIndex + 1);
-			const explicitTask = explicitRunner.tasks.find(task => task.name === taskName);
-			if (!taskName || !explicitTask) {
-				throw new ToolError(
-					`Task \`${taskName || "(empty)"}\` not found in runner \`${explicitRunner.id}\`. Available tasks:\n${formatAvailableTasks(runners)}`,
-				);
-			}
-			return { runner: explicitRunner, task: explicitTask, tail };
-		}
-	}
-
 	const matches = findMatchingRunners(head, runners);
 	if (matches.length === 1) {
 		return { runner: matches[0]!, task: matches[0]!.tasks.find(task => task.name === head)!, tail };
@@ -135,6 +190,11 @@ function resolveRunnerAndTask(
 		throw new ToolError(
 			`Task \`${head}\` exists in multiple runners (${ids}). Use \`<runner-id>:<task>\`, for example \`${matches[0]!.id}:${head}\`. Available tasks:\n${formatAvailableTasks(runners)}`,
 		);
+	}
+
+	const explicit = findExplicitRunnerTask(head, runners);
+	if (explicit) {
+		return { runner: explicit.runner, task: explicit.task, tail };
 	}
 
 	throw new ToolError(
@@ -174,13 +234,12 @@ export function titleFromOp(op: string | undefined, runners: DetectedRunner[]): 
 	if (!op) return "Run";
 	const { head } = parseOp(op);
 	if (!head) return "Run";
-	const colonIndex = head.indexOf(":");
-	if (colonIndex > 0) {
-		const runner = findRunnerById(head.slice(0, colonIndex), runners);
-		return runner?.label ?? "Run";
-	}
 	const matches = findMatchingRunners(head, runners);
-	return matches.length === 1 ? matches[0]!.label : "Run";
+	if (matches.length === 1) {
+		return matches[0]!.label;
+	}
+	const explicit = findExplicitRunnerTask(head, runners);
+	return explicit?.runner.label ?? "Run";
 }
 
 function findAmbiguityExample(runners: DetectedRunner[]): { runner: string; task: string } | undefined {
@@ -214,6 +273,7 @@ export function buildPromptModel(runners: DetectedRunner[]): RecipePromptModel {
 				doc: task.doc,
 				cwd: task.cwd,
 			})),
+			hiddenTaskCount: runner.tasks.length > PROMPT_TASK_LIMIT ? runner.tasks.length - PROMPT_TASK_LIMIT : undefined,
 		})),
 	};
 }

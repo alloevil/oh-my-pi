@@ -1,7 +1,14 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
+import { logger } from "@oh-my-pi/pi-utils";
+import {
+	type DetectedRunner,
+	execRecipeCommand,
+	isBackendFile,
+	type RecipeBackend,
+	type RunnerTask,
+	readBackendText,
+	type TaskRunner,
+} from "../runner";
 
 interface PackageJsonInfo {
 	name?: string;
@@ -9,20 +16,25 @@ interface PackageJsonInfo {
 	workspaces: string[];
 }
 
-async function resolvePackageRunner(cwd: string): Promise<string> {
+async function commandExists(cwd: string, backend: RecipeBackend, command: string): Promise<boolean> {
+	const result = await execRecipeCommand(backend, cwd, `command -v ${command}`);
+	return result.exitCode === 0 && result.stdout.trim().length > 0;
+}
+
+async function resolvePackageRunner(cwd: string, backend: RecipeBackend): Promise<string> {
 	const [bunLock, bunLockb, pnpmLock, yarnLock, npmLock, npmShrink] = await Promise.all([
-		isFile(path.join(cwd, "bun.lock")),
-		isFile(path.join(cwd, "bun.lockb")),
-		isFile(path.join(cwd, "pnpm-lock.yaml")),
-		isFile(path.join(cwd, "yarn.lock")),
-		isFile(path.join(cwd, "package-lock.json")),
-		isFile(path.join(cwd, "npm-shrinkwrap.json")),
+		isFile(path.join(cwd, "bun.lock"), backend),
+		isFile(path.join(cwd, "bun.lockb"), backend),
+		isFile(path.join(cwd, "pnpm-lock.yaml"), backend),
+		isFile(path.join(cwd, "yarn.lock"), backend),
+		isFile(path.join(cwd, "package-lock.json"), backend),
+		isFile(path.join(cwd, "npm-shrinkwrap.json"), backend),
 	]);
 	if (bunLock || bunLockb) return "bun run";
 	if (pnpmLock) return "pnpm run";
 	if (yarnLock) return "yarn";
 	if (npmLock || npmShrink) return "npm run";
-	if ($which("bun")) return "bun run";
+	if (await commandExists(cwd, backend, "bun")) return "bun run";
 	return "npm run";
 }
 
@@ -34,14 +46,8 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-async function isFile(filePath: string): Promise<boolean> {
-	try {
-		const stat = await fs.stat(filePath);
-		return stat.isFile();
-	} catch (err) {
-		if (isEnoent(err)) return false;
-		throw err;
-	}
+async function isFile(filePath: string, backend: RecipeBackend): Promise<boolean> {
+	return isBackendFile(backend, filePath);
 }
 
 function parseWorkspacePatterns(pkg: Record<string, unknown>): string[] {
@@ -60,9 +66,9 @@ function normalizeWorkspacePattern(pattern: string): string {
 	return negated ? `!${normalizedBody}` : normalizedBody;
 }
 
-async function readPackageJson(filePath: string): Promise<PackageJsonInfo | null> {
+async function readPackageJson(filePath: string, backend: RecipeBackend): Promise<PackageJsonInfo | null> {
 	try {
-		const pkg = (await Bun.file(filePath).json()) as unknown;
+		const pkg = JSON.parse(await readBackendText(backend, filePath)) as unknown;
 		if (!isRecord(pkg)) return null;
 		const scripts = isRecord(pkg.scripts)
 			? Object.entries(pkg.scripts)
@@ -72,25 +78,27 @@ async function readPackageJson(filePath: string): Promise<PackageJsonInfo | null
 		const name = typeof pkg.name === "string" && pkg.name.length > 0 ? pkg.name : undefined;
 		return { name, scripts, workspaces: parseWorkspacePatterns(pkg) };
 	} catch (err) {
-		if (!isEnoent(err)) {
-			logger.debug("package.json script detection failed", {
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
+		logger.debug("package.json script detection failed", {
+			error: err instanceof Error ? err.message : String(err),
+		});
 		return null;
 	}
 }
 
-async function findWorkspacePackageJsons(cwd: string, patterns: string[]): Promise<string[]> {
+async function findWorkspacePackageJsons(cwd: string, patterns: string[], backend: RecipeBackend): Promise<string[]> {
 	const includePatterns = patterns.filter(pattern => !pattern.startsWith("!")).map(normalizeWorkspacePattern);
 	const excludePatterns = patterns.filter(pattern => pattern.startsWith("!")).map(normalizeWorkspacePattern);
 
 	const collect = async (pattern: string): Promise<string[]> => {
-		const out: string[] = [];
-		for await (const entry of new Bun.Glob(pattern).scan({ cwd, onlyFiles: true })) {
-			out.push(path.normalize(String(entry)));
-		}
-		return out;
+		const result = await backend.fs.glob({
+			patterns: [pattern],
+			paths: [cwd],
+			types: ["file"],
+			gitignore: false,
+		});
+		return result.entries.map(entry =>
+			path.relative(cwd, path.isAbsolute(entry.path) ? entry.path : path.join(cwd, entry.path)),
+		);
 	};
 
 	const [excludedLists, includedLists] = await Promise.all([
@@ -119,10 +127,10 @@ function tasksForPackage(options: { pkg: PackageJsonInfo; packageDir: string; na
 	}));
 }
 
-async function readPackageTasks(cwd: string): Promise<RunnerTask[] | null> {
-	const rootPkg = await readPackageJson(path.join(cwd, "package.json"));
+async function readPackageTasks(cwd: string, backend: RecipeBackend): Promise<RunnerTask[] | null> {
+	const rootPkg = await readPackageJson(path.join(cwd, "package.json"), backend);
 	if (!rootPkg) return null;
-	const workspacePackageJsons = await findWorkspacePackageJsons(cwd, rootPkg.workspaces);
+	const workspacePackageJsons = await findWorkspacePackageJsons(cwd, rootPkg.workspaces, backend);
 	const tasks: RunnerTask[] = [];
 
 	if (rootPkg.scripts.length > 0) {
@@ -135,7 +143,7 @@ async function readPackageTasks(cwd: string): Promise<RunnerTask[] | null> {
 		);
 	}
 
-	const pkgs = await Promise.all(workspacePackageJsons.map(p => readPackageJson(path.join(cwd, p))));
+	const pkgs = await Promise.all(workspacePackageJsons.map(p => readPackageJson(path.join(cwd, p), backend)));
 	pkgs.forEach((pkg, index) => {
 		if (!pkg || pkg.scripts.length === 0) return;
 		const packageDir = path.dirname(workspacePackageJsons[index]);
@@ -154,9 +162,12 @@ async function readPackageTasks(cwd: string): Promise<RunnerTask[] | null> {
 export const pkgRunner: TaskRunner = {
 	id: "pkg",
 	label: "Pkg",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, backend: RecipeBackend): Promise<DetectedRunner | null> {
 		try {
-			const [commandPrefix, tasks] = await Promise.all([resolvePackageRunner(cwd), readPackageTasks(cwd)]);
+			const [commandPrefix, tasks] = await Promise.all([
+				resolvePackageRunner(cwd, backend),
+				readPackageTasks(cwd, backend),
+			]);
 			if (!tasks || tasks.length === 0) return null;
 			return { id: "pkg", label: "Pkg", commandPrefix, tasks };
 		} catch (err) {

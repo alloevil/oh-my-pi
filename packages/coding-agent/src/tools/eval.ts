@@ -2,8 +2,9 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Markdown, Text } from "@oh-my-pi/pi-tui";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
+import type { Backend } from "../backend";
 import { jsBackend, parseEvalInput, pythonBackend, sniffEvalLanguage } from "../eval";
 import type { ExecutorBackend } from "../eval/backend";
 import evalGrammar from "../eval/eval.lark" with { type: "text" };
@@ -15,6 +16,7 @@ import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
+import { htmlToBasicMarkdown } from "../web/scrapers/types";
 import { resolveEvalBackends, type ToolSession } from ".";
 import { formatStyledTruncationWarning } from "./output-meta";
 import { formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
@@ -28,6 +30,17 @@ export const evalSchema = Type.Object({
 	input: Type.String({
 		description: "eval input as a sequence of `*** Begin <LANG>` cell headers followed by code",
 	}),
+	transport: Type.Optional(
+		Type.Union([Type.Literal("stdio"), Type.Literal("jupyter")], {
+			description: "kernel transport override",
+		}),
+	),
+	idleTimeoutMs: Type.Optional(
+		Type.Integer({
+			description: "kernel idle timeout in milliseconds",
+			minimum: 1,
+		}),
+	),
 });
 export type EvalToolParams = Static<typeof evalSchema>;
 
@@ -163,6 +176,195 @@ function timeoutSecondsFromMs(timeoutMs: number): number {
 	return clampTimeout("eval", timeoutMs / 1000);
 }
 
+function normalizeKernelDisplayText(text: string): string {
+	return text.endsWith("\n") ? text : `${text}\n`;
+}
+
+function kernelHandleLanguage(language: EvalLanguage): "python" | "js" {
+	return language === "python" ? "python" : "js";
+}
+
+type KernelExecutionState = "starting" | "busy" | "idle";
+
+function isEvalStatusEvent(value: unknown): value is EvalStatusEvent {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const op = (value as { op?: unknown }).op;
+	return typeof op === "string" && op.length > 0;
+}
+
+function isKernelExecutionState(value: unknown): value is KernelExecutionState {
+	return value === "starting" || value === "busy" || value === "idle";
+}
+
+function createEvalKernelNamespace(
+	session: ToolSession,
+	sessionFile: string | undefined,
+	kernelOwnerId: string | undefined,
+): string {
+	const hasher = new Bun.CryptoHasher("sha256");
+	hasher.update("omp-eval-kernel-v1\0");
+	hasher.update(session.getSessionId?.() ?? "");
+	hasher.update("\0");
+	hasher.update(kernelOwnerId ?? "");
+	hasher.update("\0");
+	hasher.update(sessionFile ?? "");
+	hasher.update("\0");
+	hasher.update(session.cwd);
+	return `eval:${hasher.digest("hex").slice(0, 32)}`;
+}
+
+function getEvalKernelName(language: EvalLanguage, namespace: string): string {
+	return `${namespace}:${language}`;
+}
+
+interface KernelConfigSnapshot {
+	lang: string;
+	transport?: string;
+	idleTimeoutMs?: number;
+	idle_timeout_ms?: number;
+}
+
+interface KernelStatusSnapshot {
+	config: KernelConfigSnapshot;
+	transport?: string;
+	idleTimeoutMs?: number;
+	idle_timeout_ms?: number;
+}
+
+const evalKernelLocks = new Map<string, Promise<void>>();
+
+function kernelConfigMatches(
+	existing: KernelConfigSnapshot,
+	desired: { lang: "python" | "js"; transport?: "stdio" | "jupyter"; idleTimeoutMs?: number },
+): boolean {
+	return (
+		existing.lang === desired.lang &&
+		existing.transport === desired.transport &&
+		(existing.idleTimeoutMs ?? existing.idle_timeout_ms) === desired.idleTimeoutMs
+	);
+}
+
+function getKernelStatusConfig(status: KernelStatusSnapshot): KernelConfigSnapshot {
+	return {
+		...status.config,
+		transport: status.transport ?? status.config.transport,
+		idleTimeoutMs:
+			status.idleTimeoutMs ?? status.idle_timeout_ms ?? status.config.idleTimeoutMs ?? status.config.idle_timeout_ms,
+	};
+}
+
+async function withEvalKernelLock<T>(name: string, task: () => Promise<T>): Promise<T> {
+	const previous = evalKernelLocks.get(name) ?? Promise.resolve();
+	let release: (() => void) | undefined;
+	const current = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	evalKernelLocks.set(name, current);
+	await previous.catch(() => undefined);
+	try {
+		return await task();
+	} finally {
+		release?.();
+		if (evalKernelLocks.get(name) === current) {
+			evalKernelLocks.delete(name);
+		}
+	}
+}
+
+async function ensureEvalKernel(
+	backend: Backend,
+	name: string,
+	language: EvalLanguage,
+	reset: boolean,
+	options: { transport?: "stdio" | "jupyter"; idleTimeoutMs?: number },
+): Promise<void> {
+	const desiredConfig = {
+		kind: "eval" as const,
+		lang: kernelHandleLanguage(language),
+		transport: options.transport,
+		idleTimeoutMs: options.idleTimeoutMs,
+	};
+	const existing = await backend.kernel.get(name);
+	const existingConfig = existing ? getKernelStatusConfig(existing) : undefined;
+	if (existing && existingConfig && (reset || !kernelConfigMatches(existingConfig, desiredConfig))) {
+		await backend.kernel.delete(name);
+	}
+	if (!existingConfig || reset || !kernelConfigMatches(existingConfig, desiredConfig)) {
+		await backend.kernel.put(name, desiredConfig);
+	}
+}
+
+function parseKernelEventJson(data: string): unknown {
+	try {
+		return JSON.parse(data) as unknown;
+	} catch {
+		return data;
+	}
+}
+
+function formatKernelErrorText(ename: string, evalue: string, traceback: string[]): string {
+	const summary = `${ename}: ${evalue}`;
+	if (traceback.length === 0) {
+		return normalizeKernelDisplayText(summary);
+	}
+	const body = traceback.join("\n");
+	return normalizeKernelDisplayText(body.startsWith(summary) ? body : `${summary}\n${body}`);
+}
+
+async function consumeKernelDisplayEvent(
+	event: { mime: string; data: string },
+	options: {
+		jsonOutputs: unknown[];
+		images: ImageContent[];
+		statusEvents: EvalStatusEvent[];
+		cellStatusEvents: EvalStatusEvent[];
+		cellDisplayOutputs: EvalDisplayOutput[];
+		pushText: (text: string) => void;
+		onMarkdown: () => void;
+		pushUpdate: () => void;
+	},
+): Promise<void> {
+	if (event.mime === "application/x-omp-status") {
+		const parsed = parseKernelEventJson(event.data);
+		if (isEvalStatusEvent(parsed)) {
+			options.statusEvents.push(parsed);
+			options.cellStatusEvents.push(parsed);
+			options.pushUpdate();
+		}
+		return;
+	}
+	if (event.mime === "application/json") {
+		const data = parseKernelEventJson(event.data);
+		options.jsonOutputs.push(data);
+		options.cellDisplayOutputs.push({ type: "json", data });
+		options.pushUpdate();
+		return;
+	}
+	if (event.mime.startsWith("image/")) {
+		options.images.push({ type: "image", data: event.data, mimeType: event.mime });
+		options.cellDisplayOutputs.push({ type: "image", data: event.data, mimeType: event.mime });
+		options.pushUpdate();
+		return;
+	}
+	if (event.mime === "text/markdown") {
+		options.onMarkdown();
+		if (event.data.length > 0) {
+			options.pushText(normalizeKernelDisplayText(event.data));
+		}
+		return;
+	}
+	if (event.mime === "text/html") {
+		const markdown = (await htmlToBasicMarkdown(event.data)) || "";
+		if (!markdown) return;
+		options.onMarkdown();
+		options.pushText(normalizeKernelDisplayText(markdown));
+		return;
+	}
+	if (event.mime === "text/plain" && event.data.length > 0) {
+		options.pushText(normalizeKernelDisplayText(event.data));
+	}
+}
+
 async function resolveBackend(
 	session: ToolSession,
 	requested: EvalLanguage | undefined,
@@ -212,7 +414,7 @@ async function resolveBackend(
 
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
-	readonly summary = "Execute Python or JavaScript code in an in-process eval backend";
+	readonly summary = "Execute Python or JavaScript code through a session kernel backend";
 	readonly loadMode = "discoverable";
 	readonly label = "Eval";
 	get description(): string {
@@ -262,6 +464,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw new ToolError("Eval tool requires a session when not using proxy executor");
 		}
 		const session = this.session;
+		const backend = session.backend;
+		const transport = params.transport;
+		const idleTimeoutMs = params.idleTimeoutMs;
 
 		const parsedInput = parseEvalInput(params.input);
 		let previousRuntimeLanguage: EvalLanguage | undefined;
@@ -299,7 +504,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				session.assertEvalExecutionAllowed?.();
 
-				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
+				const completedTailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
+				let liveTailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 				const jsonOutputs: unknown[] = [];
 				const images: ImageContent[] = [];
 				const statusEvents: EvalStatusEvent[] = [];
@@ -314,8 +520,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}));
 				const cellOutputs: string[] = [];
 
-				const appendTail = (text: string) => {
-					tailBuffer.append(text);
+				const appendCompletedTail = (text: string) => {
+					completedTailBuffer.append(text);
+				};
+				const appendLiveTail = (text: string) => {
+					liveTailBuffer.append(text);
+				};
+				const clearLiveTail = () => {
+					liveTailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 				};
 
 				const buildUpdateDetails = (): EvalToolDetails => {
@@ -344,7 +556,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 				const pushUpdate = () => {
 					if (!onUpdate) return;
-					const tailText = tailBuffer.text();
+					const tailText = `${completedTailBuffer.text()}${liveTailBuffer.text()}`;
 					onUpdate({
 						content: [{ type: "text", text: tailText }],
 						details: buildUpdateDetails(),
@@ -359,15 +571,15 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					artifactPath,
 					artifactId,
 					onChunk: chunk => {
-						appendTail(chunk);
+						appendLiveTail(chunk);
 						pushUpdate();
 					},
 				});
-				const sessionId = sessionFile ? `session:${sessionFile}:cwd:${session.cwd}` : `cwd:${session.cwd}`;
+				const kernelNamespace = createEvalKernelNamespace(session, sessionFile, kernelOwnerId);
 
 				for (let i = 0; i < cells.length; i++) {
 					const cell = cells[i];
-					const backend = cell.resolved.backend;
+					const runtimeLanguage = cell.resolved.backend.id;
 					const timeoutSec = timeoutSecondsFromMs(cell.timeoutMs);
 					const deadlineMs = Date.now() + timeoutSec * 1000;
 					const timeoutSignal = AbortSignal.timeout(Math.max(0, deadlineMs - Date.now()));
@@ -376,6 +588,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						: AbortSignal.any([timeoutSignal, sessionAbortController.signal]);
 
 					const cellResult = cellResults[i];
+					liveTailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 					cellResult.status = "running";
 					cellResult.output = "";
 					cellResult.statusEvents = undefined;
@@ -383,51 +596,95 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					cellResult.durationMs = undefined;
 					pushUpdate();
 
-					const startTime = Date.now();
-					const result = await backend.execute(cell.code, {
-						cwd: session.cwd,
-						sessionId,
-						sessionFile: sessionFile ?? undefined,
-						kernelOwnerId,
-						signal: combinedSignal,
-						session,
-						deadlineMs,
-						reset: cell.reset,
-						artifactPath,
-						artifactId,
-						onChunk: chunk => {
-							outputSink!.push(chunk);
-						},
-					});
-					const durationMs = Date.now() - startTime;
+					const kernelName = getEvalKernelName(runtimeLanguage, kernelNamespace);
 
+					const startTime = Date.now();
+					let cancelled = false;
+					let exitCode: number | undefined = 0;
+					let rawCellOutput = "";
 					const cellStatusEvents: EvalStatusEvent[] = [];
 					const cellDisplayOutputs: EvalDisplayOutput[] = [];
+					let lastKernelState: KernelExecutionState | undefined;
 					let cellHasMarkdown = false;
-					for (const output of result.displayOutputs) {
-						if (output.type === "json") {
-							jsonOutputs.push(output.data);
-							cellDisplayOutputs.push(output);
-						}
-						if (output.type === "image") {
-							images.push({ type: "image", data: output.data, mimeType: output.mimeType });
-							cellDisplayOutputs.push(output);
-						}
-						if (output.type === "status") {
-							statusEvents.push(output.event);
-							cellStatusEvents.push(output.event);
-						}
-						if (output.type === "markdown") {
-							cellHasMarkdown = true;
+
+					try {
+						await withEvalKernelLock(kernelName, async () => {
+							await ensureEvalKernel(backend, kernelName, runtimeLanguage, cell.reset, {
+								transport,
+								idleTimeoutMs,
+							});
+							await untilAborted(combinedSignal, async () => {
+								for await (const event of backend.kernel.exec(kernelName, {
+									code: cell.code,
+									cwd: session.cwd,
+									signal: combinedSignal,
+									timeout_ms: timeoutSec * 1000,
+									store_history: true,
+								})) {
+									switch (event.type) {
+										case "stdout":
+										case "stderr":
+											rawCellOutput += event.data;
+											outputSink!.push(event.data);
+											break;
+										case "result": {
+											const text = normalizeKernelDisplayText(event.text);
+											rawCellOutput += text;
+											outputSink!.push(text);
+											break;
+										}
+										case "display":
+											await consumeKernelDisplayEvent(event, {
+												jsonOutputs,
+												images,
+												statusEvents,
+												cellStatusEvents,
+												cellDisplayOutputs,
+												pushText: text => {
+													rawCellOutput += text;
+													outputSink!.push(text);
+												},
+												onMarkdown: () => {
+													cellHasMarkdown = true;
+												},
+												pushUpdate,
+											});
+											break;
+										case "error": {
+											exitCode = 1;
+											const text = formatKernelErrorText(event.ename, event.evalue, event.traceback);
+											rawCellOutput += text;
+											outputSink!.push(text);
+											break;
+										}
+										case "status":
+											if (isKernelExecutionState(event.state)) {
+												lastKernelState = event.state;
+											}
+											break;
+									}
+								}
+							});
+						});
+					} catch (error) {
+						if (combinedSignal.aborted) {
+							cancelled = true;
+							exitCode = undefined;
+						} else {
+							throw error;
 						}
 					}
+					if (exitCode === 0 && lastKernelState === "busy") {
+						exitCode = 1;
+					}
+					const durationMs = Date.now() - startTime;
 
-					const stdoutTrimmed = result.output.trim();
+					const stdoutTrimmed = rawCellOutput.trim();
 					const displayText = formatDisplayOutputsForText(cellDisplayOutputs);
 					const cellOutput =
 						stdoutTrimmed && displayText ? `${stdoutTrimmed}\n\n${displayText}` : stdoutTrimmed || displayText;
 					cellResult.output = cellOutput;
-					cellResult.exitCode = result.exitCode;
+					cellResult.exitCode = exitCode;
 					cellResult.durationMs = durationMs;
 					cellResult.statusEvents = cellStatusEvents.length > 0 ? cellStatusEvents : undefined;
 					cellResult.hasMarkdown = cellHasMarkdown || undefined;
@@ -447,15 +704,18 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						cellOutputs.push(combinedCellOutput);
 					}
 
-					if (combinedCellOutput) {
+					if (combinedCellOutput && cells.length > 1) {
 						const prefix = cellOutputs.length > 1 ? "\n\n" : "";
-						appendTail(`${prefix}${combinedCellOutput}`);
+						appendCompletedTail(`${prefix}${combinedCellOutput}`);
+						clearLiveTail();
 					}
 
-					if (result.cancelled) {
+					if (cancelled) {
 						cellResult.status = "error";
 						pushUpdate();
-						const errorMsg = result.output || "Command aborted";
+						const errorMsg =
+							cellOutput ||
+							(timeoutSignal.aborted ? `Execution timed out after ${timeoutSec}s` : "Command aborted");
 						const combinedOutput = cellOutputs.join("\n\n");
 						const abortSuffix = parsedInput.aborted ? `\n\n${ABORT_WARNING}` : "";
 						const outputText =
@@ -480,17 +740,17 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							.done();
 					}
 
-					if (result.exitCode !== 0 && result.exitCode !== undefined) {
+					if (exitCode !== 0 && exitCode !== undefined) {
 						cellResult.status = "error";
 						pushUpdate();
 						const combinedOutput = cellOutputs.join("\n\n");
 						const abortSuffix = parsedInput.aborted ? `\n\n${ABORT_WARNING}` : "";
 						const outputText =
 							(cells.length > 1
-								? `${combinedOutput}\n\nCell ${i + 1} failed (exit code ${result.exitCode}). Earlier cells succeeded—their state persists. Fix only cell ${i + 1}.`
+								? `${combinedOutput}\n\nCell ${i + 1} failed (exit code ${exitCode}). Earlier cells succeeded—their state persists. Fix only cell ${i + 1}.`
 								: combinedOutput
-									? `${combinedOutput}\n\nCommand exited with code ${result.exitCode}`
-									: `Command exited with code ${result.exitCode}`) + abortSuffix;
+									? `${combinedOutput}\n\nCommand exited with code ${exitCode}`
+									: `Command exited with code ${exitCode}`) + abortSuffix;
 
 						const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 						const details: EvalToolDetails = {

@@ -11,6 +11,7 @@ import { inspectImageToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/inspec
 import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
 import { sanitizeText } from "@oh-my-pi/pi-natives";
 import { Value } from "@sinclair/typebox/value";
+import { LocalBackend } from "../../src/backend";
 
 const TINY_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
@@ -63,6 +64,7 @@ function createSession(
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd }),
 		getModelString: () => `${activeModel.provider}/${activeModel.id}`,
 		getActiveModelString: () => `${activeModel.provider}/${activeModel.id}`,
 		settings,

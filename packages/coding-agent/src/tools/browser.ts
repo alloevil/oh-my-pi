@@ -1,10 +1,19 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { StringEnum } from "@oh-my-pi/pi-ai";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import type { CdpAttachHandleConfig, CdpSpawnHandleConfig } from "@oh-my-pi/rwp-client";
 import { type Static, Type } from "@sinclair/typebox";
+import type { Backend } from "../backend";
+import type { BrowserConfig } from "../backend/types";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
-import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
+import { BROWSER_PROTOCOL_TIMEOUT_MS, ensureChromiumExecutable, loadPuppeteer } from "./browser/launch";
+import {
+	type BrowserHandle,
+	type BrowserKind,
+	type BrowserKindTag,
+	toPuppeteerConnectOptions,
+} from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
 import type { OutputMeta } from "./output-meta";
@@ -95,10 +104,29 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	}
 	if (app?.path) {
 		const exe = resolveToCwd(app.path, session.cwd);
-		return { kind: "spawned", path: exe };
+		return { kind: "spawned", path: exe, args: normalizeAppArgs(app.args) };
 	}
 	const headless = session.settings.get("browser.headless") as boolean;
-	return { kind: "headless", headless };
+	return { kind: "headless", headless, args: normalizeAppArgs(app?.args) };
+}
+
+function normalizeAppArgs(args: string[] | undefined): string[] | undefined {
+	return args && args.length > 0 ? [...args] : undefined;
+}
+
+function assertBrowserKindAvailable(kind: BrowserKind, backendKind: "local" | "remote"): void {
+	if (backendKind !== "remote" || kind.kind === "connected") return;
+	const mode = kind.kind === "headless" ? "headless launch" : "app.path spawn";
+	throw new ToolError(
+		`Remote browser ${mode} is disabled because local executable paths are not valid on the remote backend. Pass app.cdp_url to attach to a browser reachable from the remote server.`,
+	);
+}
+
+function disconnectBrowserClient(handle: BrowserHandle): void {
+	if (!handle.browser.connected) return;
+	try {
+		handle.browser.disconnect();
+	} catch {}
 }
 
 /**
@@ -168,7 +196,10 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
 		const kind = resolveBrowserKind(params, this.session);
+		const backend = this.session.backend;
+		const browserBackend = backend.browser;
 		details.browser = kind.kind;
+		assertBrowserKindAvailable(kind, backend.kind);
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
 		const existing = getTab(name);
@@ -178,51 +209,49 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			);
 		}
 
-		const browser = await untilAborted(signal, () =>
-			acquireBrowser(kind, {
-				cwd: this.session.cwd,
-				viewport: params.viewport
-					? {
-							width: params.viewport.width,
-							height: params.viewport.height,
-							deviceScaleFactor: params.viewport.scale,
-						}
-					: undefined,
-				appArgs: params.app?.args,
-				signal,
-			}),
-		);
+		const browser = existing?.browser ?? (await this.#connectBackendBrowser(name, kind, backend, signal));
 
-		const result = await untilAborted(signal, () =>
-			acquireTab(name, browser, {
-				url: params.url,
-				waitUntil: params.wait_until,
-				viewport: params.viewport
-					? {
-							width: params.viewport.width,
-							height: params.viewport.height,
-							deviceScaleFactor: params.viewport.scale,
-						}
-					: undefined,
-				target: params.app?.target,
-				timeoutMs,
-				dialogs: params.dialogs,
-				signal,
-			}),
-		);
-		const tab = result.tab;
-		const url = tab.info.url;
-		const title = tab.info.title ?? "";
-		details.url = url;
-		details.viewport = tab.info.viewport;
-		const verb = result.created ? "Opened" : "Reused";
-		const lines = [
-			`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
-			`URL: ${url}`,
-			title ? `Title: ${title}` : null,
-		].filter((l): l is string => typeof l === "string");
-		details.result = lines.join("\n");
-		return toolResult(details).text(lines.join("\n")).done();
+		try {
+			const result = await untilAborted(signal, () =>
+				acquireTab(name, browser, {
+					url: params.url,
+					waitUntil: params.wait_until,
+					viewport: params.viewport
+						? {
+								width: params.viewport.width,
+								height: params.viewport.height,
+								deviceScaleFactor: params.viewport.scale,
+							}
+						: undefined,
+					target: params.app?.target,
+					timeoutMs,
+					dialogs: params.dialogs,
+					signal,
+				}),
+			);
+			const tab = result.tab;
+			const url = tab.info.url;
+			const title = tab.info.title ?? "";
+			details.url = url;
+			details.viewport = tab.info.viewport;
+			const verb = result.created ? "Opened" : "Reused";
+			const lines = [
+				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
+				`URL: ${url}`,
+				title ? `Title: ${title}` : null,
+			].filter((l): l is string => typeof l === "string");
+			details.result = lines.join("\n");
+			return toolResult(details).text(lines.join("\n")).done();
+		} catch (error) {
+			if (!existing) {
+				disconnectBrowserClient(browser);
+				await untilAborted(
+					signal,
+					async () => await browserBackend.delete(name, { signal }).catch(() => undefined),
+				);
+			}
+			throw error;
+		}
 	}
 
 	async #close(
@@ -231,14 +260,32 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		details: BrowserToolDetails,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
+		const backend = this.session.backend;
+		const browserBackend = backend.browser;
 		const kill = !!params.kill;
 		if (params.all) {
 			const count = await untilAborted(signal, () => releaseAllTabs({ kill }));
+			const backendNames = (await untilAborted(signal, () => browserBackend.list({ signal }))).map(
+				status => status.name,
+			);
+			await Promise.all(
+				[...new Set(backendNames)].map(
+					async tabName =>
+						await untilAborted(
+							signal,
+							async () => await browserBackend.delete(tabName, { signal }).catch(() => undefined),
+						),
+				),
+			);
 			details.result = `Closed ${count} tab(s)`;
 			return toolResult(details).text(details.result).done();
 		}
+		const status = await untilAborted(signal, () => browserBackend.get(name, { signal }));
 		const closed = await untilAborted(signal, () => releaseTab(name, { kill }));
-		details.result = closed ? `Closed tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
+		if (closed || status) {
+			await untilAborted(signal, async () => await browserBackend.delete(name, { signal }).catch(() => undefined));
+		}
+		details.result = closed || status ? `Closed tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
 		return toolResult(details).text(details.result).done();
 	}
 
@@ -281,6 +328,73 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		details.result = textOnly;
 		return toolResult(details).content(content).done();
 	}
+	async #connectBackendBrowser(
+		name: string,
+		kind: BrowserKind,
+		backend: Backend,
+		signal?: AbortSignal,
+	): Promise<BrowserHandle> {
+		const browserBackend = backend.browser;
+		assertBrowserKindAvailable(kind, backend.kind);
+		await untilAborted(signal, async () => await browserBackend.put(name, await toBrowserConfig(kind), { signal }));
+		try {
+			const cdpEndpoint = await untilAborted(signal, () => browserBackend.wsUrl(name, { signal }));
+			return await untilAborted(signal, () => connectBrowserHandle(name, cdpEndpoint, kind));
+		} catch (error) {
+			await untilAborted(signal, async () => await browserBackend.delete(name, { signal }).catch(() => undefined));
+			throw error;
+		}
+	}
+}
+
+async function connectBrowserHandle(name: string, cdpEndpoint: string, kind: BrowserKind): Promise<BrowserHandle> {
+	const endpoint = cdpEndpoint.replace(/\/+$/, "");
+	const puppeteer = await loadPuppeteer();
+	const browser = await puppeteer.connect({
+		...toPuppeteerConnectOptions(endpoint),
+		defaultViewport: null,
+		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+	});
+	return {
+		key: `backend:${name}`,
+		kind,
+		browser,
+		cdpUrl: endpoint,
+		refCount: 0,
+		stealth: { browserSession: null, override: null },
+	};
+}
+
+async function toBrowserConfig(kind: BrowserKind): Promise<BrowserConfig> {
+	switch (kind.kind) {
+		case "headless": {
+			const executablePath = await ensureChromiumExecutable();
+			if (!executablePath) {
+				throw new ToolError(
+					"Unable to resolve a Chromium executable for backend browser spawn. Set PUPPETEER_EXECUTABLE_PATH or install Chrome/Chromium.",
+				);
+			}
+			const config: CdpSpawnHandleConfig = {
+				kind: "cdp-spawn",
+				path: executablePath,
+				args: kind.args,
+				headless: kind.headless,
+			};
+			return config;
+		}
+		case "spawned": {
+			const config: CdpSpawnHandleConfig = {
+				kind: "cdp-spawn",
+				path: kind.path,
+				args: kind.args,
+			};
+			return config;
+		}
+		case "connected": {
+			const config: CdpAttachHandleConfig = { kind: "cdp-attach", cdp_url: kind.cdpUrl };
+			return config;
+		}
+	}
 }
 
 function describeBrowser(handle: BrowserHandle): string {
@@ -307,10 +421,24 @@ function describeKind(kind: BrowserKind): string {
 
 function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind !== b.kind) return false;
-	if (a.kind === "headless" && b.kind === "headless") return a.headless === b.headless;
-	if (a.kind === "spawned" && b.kind === "spawned") return a.path === b.path;
+	if (a.kind === "headless" && b.kind === "headless") {
+		return a.headless === b.headless && sameStringArray(a.args, b.args);
+	}
+	if (a.kind === "spawned" && b.kind === "spawned") {
+		return a.path === b.path && sameStringArray(a.args, b.args);
+	}
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
 	return false;
+}
+
+function sameStringArray(a: string[] | undefined, b: string[] | undefined): boolean {
+	if (a === b) return true;
+	if (!a || !b) return !a && !b;
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
 }
 
 function stringifyReturnValue(value: unknown): string {

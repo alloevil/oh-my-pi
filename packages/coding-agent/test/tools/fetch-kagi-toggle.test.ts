@@ -11,6 +11,7 @@ import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import * as scraperUtils from "@oh-my-pi/pi-coding-agent/web/scrapers/utils";
 import * as natives from "@oh-my-pi/pi-natives";
 import { hookFetch, ptree, Snowflake } from "@oh-my-pi/pi-utils";
+import { LocalBackend } from "../../src/backend";
 
 const withMissingSystemPython = () => {
 	const whichSpy = vi.spyOn(Bun, "which").mockImplementation(() => null);
@@ -44,6 +45,7 @@ describe("read tool URL selector shorthands", () => {
 			getSessionFile: () => sessionFile,
 			getArtifactsDir: () => artifactsDir,
 			getSessionSpawns: () => null,
+			backend: new LocalBackend({ cwd: testDir }),
 			allocateOutputArtifact: async toolType => {
 				const id = String(nextArtifactId++);
 				return {
@@ -136,6 +138,7 @@ describe("read tool URL handling", () => {
 			getSessionFile: () => sessionFile,
 			getArtifactsDir: () => artifactsDir,
 			getSessionSpawns: () => null,
+			backend: new LocalBackend({ cwd: testDir }),
 			allocateOutputArtifact: async toolType => {
 				const id = String(nextArtifactId++);
 				return {

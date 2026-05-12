@@ -44,6 +44,7 @@ import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, getBundledModel, type ToolCall } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { _resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -192,6 +193,7 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 		const toolSession: ToolSession = {
 			cwd: tempDir,
 			hasUI: false,
+			backend: new LocalBackend({ cwd: tempDir }),
 			settings,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,

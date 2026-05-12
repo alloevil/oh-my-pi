@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { ReadToolDetails } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -24,6 +25,7 @@ function createSession(cwd: string, settings = Settings.isolated()): ToolSession
 	return {
 		cwd,
 		hasUI: false,
+		backend: new LocalBackend({ cwd }),
 		getSessionFile: () => sessionFile,
 		getSessionSpawns: () => "*",
 		getArtifactsDir: () => sessionDir,

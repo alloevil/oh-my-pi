@@ -183,6 +183,26 @@ describe("pi-natives", () => {
 			expect(result.totalMatches).toBe(2); // "Test" in title + "test" in body
 		});
 
+		it("returns separate before and after context lines", async () => {
+			const fixturePath = path.join(testDir, "context.txt");
+			await fs.writeFile(fixturePath, "#if FLAG\nneedle\n#endif\n");
+
+			const result = await grep({
+				pattern: "needle",
+				path: fixturePath,
+				contextBefore: 1,
+				contextAfter: 1,
+			});
+
+			expect(result.matches).toHaveLength(1);
+			expect(result.matches[0]).toMatchObject({
+				lineNumber: 2,
+				line: "needle",
+				contextBefore: [{ lineNumber: 1, line: "#if FLAG" }],
+				contextAfter: [{ lineNumber: 3, line: "#endif" }],
+			});
+		});
+
 		it("should return filesWithMatches mode", async () => {
 			const result = await grep({
 				pattern: "return",

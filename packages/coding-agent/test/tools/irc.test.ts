@@ -4,6 +4,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { IrcTool } from "@oh-my-pi/pi-coding-agent/tools/irc";
+import { LocalBackend } from "../../src/backend";
 
 interface FakeSession {
 	session: AgentSession;
@@ -64,6 +65,7 @@ function makeToolSession(registry: AgentRegistry, agentId: string): ToolSession 
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd: "/tmp" }),
 		settings: Settings.isolated(),
 		agentRegistry: registry,
 		getAgentId: () => agentId,
@@ -84,6 +86,7 @@ describe("IrcTool", () => {
 			hasUI: false,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
+			backend: new LocalBackend({ cwd: "/tmp" }),
 			settings: Settings.isolated(),
 			agentRegistry: registry,
 			getAgentId: () => "0-Main",
@@ -98,6 +101,7 @@ describe("IrcTool", () => {
 			hasUI: false,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
+			backend: new LocalBackend({ cwd: "/tmp" }),
 			settings: Settings.isolated(),
 		};
 		expect(IrcTool.createIf(session)).toBeNull();

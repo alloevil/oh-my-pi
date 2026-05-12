@@ -1,10 +1,6 @@
-import { ToolError } from "./tool-errors";
-
-let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
-async function loadFflate(): Promise<typeof import("fflate")> {
-	if (!fflateModulePromise) fflateModulePromise = import("fflate");
-	return fflateModulePromise;
-}
+import type { ArchiveSnapshot } from "../backend/types";
+import type { ToolSession } from "../sdk";
+import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 
 export type ArchiveFormat = "zip" | "tar" | "tar.gz";
 
@@ -27,22 +23,7 @@ export interface ArchiveDirectoryEntry extends ArchiveNode {
 export interface ExtractedArchiveFile extends ArchiveNode {
 	bytes: Uint8Array;
 }
-
-interface TarStorage {
-	type: "tar";
-	file: File;
-}
-
-interface ZipStorage {
-	type: "zip";
-	bytes: Uint8Array;
-}
-
-type EntryStorage = TarStorage | ZipStorage;
-
-interface ArchiveIndexEntry extends ArchiveNode {
-	storage?: EntryStorage;
-}
+interface ArchiveIndexEntry extends ArchiveNode {}
 
 function normalizeArchiveLookupPath(rawPath?: string): string | undefined {
 	if (!rawPath) return "";
@@ -56,23 +37,6 @@ function normalizeArchiveLookupPath(rawPath?: string): string | undefined {
 	}
 
 	return normalizedParts.join("/");
-}
-
-function normalizeArchiveEntryPath(rawPath: string): string | undefined {
-	const parts = rawPath.replace(/\\/g, "/").split("/");
-	const normalizedParts: string[] = [];
-	for (const part of parts) {
-		if (!part || part === ".") continue;
-		if (part === "..") return undefined;
-		normalizedParts.push(part);
-	}
-
-	if (normalizedParts.length === 0) return undefined;
-	return normalizedParts.join("/");
-}
-
-function isArchiveDirectoryName(rawPath: string): boolean {
-	return rawPath.endsWith("/") || rawPath.endsWith("\\");
 }
 
 function upsertArchiveEntry(map: Map<string, ArchiveIndexEntry>, entry: ArchiveIndexEntry): void {
@@ -95,7 +59,6 @@ function upsertArchiveEntry(map: Map<string, ArchiveIndexEntry>, entry: ArchiveI
 		...existing,
 		size: existing.size || entry.size,
 		mtimeMs: existing.mtimeMs ?? entry.mtimeMs,
-		storage: existing.storage ?? entry.storage,
 	});
 }
 
@@ -123,61 +86,16 @@ function getArchiveFormatFromPath(filePath: string): ArchiveFormat | undefined {
 	return undefined;
 }
 
-async function readTarEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	let archive: Bun.Archive;
-	try {
-		archive = new Bun.Archive(bytes);
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
+function throwArchiveAccessError(action: string, error: unknown, signal?: AbortSignal): never {
+	if (error instanceof ToolError || error instanceof ToolAbortError) {
+		throw error;
+	}
+	if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+		throwIfAborted(signal);
 	}
 
-	let files: Map<string, File>;
-	try {
-		files = await archive.files();
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
-	}
-
-	const entries: ArchiveIndexEntry[] = [];
-	for (const [rawPath, file] of files) {
-		const normalizedPath = normalizeArchiveEntryPath(rawPath);
-		if (!normalizedPath) continue;
-		const mtimeMs = file.lastModified > 0 ? file.lastModified : undefined;
-		entries.push({
-			path: normalizedPath,
-			isDirectory: false,
-			size: file.size,
-			mtimeMs,
-			storage: { type: "tar", file },
-		});
-	}
-
-	return entries;
-}
-
-async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	const { unzipSync } = await loadFflate();
-	let files: Record<string, Uint8Array>;
-	try {
-		files = unzipSync(bytes);
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
-	}
-
-	const entries: ArchiveIndexEntry[] = [];
-	for (const [rawPath, fileBytes] of Object.entries(files)) {
-		const normalizedPath = normalizeArchiveEntryPath(rawPath);
-		if (!normalizedPath) continue;
-		const isDirectory = isArchiveDirectoryName(rawPath);
-		entries.push({
-			path: normalizedPath,
-			isDirectory,
-			size: isDirectory ? 0 : fileBytes.byteLength,
-			storage: isDirectory ? undefined : { type: "zip", bytes: fileBytes },
-		});
-	}
-
-	return entries;
+	const message = error instanceof Error ? error.message : String(error);
+	throw new ToolError(`Failed to ${action}: ${message}`);
 }
 
 export function parseArchivePathCandidates(filePath: string): ArchivePathCandidate[] {
@@ -204,12 +122,14 @@ export function parseArchivePathCandidates(filePath: string): ArchivePathCandida
 	return candidates.sort((left, right) => right.archivePath.length - left.archivePath.length);
 }
 
-export class ArchiveReader {
+export class ArchiveReader implements AsyncDisposable {
 	readonly format: ArchiveFormat;
 	#entries = new Map<string, ArchiveIndexEntry>();
+	#snapshot: ArchiveSnapshot;
 
-	constructor(format: ArchiveFormat, entries: ArchiveIndexEntry[]) {
-		this.format = format;
+	constructor(snapshot: ArchiveSnapshot, entries: ArchiveIndexEntry[]) {
+		this.format = snapshot.format;
+		this.#snapshot = snapshot;
 		for (const entry of entries) {
 			upsertArchiveEntry(this.#entries, entry);
 		}
@@ -280,7 +200,7 @@ export class ArchiveReader {
 		);
 	}
 
-	async readFile(subPath: string): Promise<ExtractedArchiveFile> {
+	async readEntry(subPath: string): Promise<ExtractedArchiveFile> {
 		const normalizedPath = normalizeArchiveLookupPath(subPath);
 		if (!normalizedPath) {
 			throw new ToolError("Archive file path is required");
@@ -293,11 +213,7 @@ export class ArchiveReader {
 		if (entry.isDirectory) {
 			throw new ToolError(`Archive path '${normalizedPath}' is a directory`);
 		}
-		if (!entry.storage) {
-			throw new ToolError(`Archive file '${normalizedPath}' has no readable storage`);
-		}
-
-		const bytes = entry.storage.type === "tar" ? await entry.storage.file.bytes() : entry.storage.bytes;
+		const bytes = await this.#snapshot.readEntry(normalizedPath);
 
 		return {
 			path: entry.path,
@@ -307,15 +223,45 @@ export class ArchiveReader {
 			bytes,
 		};
 	}
+
+	async readFile(subPath: string): Promise<ExtractedArchiveFile> {
+		return this.readEntry(subPath);
+	}
+
+	async close(): Promise<void> {
+		await this.#snapshot.close();
+	}
+
+	async [Symbol.asyncDispose](): Promise<void> {
+		await this.close();
+	}
 }
 
-export async function openArchive(filePath: string): Promise<ArchiveReader> {
+export async function openArchive(
+	filePath: string,
+	session: ToolSession,
+	signal?: AbortSignal,
+): Promise<ArchiveReader> {
 	const format = getArchiveFormatFromPath(filePath);
 	if (!format) {
 		throw new ToolError(`Unsupported archive format: ${filePath}`);
 	}
 
-	const bytes = await Bun.file(filePath).bytes();
-	const entries = format === "zip" ? await readZipEntries(bytes) : await readTarEntries(bytes);
-	return new ArchiveReader(format, entries);
+	const backend = session.backend;
+	let snapshot: ArchiveSnapshot | undefined;
+	try {
+		snapshot = await backend.fs.openArchive(filePath, { signal });
+		const entries = (await snapshot.entries({ signal })).map(entry => ({
+			path: entry.path,
+			isDirectory: entry.kind === "dir",
+			size: entry.size,
+			mtimeMs: entry.mtimeMs ?? undefined,
+		}));
+		return new ArchiveReader(snapshot, entries);
+	} catch (error) {
+		try {
+			await snapshot?.close();
+		} catch {}
+		throwArchiveAccessError("open archive", error, signal);
+	}
 }

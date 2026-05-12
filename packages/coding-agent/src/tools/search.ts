@@ -1,11 +1,11 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 
-import { type GrepMatch, GrepOutputMode, type GrepResult, grep } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
+import type { GlobResult, GrepHit, GrepSummary, StatResult } from "../backend/types";
 import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
@@ -20,11 +20,11 @@ import { formatGroupedFiles } from "./grouped-file-output";
 import { formatMatchLine } from "./match-line-format";
 import { formatFullOutputReference, type OutputMeta } from "./output-meta";
 import {
+	combineSearchGlobs,
 	formatPathRelativeToCwd,
 	hasGlobPathChars,
 	normalizePathLikeInput,
 	parseSearchPath,
-	partitionExistingPaths,
 	resolveExplicitSearchPaths,
 	resolveToCwd,
 } from "./path-utils";
@@ -71,13 +71,120 @@ export interface SearchToolDetails {
 	 * `result.text` lines but uses a `│` gutter and `*` to mark match lines (vs space for
 	 * context). The TUI uses this directly so it never parses model-facing hashline anchors. */
 	displayContent?: string;
-	/** User-supplied paths whose base directory was missing on disk. The tool
+	/** User-supplied paths whose base directory was missing on the active backend. The tool
 	 * skipped these and continued with the surviving entries; surfaced as a
 	 * non-fatal warning in the renderer and in the model-facing text. */
 	missingPaths?: string[];
 }
 
 type SearchParams = Static<typeof searchSchema>;
+
+interface SearchMatchLine {
+	lineNumber: number;
+	line: string;
+	isMatch: boolean;
+	truncated?: boolean;
+}
+
+interface SearchMatch {
+	path: string;
+	lineNumber: number;
+	line: string;
+	lines: SearchMatchLine[];
+}
+
+interface SearchExecutionResult {
+	matches: SearchMatch[];
+	limitReached: boolean;
+}
+
+function isGrepLineTruncated(hit: GrepHit): boolean {
+	if (!("truncated" in hit)) {
+		return false;
+	}
+	return hit.truncated === true;
+}
+
+type TaggedGrepSummary = GrepSummary & { type: "summary" };
+
+function isTaggedGrepSummary(value: unknown): value is TaggedGrepSummary {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+	return "type" in value && value.type === "summary";
+}
+
+function isLegacyGrepSummary(value: unknown): value is GrepSummary {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+	return !("type" in value) && "limitReached" in value;
+}
+
+function getGrepLimitReached(value: unknown): boolean {
+	if (!isTaggedGrepSummary(value) && !isLegacyGrepSummary(value)) {
+		return false;
+	}
+	return value.limitReached === true;
+}
+
+function normalizeContextLines(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return 0;
+	}
+	return Math.max(0, Math.floor(value));
+}
+
+function isPathNotFoundError(error: unknown): boolean {
+	return isEnoent(error) || (error instanceof Error && /(?:Path not found|ENOENT|not found)/i.test(error.message));
+}
+
+interface SearchInputProbe {
+	raw: string;
+	absoluteBasePath: string;
+	glob?: Bun.Glob;
+	matched: boolean;
+}
+
+function normalizeProbePath(filePath: string): string {
+	return filePath.replace(/\\/g, "/");
+}
+
+function relativePathWithin(basePath: string, filePath: string): string | undefined {
+	const relative = path.relative(basePath, filePath);
+	if (relative === "") return ".";
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		return undefined;
+	}
+	return normalizeProbePath(relative);
+}
+
+function createSearchInputProbe(rawPath: string, cwd: string, suffixGlob?: string): SearchInputProbe {
+	const parsedPath = parseSearchPath(rawPath);
+	const absoluteBasePath = resolveToCwd(parsedPath.basePath, cwd);
+	const globPattern = parsedPath.glob ? combineSearchGlobs(parsedPath.glob, suffixGlob) : suffixGlob;
+	return {
+		raw: rawPath,
+		absoluteBasePath,
+		glob: globPattern ? new Bun.Glob(normalizeProbePath(globPattern)) : undefined,
+		matched: false,
+	};
+}
+
+function markSearchProbeMatches(probes: SearchInputProbe[], entries: Array<{ path: string }>, cwd: string): void {
+	if (probes.length === 0 || entries.length === 0) return;
+	for (const entry of entries) {
+		const absoluteEntryPath = path.isAbsolute(entry.path) ? entry.path : path.resolve(cwd, entry.path);
+		for (const probe of probes) {
+			if (probe.matched) continue;
+			const relative = relativePathWithin(probe.absoluteBasePath, absoluteEntryPath);
+			if (relative === undefined) continue;
+			if (!probe.glob || probe.glob.match(relative === "." ? path.basename(absoluteEntryPath) : relative)) {
+				probe.matched = true;
+			}
+		}
+	}
+}
 
 export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDetails> {
 	readonly name = "search";
@@ -115,8 +222,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			if (normalizedSkip < 0 || !Number.isFinite(normalizedSkip)) {
 				throw new ToolError("Skip must be a non-negative number");
 			}
-			const normalizedContextBefore = this.session.settings.get("search.contextBefore");
-			const normalizedContextAfter = this.session.settings.get("search.contextAfter");
+			const normalizedContextBefore = normalizeContextLines(this.session.settings.get("search.contextBefore"));
+			const normalizedContextAfter = normalizeContextLines(this.session.settings.get("search.contextAfter"));
 			const ignoreCase = i ?? false;
 			const useGitignore = gitignore ?? true;
 			const patternHasNewline = normalizedPattern.includes("\n") || normalizedPattern.includes("\\n");
@@ -157,26 +264,53 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			}
 			const baseDisplayMode = resolveFileDisplayMode(this.session);
 			const immutableDisplayMode = resolveFileDisplayMode(this.session, { immutable: true });
-			// Tolerate missing entries in a multi-path call: skip ones whose base
-			// directory is gone, and only error if every entry is missing. Single
-			// missing path keeps the original ENOENT semantics.
+			const backend = this.session.backend;
+			// Tolerate missing entries in a multi-path call after the backend glob
+			// primitive has had a chance to resolve each input. Single missing paths
+			// keep the original ENOENT semantics.
+			const uniqueResolvedPathInputs = [...new Set(resolvedPathInputs)];
+			const isMultiPathInput = uniqueResolvedPathInputs.length > 1;
 			let missingPaths: string[] = [];
-			let effectivePaths = resolvedPathInputs;
-			if (resolvedPathInputs.length > 1) {
-				const partition = await partitionExistingPaths(resolvedPathInputs, this.session.cwd, parseSearchPath);
-				if (partition.valid.length === 0) {
-					throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
+			const searchInputProbes = isMultiPathInput
+				? uniqueResolvedPathInputs.map(inputPath => createSearchInputProbe(inputPath, this.session.cwd, globFilter))
+				: [];
+			const statCache = new Map<string, StatResult | null>();
+			const statInputBase = async (targetPath: string): Promise<StatResult | null> => {
+				const cacheKey = path.resolve(targetPath);
+				if (statCache.has(cacheKey)) return statCache.get(cacheKey) ?? null;
+				try {
+					const stat = await backend.fs.stat(targetPath, { signal, followSymlinks: true });
+					const cached = stat.exists ? stat : null;
+					statCache.set(cacheKey, cached);
+					return cached;
+				} catch (err) {
+					if (isEnoent(err)) {
+						statCache.set(cacheKey, null);
+						return null;
+					}
+					throw err;
 				}
-				effectivePaths = partition.valid;
-				missingPaths = partition.missing;
-			}
-			if (effectivePaths.length === 1) {
-				const parsedPath = parseSearchPath(effectivePaths[0] ?? ".");
+			};
+			const collectMissingSearchPaths = async (): Promise<string[]> => {
+				const missing: string[] = [];
+				for (const probe of searchInputProbes) {
+					if (probe.matched) continue;
+					const stat = await statInputBase(probe.absoluteBasePath);
+					if (!stat) missing.push(probe.raw);
+				}
+				return missing;
+			};
+			if (uniqueResolvedPathInputs.length === 1) {
+				const parsedPath = parseSearchPath(uniqueResolvedPathInputs[0] ?? ".");
 				searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
 				globFilter = parsedPath.glob;
 				scopePath = formatScopePath(searchPath);
 			} else {
-				const multiSearchPath = await resolveExplicitSearchPaths(effectivePaths, this.session.cwd, globFilter);
+				const multiSearchPath = await resolveExplicitSearchPaths(
+					uniqueResolvedPathInputs,
+					this.session.cwd,
+					globFilter,
+				);
 				if (!multiSearchPath) {
 					throw new ToolError("`paths` must contain at least one path or glob");
 				}
@@ -186,87 +320,222 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				globFilter = exactFilePaths || multiTargets ? undefined : multiSearchPath.glob;
 				scopePath = multiSearchPath.scopePath;
 			}
-			let isDirectory: boolean;
-			try {
-				const stat = await Bun.file(searchPath).stat();
-				isDirectory = stat.isDirectory();
-			} catch {
-				const hint = rawPaths.length > 1 ? " (`paths` entries must each exist relative to cwd)" : "";
-				throw new ToolError(`Path not found: ${scopePath}${hint}`);
+			let isDirectory = true;
+			if (!isMultiPathInput) {
+				try {
+					const stat = await backend.fs.stat(searchPath, { signal });
+					if (!stat.exists) {
+						throw new ToolError(`Path not found: ${scopePath}`);
+					}
+					isDirectory = stat.kind === "dir";
+				} catch {
+					throw new ToolError(`Path not found: ${scopePath}`);
+				}
 			}
 
-			const effectiveOutputMode = GrepOutputMode.Content;
 			const effectiveLimit = DEFAULT_MATCH_LIMIT;
 			const internalLimit = Math.min(effectiveLimit * 5, 2000);
+			const streamMaxMatches = exactFilePaths ? undefined : normalizedSkip + internalLimit;
 
-			// Run grep
-			let result: GrepResult;
+			const grepPlans: Array<{ path: string; allowed?: Set<string> }> = [];
+			const grepPlanMap = new Map<string, { path: string; allowed?: Set<string> }>();
+			const addGrepPlan = (targetPath: string, allowedPath?: string) => {
+				const existing = grepPlanMap.get(targetPath);
+				if (existing) {
+					if (allowedPath === undefined) {
+						existing.allowed = undefined;
+					} else if (existing.allowed) {
+						existing.allowed.add(allowedPath);
+					}
+					return;
+				}
+				const plan = {
+					path: targetPath,
+					allowed: allowedPath === undefined ? undefined : new Set([allowedPath]),
+				};
+				grepPlanMap.set(targetPath, plan);
+				grepPlans.push(plan);
+			};
+			let result: SearchExecutionResult;
 			try {
-				if (exactFilePaths || multiTargets) {
-					const matches: GrepMatch[] = [];
-					let limitReached = false;
-					let totalMatches = 0;
-					let filesSearched = 0;
-					const targets = exactFilePaths
-						? exactFilePaths.map(filePath => ({ basePath: filePath, glob: undefined as string | undefined }))
-						: (multiTargets ?? []);
-					for (const target of targets) {
-						const targetResult = await grep(
-							{
-								pattern: normalizedPattern,
-								path: target.basePath,
-								glob: target.glob,
-								ignoreCase,
-								multiline: effectiveMultiline,
-								hidden: true,
-								gitignore: useGitignore,
-								cache: false,
-								maxCount: exactFilePaths ? undefined : internalLimit,
-								contextBefore: normalizedContextBefore,
-								contextAfter: normalizedContextAfter,
-								maxColumns: DEFAULT_MAX_COLUMN,
-								mode: effectiveOutputMode,
-							},
-							undefined,
-						);
-						limitReached = limitReached || Boolean(targetResult.limitReached);
-						totalMatches += targetResult.totalMatches;
-						filesSearched += targetResult.filesSearched;
-						for (const match of targetResult.matches) {
-							const absolute = path.resolve(target.basePath, match.path);
-							const rebased = path.relative(searchPath, absolute).replace(/\\/g, "/");
-							matches.push({ ...match, path: rebased });
+				const expandGlobPlans = async (basePath: string, pattern: string) => {
+					const globRequest: Parameters<typeof backend.fs.glob>[0] & { gitignore?: boolean } = {
+						patterns: [pattern],
+						paths: [basePath],
+						includeHidden: true,
+						types: ["file"],
+						gitignore: useGitignore,
+						signal,
+					};
+					let globResult: GlobResult;
+					try {
+						globResult = await backend.fs.glob(globRequest);
+					} catch (error) {
+						if (!isMultiPathInput || !isPathNotFoundError(error)) {
+							throw error;
+						}
+						globResult = { entries: [], truncated: false };
+					}
+					markSearchProbeMatches(searchInputProbes, globResult.entries, this.session.cwd);
+					for (const entry of globResult.entries) {
+						addGrepPlan(basePath, path.resolve(this.session.cwd, entry.path));
+					}
+					return globResult.entries;
+				};
+				if (exactFilePaths) {
+					for (const filePath of exactFilePaths) {
+						addGrepPlan(path.dirname(filePath), filePath);
+					}
+				} else if (multiTargets) {
+					for (const target of multiTargets) {
+						if (target.glob) {
+							await expandGlobPlans(target.basePath, target.glob);
+							continue;
+						}
+						addGrepPlan(target.basePath);
+					}
+				} else if (globFilter) {
+					await expandGlobPlans(searchPath, globFilter);
+				} else if (isDirectory) {
+					addGrepPlan(searchPath);
+				} else {
+					addGrepPlan(path.dirname(searchPath), searchPath);
+				}
+
+				const createLine = (hit: GrepHit): SearchMatchLine => ({
+					lineNumber: hit.line,
+					line: hit.text,
+					isMatch: hit.kind === "match",
+					truncated: isGrepLineTruncated(hit),
+				});
+				const matches: SearchMatch[] = [];
+				let limitReached = false;
+				let seenMatches = 0;
+				let currentMatch: SearchMatch | undefined;
+				let pendingBefore: SearchMatchLine[] = [];
+				let pendingAfter: SearchMatchLine[] = [];
+
+				const pushMatch = (match: SearchMatch) => {
+					seenMatches += 1;
+					if (seenMatches <= normalizedSkip) {
+						return;
+					}
+					if (!exactFilePaths && matches.length >= internalLimit) {
+						return;
+					}
+					matches.push(match);
+				};
+
+				const flushCurrentMatch = () => {
+					if (!currentMatch) {
+						pendingBefore = [];
+						pendingAfter = [];
+						return;
+					}
+					currentMatch.lines.push(...pendingAfter.slice(0, normalizedContextAfter));
+					pushMatch(currentMatch);
+					currentMatch = undefined;
+					pendingBefore = [];
+					pendingAfter = [];
+				};
+
+				const handleHit = (hit: GrepHit, absolutePath: string) => {
+					const matchPath = path.relative(searchPath, absolutePath).replace(/\\/g, "/");
+					const line = createLine(hit);
+					if (line.isMatch) {
+						if (currentMatch) {
+							if (currentMatch.path === matchPath) {
+								const beforeCount =
+									normalizedContextBefore > 0 ? Math.min(normalizedContextBefore, pendingAfter.length) : 0;
+								const splitIndex = pendingAfter.length - beforeCount;
+								currentMatch.lines.push(...pendingAfter.slice(0, Math.min(splitIndex, normalizedContextAfter)));
+								pendingBefore = beforeCount > 0 ? pendingAfter.slice(splitIndex) : [];
+								pushMatch(currentMatch);
+							} else {
+								flushCurrentMatch();
+							}
+						}
+						const beforeLines = normalizedContextBefore > 0 ? pendingBefore.slice(-normalizedContextBefore) : [];
+						currentMatch = {
+							path: matchPath,
+							lineNumber: line.lineNumber,
+							line: line.line,
+							lines: [...beforeLines, line],
+						};
+						pendingBefore = [];
+						pendingAfter = [];
+						return;
+					}
+
+					if (currentMatch && currentMatch.path === matchPath) {
+						pendingAfter.push(line);
+						return;
+					}
+					if (currentMatch) {
+						flushCurrentMatch();
+					}
+					pendingBefore.push(line);
+					if (normalizedContextBefore === 0) {
+						pendingBefore = [];
+					} else if (pendingBefore.length > normalizedContextBefore) {
+						pendingBefore = pendingBefore.slice(-normalizedContextBefore);
+					}
+				};
+
+				for (const plan of grepPlans) {
+					const remainingMatches =
+						exactFilePaths || streamMaxMatches === undefined ? undefined : streamMaxMatches - seenMatches;
+					if (remainingMatches !== undefined && remainingMatches <= 0) {
+						break;
+					}
+					const grepRequest = {
+						pattern: normalizedPattern,
+						paths: [plan.path],
+						ignoreCase,
+						gitignore: useGitignore,
+						multiline: effectiveMultiline,
+						contextBefore: normalizedContextBefore,
+						contextAfter: normalizedContextAfter,
+						maxMatches: remainingMatches,
+						signal,
+					};
+					try {
+						const grepStream = backend.fs.grep(grepRequest)[Symbol.asyncIterator]();
+						while (true) {
+							const next = await grepStream.next();
+							if (next.done) {
+								limitReached = limitReached || getGrepLimitReached(next.value);
+								break;
+							}
+							signal?.throwIfAborted();
+							const hit = next.value;
+							const absolutePath = path.isAbsolute(hit.path)
+								? hit.path
+								: path.resolve(this.session.cwd, hit.path);
+							markSearchProbeMatches(searchInputProbes, [{ path: absolutePath }], this.session.cwd);
+							if (plan.allowed && !plan.allowed.has(absolutePath)) {
+								continue;
+							}
+							handleHit(hit, absolutePath);
+						}
+					} catch (error) {
+						if (!isMultiPathInput || !isPathNotFoundError(error)) {
+							throw error;
 						}
 					}
-					const offsetMatches = matches.slice(normalizedSkip);
-					result = {
-						matches: offsetMatches,
-						totalMatches: exactFilePaths ? offsetMatches.length : totalMatches,
-						filesWithMatches: new Set(offsetMatches.map(match => match.path)).size,
-						filesSearched: exactFilePaths ? exactFilePaths.length : filesSearched,
-						limitReached,
-					};
-				} else {
-					result = await grep(
-						{
-							pattern: normalizedPattern,
-							path: searchPath,
-							glob: globFilter,
-							ignoreCase,
-							multiline: effectiveMultiline,
-							hidden: true,
-							gitignore: useGitignore,
-							cache: false,
-							maxCount: internalLimit,
-							offset: normalizedSkip > 0 ? normalizedSkip : undefined,
-							contextBefore: normalizedContextBefore,
-							contextAfter: normalizedContextAfter,
-							maxColumns: DEFAULT_MAX_COLUMN,
-							mode: effectiveOutputMode,
-						},
-						undefined,
-					);
+					flushCurrentMatch();
 				}
+				if (isMultiPathInput) {
+					missingPaths = await collectMissingSearchPaths();
+					if (missingPaths.length === searchInputProbes.length) {
+						throw new ToolError(`Path not found: ${missingPaths.join(", ")}`);
+					}
+				}
+
+				result = {
+					matches,
+					limitReached,
+				};
 			} catch (err) {
 				if (err instanceof Error && err.message.startsWith("regex parse error")) {
 					throw new ToolError(err.message);
@@ -278,10 +547,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				formatResultPath(filePath, isDirectory, searchPath, this.session.cwd);
 
 			// Build output
-			const roundRobinSelect = (matches: GrepMatch[], limit: number): GrepMatch[] => {
+			const roundRobinSelect = (matches: SearchMatch[], limit: number): SearchMatch[] => {
 				if (matches.length <= limit) return matches;
 				const fileOrder: string[] = [];
-				const byFile = new Map<string, GrepMatch[]>();
+				const byFile = new Map<string, SearchMatch[]>();
 				for (const match of matches) {
 					if (!byFile.has(match.path)) {
 						fileOrder.push(match.path);
@@ -289,7 +558,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					}
 					byFile.get(match.path)!.push(match);
 				}
-				const selected: GrepMatch[] = [];
+				const selected: SearchMatch[] = [];
 				const indices = new Map<string, number>(fileOrder.map(file => [file, 0]));
 				while (selected.length < limit) {
 					let anyAdded = false;
@@ -331,7 +600,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			}
 			const outputLines: string[] = [];
 			let linesTruncated = false;
-			const matchesByFile = new Map<string, GrepMatch[]>();
+			const matchesByFile = new Map<string, SearchMatch[]>();
 			for (const match of selectedMatches) {
 				const relativePath = formatPath(match.path);
 				recordFile(relativePath);
@@ -350,35 +619,23 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					? immutableDisplayMode.hashLines
 					: baseDisplayMode.hashLines;
 				const lineNumberWidth = fileMatches.reduce((width, match) => {
-					let nextWidth = Math.max(width, String(match.lineNumber).length);
-					for (const ctx of match.contextBefore ?? []) {
-						nextWidth = Math.max(nextWidth, String(ctx.lineNumber).length);
+					for (const entry of match.lines) {
+						width = Math.max(width, String(entry.lineNumber).length);
 					}
-					for (const ctx of match.contextAfter ?? []) {
-						nextWidth = Math.max(nextWidth, String(ctx.lineNumber).length);
-					}
-					return nextWidth;
+					return width;
 				}, 0);
 				const cacheEntries: Array<readonly [number, string]> = [];
 				for (const match of fileMatches) {
-					const pushLine = (lineNumber: number, line: string, isMatch: boolean, recordable: boolean) => {
+					const pushLine = (lineNumber: number, line: string, isMatch: boolean, truncated?: boolean) => {
+						if (truncated) {
+							linesTruncated = true;
+						}
 						modelOut.push(formatMatchLine(lineNumber, line, isMatch, { useHashLines }));
 						displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
-						if (recordable) cacheEntries.push([lineNumber, line] as const);
+						cacheEntries.push([lineNumber, line] as const);
 					};
-					if (match.contextBefore) {
-						for (const ctx of match.contextBefore) {
-							pushLine(ctx.lineNumber, ctx.line, false, true);
-						}
-					}
-					pushLine(match.lineNumber, match.line, true, !match.truncated);
-					if (match.truncated) {
-						linesTruncated = true;
-					}
-					if (match.contextAfter) {
-						for (const ctx of match.contextAfter) {
-							pushLine(ctx.lineNumber, ctx.line, false, true);
-						}
+					for (const entry of match.lines) {
+						pushLine(entry.lineNumber, entry.line, entry.isMatch, entry.truncated);
 					}
 					fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
 				}

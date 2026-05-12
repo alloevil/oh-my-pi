@@ -178,6 +178,70 @@ describe("runSubprocess yield reminders", () => {
 		expect(userPrompt).not.toContain("Shared task background");
 	});
 
+	it("omits markdown conversation context file from subagent prompt when IRC is enabled", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-irc-context-file",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-irc-context-file",
+			settings: Settings.isolated({ "irc.enabled": true }),
+			contextFile: "/tmp/context.md",
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]).join("\n");
+
+		expect(systemPrompt).not.toContain("# Conversation Context");
+		expect(systemPrompt).not.toContain("/tmp/context.md");
+		expect(systemPrompt).toContain("# IRC Peers");
+	});
+
+	it("keeps markdown conversation context file in subagent prompt when IRC is disabled", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-no-irc-context-file",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-no-irc-context-file",
+			settings: Settings.isolated({ "irc.enabled": false }),
+			contextFile: "/tmp/context.md",
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]).join("\n");
+
+		expect(systemPrompt).toContain("# Conversation Context");
+		expect(systemPrompt).toContain("/tmp/context.md");
+		expect(systemPrompt).not.toContain("# IRC Peers");
+	});
+
 	it("sends reminder prompt when subagent stops without yield", async () => {
 		const prompts: string[] = [];
 		const promptOptions: Array<PromptOptions | undefined> = [];

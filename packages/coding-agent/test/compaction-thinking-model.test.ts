@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort, getBundledModel, type Model, type Effort as ThinkingLevelType } from "@oh-my-pi/pi-ai";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -55,6 +56,7 @@ describe.skipIf(!HAS_ANTIGRAVITY_AUTH)("Compaction with thinking models (Antigra
 		const toolSession: ToolSession = {
 			cwd: tempDir,
 			hasUI: false,
+			backend: new LocalBackend({ cwd: tempDir }),
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated(),
@@ -166,6 +168,7 @@ describe.skipIf(!HAS_ANTHROPIC_AUTH)("Compaction with thinking models (Anthropic
 		const toolSession: ToolSession = {
 			cwd: tempDir,
 			hasUI: false,
+			backend: new LocalBackend({ cwd: tempDir }),
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated(),

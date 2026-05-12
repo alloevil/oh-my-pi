@@ -135,13 +135,13 @@ export async function runShellCommand(cmd: ShellCommandArgs): Promise<void> {
 							process.stderr.write(`${err.message}\n`);
 							return;
 						}
-						if (chunk.length > 0) {
-							lastChar = chunk[chunk.length - 1] ?? null;
+						if (chunk.text.length > 0) {
+							lastChar = chunk.text[chunk.text.length - 1] ?? null;
 						}
-						process.stdout.write(chunk);
+						const output = chunk.stream === "stderr" ? process.stderr : process.stdout;
+						output.write(chunk.text);
 					},
 				);
-
 				if (lastChar && lastChar !== "\n") {
 					process.stdout.write("\n");
 				}

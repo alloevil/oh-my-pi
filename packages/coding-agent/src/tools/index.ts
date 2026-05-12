@@ -1,6 +1,7 @@
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
+import type { Backend } from "../backend";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
@@ -12,6 +13,7 @@ import type { PlanModeState } from "../plan-mode/state";
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
 import type { CustomMessage } from "../session/messages";
+import type { SessionCapabilityBuckets, SessionPathContext } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -46,7 +48,6 @@ import { ResolveTool } from "./resolve";
 import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
-import { loadSshTool } from "./ssh";
 import { type TodoPhase, TodoWriteTool } from "./todo-write";
 import { WriteTool } from "./write";
 import { YieldTool } from "./yield";
@@ -87,7 +88,6 @@ export * from "./resolve";
 export * from "./review";
 export * from "./search";
 export * from "./search-tool-bm25";
-export * from "./ssh";
 export * from "./todo-write";
 export * from "./vim";
 export * from "./write";
@@ -112,8 +112,12 @@ export type {
 
 /** Session context for tool factories */
 export interface ToolSession {
-	/** Current working directory */
+	/** Current execution working directory. For connected sessions this is remote, not local. */
 	cwd: string;
+	/** Explicit local/remote path identity for this session. */
+	sessionPath?: SessionPathContext;
+	/** Capability buckets for disabling subsystems that are unsafe for this session identity. */
+	capabilities?: SessionCapabilityBuckets;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Skip Python kernel availability check and warmup */
@@ -130,6 +134,8 @@ export interface ToolSession {
 	enableLsp?: boolean;
 	/** Whether an edit-capable tool is available in this session (controls hashline output) */
 	hasEditTool?: boolean;
+	/** Backend dispatch surface for tools that map to RWP endpoints. */
+	backend: Backend;
 	/** Event bus for tool/extension communication */
 	eventBus?: EventBus;
 	/** Output schema for structured completion (subagents) */
@@ -268,7 +274,6 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	debug: DebugTool.createIf,
 	eval: s => new EvalTool(s),
 	calc: s => new CalculatorTool(s),
-	ssh: loadSshTool,
 	github: GithubTool.createIf,
 	find: s => new FindTool(s),
 	search: s => new SearchTool(s),
@@ -305,6 +310,23 @@ export interface EvalBackendsAllowance {
 	js: boolean;
 }
 
+function getSessionCapabilities(session: ToolSession): SessionCapabilityBuckets {
+	return (
+		session.capabilities ?? {
+			fs: true,
+			shell: true,
+			eval: true,
+			subagents: true,
+			localWorkspaceDiscovery: true,
+			projectMcpDiscovery: true,
+			lsp: true,
+			debug: true,
+			browser: true,
+			recipes: true,
+		}
+	);
+}
+
 /**
  * Parse PI_PY / PI_JS environment variables. Each is a boolean flag; unset
  * means "not specified, defer to settings". Returns null when neither is set
@@ -333,6 +355,7 @@ export function readEvalBackendsAllowance(session: ToolSession): EvalBackendsAll
  * override the per-key settings; otherwise settings (defaults true) win.
  */
 export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance {
+	if (!getSessionCapabilities(session).eval) return { python: false, js: false };
 	return getEvalBackendsFromEnv() ?? readEvalBackendsAllowance(session);
 }
 
@@ -340,6 +363,7 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
  * Create tools from BUILTIN_TOOLS registry.
  */
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
+	const capabilities = getSessionCapabilities(session);
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
 	const requestedTools =
@@ -419,24 +443,25 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
+		if (name === "read" || name === "edit" || name === "write") return capabilities.fs;
 		if (name === "exit_plan_mode") return planEnabled;
-		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
-		if (name === "bash") return true;
+		if (name === "lsp") return capabilities.lsp && enableLsp && session.settings.get("lsp.enabled");
+		if (name === "bash") return capabilities.shell;
 		if (name === "eval") return allowEval;
-		if (name === "debug") return session.settings.get("debug.enabled");
+		if (name === "debug") return capabilities.debug && session.settings.get("debug.enabled");
 		if (name === "todo_write") return !includeYield && session.settings.get("todo.enabled");
-		if (name === "find") return session.settings.get("find.enabled");
-		if (name === "search") return session.settings.get("search.enabled");
+		if (name === "find") return capabilities.fs && session.settings.get("find.enabled");
+		if (name === "search") return capabilities.fs && session.settings.get("search.enabled");
 		if (name === "github") return session.settings.get("github.enabled");
-		if (name === "ast_grep") return session.settings.get("astGrep.enabled");
-		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
+		if (name === "ast_grep") return capabilities.fs && session.settings.get("astGrep.enabled");
+		if (name === "ast_edit") return capabilities.fs && session.settings.get("astEdit.enabled");
 		if (name === "render_mermaid") return session.settings.get("renderMermaid.enabled");
 		if (name === "inspect_image") return session.settings.get("inspect_image.enabled");
 		if (name === "web_search") return session.settings.get("web_search.enabled");
 		// search_tool_bm25 is allowed when either legacy mcp.discoveryMode or new tools.discoveryMode is active.
 		if (name === "search_tool_bm25") return discoveryActive;
 		if (name === "calc") return session.settings.get("calc.enabled");
-		if (name === "browser") return session.settings.get("browser.enabled");
+		if (name === "browser") return capabilities.browser && session.settings.get("browser.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
 		if (name === "irc") {
 			if (!session.settings.get("irc.enabled")) return false;
@@ -445,11 +470,12 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			if (!session.settings.get("async.enabled") && session.getAgentId?.() === MAIN_AGENT_ID) return false;
 			return true;
 		}
-		if (name === "recipe") return session.settings.get("recipe.enabled");
+		if (name === "recipe") return capabilities.recipes && session.settings.get("recipe.enabled");
 		if (name === "retain" || name === "recall" || name === "reflect") {
 			return session.settings.get("memory.backend") === "hindsight";
 		}
 		if (name === "task") {
+			if (!capabilities.subagents) return false;
 			const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;
 			const currentDepth = session.taskDepth ?? 0;
 			return maxDepth < 0 || currentDepth < maxDepth;

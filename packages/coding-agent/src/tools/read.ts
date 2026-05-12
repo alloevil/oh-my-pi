@@ -1,15 +1,15 @@
-import { Database } from "bun:sqlite";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { glob, type SummaryResult, summarizeCode } from "@oh-my-pi/pi-natives";
+import type { SummaryResult } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { getRemoteDir, prompt, readImageMetadata, untilAborted } from "@oh-my-pi/pi-utils";
+import { type ImageMetadata, parseImageMetadata, prompt, readImageMetadata, untilAborted } from "@oh-my-pi/pi-utils";
+import { RwpError } from "@oh-my-pi/rwp-client";
 import { type Static, Type } from "@sinclair/typebox";
+import type { AstSummary, Backend, ReadAstOptions, ReadLinesOptions, ReadLinesResult } from "../backend";
 import { getFileReadCache } from "../edit/file-read-cache";
-import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
+import { isNotebookPath, readEditableNotebookText, readEditableNotebookTextFromBytes } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
 import { InternalUrlRouter } from "../internal-urls";
@@ -29,9 +29,10 @@ import {
 import { renderCodeCell, renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import { ImageInputTooLargeError, loadImageInput, MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
-import { convertFileWithMarkit } from "../utils/markit";
-import { buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
+import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
+import { formatDimensionNote, resizeImage } from "../utils/image-resize";
+import { convertBufferWithMarkit, convertFileWithMarkit, type MarkitConversionResult } from "../utils/markit";
+import { buildBackendDirectoryTree, buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
 import { type ArchiveReader, openArchive, parseArchivePathCandidates } from "./archive-reader";
 import {
 	executeReadUrl,
@@ -47,20 +48,13 @@ import { formatFullOutputReference, formatStyledTruncationWarning, type OutputMe
 import { expandPath, formatPathRelativeToCwd, resolveReadPath, splitPathAndSel } from "./path-utils";
 import { formatBytes, shortenPath, wrapBrackets } from "./render-utils";
 import {
-	executeReadQuery,
-	getRowByKey,
-	getRowByRowId,
-	getTableSchema,
 	isSqliteFile,
-	listTables,
 	parseSqlitePathCandidates,
 	parseSqliteSelector,
-	queryRows,
 	renderRow,
 	renderSchema,
 	renderTable,
 	renderTableList,
-	resolveTableRowLookup,
 } from "./sqlite-reader";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -71,11 +65,27 @@ const CONVERTIBLE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx"
 const MAX_SUMMARY_BYTES = 2 * 1024 * 1024;
 const MAX_SUMMARY_LINES = 20_000;
 const PROSE_SUMMARY_EXTENSIONS = new Set([".md", ".txt"]);
-// Remote mount path prefix (sshfs mounts) - skip fuzzy matching to avoid hangs
-const REMOTE_MOUNT_PREFIX = getRemoteDir() + path.sep;
+const SQLITE_COMMENT_OR_TERMINATOR_ERROR =
+	"SQLite where clause cannot contain comments, semicolons, or multiple statements";
 
-function isRemoteMountPath(absolutePath: string): boolean {
-	return absolutePath.startsWith(REMOTE_MOUNT_PREFIX);
+const SQLITE_FORBIDDEN_WHERE_KEYWORDS = new Set([
+	"limit",
+	"offset",
+	"union",
+	"intersect",
+	"except",
+	"attach",
+	"detach",
+	"pragma",
+	"vacuum",
+]);
+
+const SUPPORTED_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+
+type SupportedImageMime = ImageMetadata extends { mimeType: infer M } ? M : never;
+
+function isSupportedImageMime(mimeType: string): mimeType is SupportedImageMime {
+	return SUPPORTED_IMAGE_MIME_TYPES.has(mimeType);
 }
 
 function prependLineNumbers(text: string, startNum: number): string {
@@ -92,6 +102,39 @@ function formatTextWithMode(
 	if (shouldAddHashLines) return formatHashLines(text, startNum);
 	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum);
 	return text;
+}
+function eolString(eol: ReadLinesResult["eol"]): string {
+	switch (eol) {
+		case "CRLF":
+			return "\r\n";
+		case "CR":
+			return "\r";
+		default:
+			return "\n";
+	}
+}
+
+function readLinesResultToText(result: ReadLinesResult): string {
+	const lines = [...result.lines];
+	if (result.bom && result.startLine === 1 && lines[0] !== undefined) {
+		lines[0] = `\uFEFF${lines[0]}`;
+	}
+	return lines.join(eolString(result.eol));
+}
+
+function mapAstSummary(summary: AstSummary): SummaryResult {
+	return {
+		language: summary.language ?? undefined,
+		parsed: summary.parsed,
+		elided: summary.elided,
+		totalLines: summary.total_lines,
+		segments: summary.segments.map(segment => ({
+			kind: segment.kind,
+			startLine: segment.start_line,
+			endLine: segment.end_line,
+			text: segment.text ?? undefined,
+		})),
+	};
 }
 
 const BRACE_PAIRS: Record<string, string> = { "{": "}", "(": ")", "[": "]" };
@@ -147,9 +190,41 @@ function formatMergedBraceLine(
 
 function countTextLines(text: string): number {
 	if (text.length === 0) return 0;
-	return text.split("\n").length;
+	const lines = text.split(/\r\n|\n|\r/);
+	return text.endsWith("\n") || text.endsWith("\r") ? lines.length - 1 : lines.length;
 }
-const READ_CHUNK_SIZE = 8 * 1024;
+
+function formatResultPath(filePath: string, cwd: string): string {
+	return formatPathRelativeToCwd(filePath, cwd);
+}
+
+function sanitizePathInMessage(message: string, filePath: string, cwd: string): string {
+	return message.replaceAll(filePath, formatResultPath(filePath, cwd));
+}
+
+type ReadLinesOptionsWithSourceLimits = ReadLinesOptions & {
+	maxLines?: number;
+	maxBytes?: number;
+};
+
+type ReadLinesResultWithSourceMeta = ReadLinesResult & {
+	truncated?: boolean;
+};
+
+function getReadLinesTotalLines(result: ReadLinesResult): number | undefined {
+	return typeof result.totalLines === "number" ? result.totalLines : undefined;
+}
+function formatBeyondEndOfFileMessage(lineNumber: number, totalFileLines: number): string {
+	const suggestion =
+		totalFileLines === 0
+			? "The file is empty."
+			: `Use :1 to read from the start, or :${totalFileLines} to read the last line.`;
+	return `Line ${lineNumber} is beyond end of file (${totalFileLines} lines total). ${suggestion}`;
+}
+
+function isReadLinesSourceTruncated(result: ReadLinesResult): boolean {
+	return (result as ReadLinesResultWithSourceMeta).truncated === true;
+}
 
 /**
  * Number of unanchored context lines to include before/after a user-requested
@@ -178,190 +253,66 @@ function expandRangeWithContext(
 	};
 }
 
-async function streamLinesFromFile(
-	filePath: string,
-	startLine: number,
-	maxLinesToCollect: number,
-	maxBytes: number,
-	selectedLineLimit: number | null,
-	signal?: AbortSignal,
-): Promise<{
-	lines: string[];
-	totalFileLines: number;
-	collectedBytes: number;
-	stoppedByByteLimit: boolean;
-	firstLinePreview?: { text: string; bytes: number };
-	firstLineByteLength?: number;
-	selectedBytesTotal: number;
-}> {
-	const bufferChunk = Buffer.allocUnsafe(READ_CHUNK_SIZE);
-	const collectedLines: string[] = [];
-	let lineIndex = 0;
-	let collectedBytes = 0;
-	let stoppedByByteLimit = false;
-	let doneCollecting = false;
-	let fileHandle: fs.FileHandle | null = null;
-	let currentLineLength = 0;
-	let currentLineChunks: Buffer[] = [];
-	let sawAnyByte = false;
-	let endedWithNewline = false;
-	let firstLinePreviewBytes = 0;
-	const firstLinePreviewChunks: Buffer[] = [];
-	let firstLineByteLength: number | undefined;
-	let selectedBytesTotal = 0;
-	let selectedLinesSeen = 0;
-	let captureLine = false;
-	let discardLineChunks = false;
-	let lineCaptureLimit = 0;
-
-	const setupLineState = () => {
-		captureLine = !doneCollecting && lineIndex >= startLine;
-		discardLineChunks = !captureLine;
-		if (captureLine) {
-			const separatorBytes = collectedLines.length > 0 ? 1 : 0;
-			lineCaptureLimit = maxBytes - collectedBytes - separatorBytes;
-			if (lineCaptureLimit <= 0) {
-				discardLineChunks = true;
-			}
-		} else {
-			lineCaptureLimit = 0;
-		}
-	};
-
-	const decodeLine = (): string => {
-		if (currentLineLength === 0) return "";
-		if (currentLineChunks.length === 1 && currentLineChunks[0]?.length === currentLineLength) {
-			return currentLineChunks[0].toString("utf-8");
-		}
-		return Buffer.concat(currentLineChunks, currentLineLength).toString("utf-8");
-	};
-
-	const maybeCapturePreview = (segment: Uint8Array) => {
-		if (doneCollecting || lineIndex < startLine || collectedLines.length !== 0) return;
-		if (firstLinePreviewBytes >= maxBytes || segment.length === 0) return;
-		const remaining = maxBytes - firstLinePreviewBytes;
-		const slice = segment.length > remaining ? segment.subarray(0, remaining) : segment;
-		if (slice.length === 0) return;
-		firstLinePreviewChunks.push(Buffer.from(slice));
-		firstLinePreviewBytes += slice.length;
-	};
-
-	const appendSegment = (segment: Uint8Array) => {
-		currentLineLength += segment.length;
-		maybeCapturePreview(segment);
-		if (!captureLine || discardLineChunks || segment.length === 0) return;
-		if (currentLineLength <= lineCaptureLimit) {
-			currentLineChunks.push(Buffer.from(segment));
-		} else {
-			discardLineChunks = true;
-		}
-	};
-
-	const finalizeLine = () => {
-		if (lineIndex >= startLine && (selectedLineLimit === null || selectedLinesSeen < selectedLineLimit)) {
-			selectedBytesTotal += currentLineLength + (selectedLinesSeen > 0 ? 1 : 0);
-			selectedLinesSeen++;
-		}
-
-		if (!doneCollecting && lineIndex >= startLine) {
-			const separatorBytes = collectedLines.length > 0 ? 1 : 0;
-			if (collectedLines.length >= maxLinesToCollect) {
-				doneCollecting = true;
-			} else if (collectedLines.length === 0 && currentLineLength > maxBytes) {
-				stoppedByByteLimit = true;
-				doneCollecting = true;
-				if (firstLineByteLength === undefined) {
-					firstLineByteLength = currentLineLength;
-				}
-			} else if (collectedLines.length > 0 && collectedBytes + separatorBytes + currentLineLength > maxBytes) {
-				stoppedByByteLimit = true;
-				doneCollecting = true;
-			} else {
-				const lineText = decodeLine();
-				collectedLines.push(lineText);
-				collectedBytes += separatorBytes + currentLineLength;
-				if (firstLineByteLength === undefined) {
-					firstLineByteLength = currentLineLength;
-				}
-				if (collectedBytes > maxBytes) {
-					stoppedByByteLimit = true;
-					doneCollecting = true;
-				} else if (collectedLines.length >= maxLinesToCollect) {
-					doneCollecting = true;
-				}
-			}
-		} else if (lineIndex >= startLine && firstLineByteLength === undefined) {
-			firstLineByteLength = currentLineLength;
-		}
-
-		lineIndex++;
-		currentLineLength = 0;
-		currentLineChunks = [];
-		setupLineState();
-	};
-
-	setupLineState();
-
-	try {
-		fileHandle = await fs.open(filePath, "r");
-
-		while (true) {
-			throwIfAborted(signal);
-			const { bytesRead } = await fileHandle.read(bufferChunk, 0, bufferChunk.length, null);
-			if (bytesRead === 0) break;
-
-			sawAnyByte = true;
-			const chunk = bufferChunk.subarray(0, bytesRead);
-			endedWithNewline = chunk[bytesRead - 1] === 0x0a;
-
-			let start = 0;
-			for (let i = 0; i < chunk.length; i++) {
-				if (chunk[i] === 0x0a) {
-					const segment = chunk.subarray(start, i);
-					if (segment.length > 0) {
-						appendSegment(segment);
-					}
-					finalizeLine();
-					start = i + 1;
-				}
-			}
-
-			if (start < chunk.length) {
-				appendSegment(chunk.subarray(start));
-			}
-		}
-	} finally {
-		if (fileHandle) {
-			await fileHandle.close();
-		}
-	}
-
-	if (endedWithNewline || currentLineLength > 0 || !sawAnyByte) {
-		finalizeLine();
-	}
-
-	let firstLinePreview: { text: string; bytes: number } | undefined;
-	if (firstLinePreviewBytes > 0) {
-		const { text, bytes } = truncateHeadBytes(Buffer.concat(firstLinePreviewChunks, firstLinePreviewBytes), maxBytes);
-		firstLinePreview = { text, bytes };
-	}
-
-	return {
-		lines: collectedLines,
-		totalFileLines: lineIndex,
-		collectedBytes,
-		stoppedByByteLimit,
-		firstLinePreview,
-		firstLineByteLength,
-		selectedBytesTotal,
-	};
-}
-
 // Maximum image file size (20MB) - larger images will be rejected to prevent OOM during serialization
 const MAX_IMAGE_SIZE = MAX_IMAGE_INPUT_BYTES;
+const IMAGE_METADATA_HEADER_BYTES = 256 * 1024;
 const GLOB_TIMEOUT_MS = 5000;
 
+function resolveBackendReadPath(filePath: string, cwd: string, backend: Backend): string {
+	if (backend.kind === "local") return resolveReadPath(filePath, cwd);
+	if (/^\/+$/u.test(filePath)) return cwd;
+	if (path.isAbsolute(filePath)) return filePath;
+	return path.resolve(cwd, filePath);
+}
+
+async function readImageMetadataFromBackend(
+	absolutePath: string,
+	backend: Backend,
+	signal?: AbortSignal,
+): Promise<ImageMetadata | null> {
+	if (backend.kind === "local") {
+		return readImageMetadata(absolutePath);
+	}
+
+	const header = await backend.fs.readBlob(absolutePath, {
+		range: { start: 0, end: IMAGE_METADATA_HEADER_BYTES - 1 },
+		signal,
+	});
+	return parseImageMetadata(header.bytes);
+}
+
+async function readEditableNotebookTextFromBackend(
+	absolutePath: string,
+	displayPath: string,
+	backend: Backend,
+	signal?: AbortSignal,
+): Promise<string> {
+	if (backend.kind === "local") {
+		return readEditableNotebookText(absolutePath, displayPath);
+	}
+
+	const blob = await backend.fs.readBlob(absolutePath, { signal });
+	return readEditableNotebookTextFromBytes(blob.bytes, displayPath);
+}
+
+async function convertDocumentFromBackend(
+	absolutePath: string,
+	extension: string,
+	backend: Backend,
+	signal?: AbortSignal,
+): Promise<MarkitConversionResult> {
+	if (backend.kind === "local") {
+		return convertFileWithMarkit(absolutePath, signal);
+	}
+
+	const blob = await backend.fs.readBlob(absolutePath, { signal });
+	return convertBufferWithMarkit(blob.bytes, extension, signal);
+}
+
 function isNotFoundError(error: unknown): boolean {
+	if (error instanceof RwpError) {
+		return error.code === "not-found";
+	}
 	if (!error || typeof error !== "object") return false;
 	const code = (error as { code?: string }).code;
 	return code === "ENOENT" || code === "ENOTDIR";
@@ -375,6 +326,7 @@ function isNotFoundError(error: unknown): boolean {
 async function findUniqueSuffixMatch(
 	rawPath: string,
 	cwd: string,
+	backend: Backend,
 	signal?: AbortSignal,
 ): Promise<{ absolutePath: string; displayPath: string } | null> {
 	const normalized = rawPath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
@@ -384,30 +336,110 @@ async function findUniqueSuffixMatch(
 	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
 	let matches: string[];
+	let truncated = false;
 	try {
 		const result = await untilAborted(combinedSignal, () =>
-			glob({
-				pattern: `**/${normalized}`,
-				path: cwd,
-				// No fileType filter: matches both files and directories
-				hidden: true,
+			backend.fs.glob({
+				patterns: [`**/${normalized}`],
+				paths: [cwd],
+				limit: 1,
+				includeHidden: false,
+				signal: combinedSignal,
 			}),
 		);
-		matches = result.matches.map(m => m.path);
+		truncated = result.truncated;
+		matches = result.entries.map(entry => entry.path);
 	} catch (error) {
 		if (error instanceof Error && error.name === "AbortError") {
-			if (!signal?.aborted) return null; // timeout — give up silently
+			if (!signal?.aborted) return null;
 			throw new ToolAbortError();
 		}
 		return null;
 	}
-
-	if (matches.length !== 1) return null;
+	if (truncated || matches.length !== 1) return null;
 
 	return {
 		absolutePath: path.resolve(cwd, matches[0]),
 		displayPath: matches[0],
 	};
+}
+
+function quoteSqliteIdentifier(identifier: string): string {
+	return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function quoteSqliteStringLiteral(value: string): string {
+	return `'${value.replaceAll("'", "''")}'`;
+}
+
+function findSqliteWhereClauseViolation(where: string): string | null {
+	let inSingleQuote = false;
+	let inDoubleQuote = false;
+	let keywordViolation: string | null = null;
+	const lower = where.toLowerCase();
+
+	for (let index = 0; index < where.length; index++) {
+		const char = where[index]!;
+		const next = where[index + 1];
+		if (inSingleQuote) {
+			if (char === "'" && next === "'") {
+				index++;
+				continue;
+			}
+			if (char === "'") inSingleQuote = false;
+			continue;
+		}
+		if (inDoubleQuote) {
+			if (char === '"' && next === '"') {
+				index++;
+				continue;
+			}
+			if (char === '"') inDoubleQuote = false;
+			continue;
+		}
+		if (char === "'") {
+			inSingleQuote = true;
+			continue;
+		}
+		if (char === '"') {
+			inDoubleQuote = true;
+			continue;
+		}
+		if (char === ";") return SQLITE_COMMENT_OR_TERMINATOR_ERROR;
+		if ((char === "-" && next === "-") || (char === "/" && next === "*") || (char === "*" && next === "/")) {
+			return SQLITE_COMMENT_OR_TERMINATOR_ERROR;
+		}
+
+		for (const keyword of SQLITE_FORBIDDEN_WHERE_KEYWORDS) {
+			if (!lower.startsWith(keyword, index)) continue;
+			const before = index === 0 ? "" : lower[index - 1]!;
+			const afterIndex = index + keyword.length;
+			const after = afterIndex >= lower.length ? "" : lower[afterIndex]!;
+			if (!/[a-z0-9_]/.test(before) && !/[a-z0-9_]/.test(after)) {
+				keywordViolation = `SQLite where clause cannot contain '${keyword.toUpperCase()}'`;
+			}
+		}
+	}
+
+	return keywordViolation;
+}
+
+function validateSqliteWhereClause(where: string | undefined): string | undefined {
+	if (!where) return undefined;
+	const trimmed = where.trim();
+	if (!trimmed) return undefined;
+	const violation = findSqliteWhereClauseViolation(trimmed);
+	if (violation) {
+		throw new ToolError(violation);
+	}
+	return trimmed;
+}
+
+function assertSupportedMime(mimeType: string): asserts mimeType is SupportedImageMime {
+	if (isSupportedImageMime(mimeType)) {
+		return;
+	}
+	throw new ToolError(`Unsupported image MIME type '${mimeType}'`);
 }
 
 function decodeUtf8Text(bytes: Uint8Array): string | null {
@@ -587,28 +619,29 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	}
 
 	async #resolveArchiveReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedArchiveReadPath | null> {
+		const backend = this.session.backend;
 		const candidates = parseArchivePathCandidates(readPath);
 		for (const candidate of candidates) {
-			let absolutePath = resolveReadPath(candidate.archivePath, this.session.cwd);
+			let absolutePath = resolveBackendReadPath(candidate.archivePath, this.session.cwd, backend);
 			let suffixResolution: { from: string; to: string } | undefined;
 
 			try {
-				const stat = await Bun.file(absolutePath).stat();
-				if (stat.isDirectory()) continue;
+				const stat = await backend.fs.stat(absolutePath, { signal });
+				if (stat.kind === "dir") continue;
 				return {
 					absolutePath,
 					archiveSubPath: candidate.archivePath === readPath ? "" : candidate.subPath,
 					suffixResolution,
 				};
 			} catch (error) {
-				if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
+				if (!isNotFoundError(error)) continue;
 
-				const suffixMatch = await findUniqueSuffixMatch(candidate.archivePath, this.session.cwd, signal);
+				const suffixMatch = await findUniqueSuffixMatch(candidate.archivePath, this.session.cwd, backend, signal);
 				if (!suffixMatch) continue;
 
 				try {
-					const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
-					if (retryStat.isDirectory()) continue;
+					const retryStat = await backend.fs.stat(suffixMatch.absolutePath, { signal });
+					if (retryStat.kind === "dir") continue;
 
 					absolutePath = suffixMatch.absolutePath;
 					suffixResolution = { from: candidate.archivePath, to: suffixMatch.displayPath };
@@ -629,15 +662,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	}
 
 	async #resolveSqliteReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedSqliteReadPath | null> {
+		const backend = this.session.backend;
 		const candidates = parseSqlitePathCandidates(readPath);
+		const sqliteProbeCache = new Map<string, Promise<boolean>>();
+		const isSqlitePath = (candidatePath: string): Promise<boolean> => {
+			let probe = sqliteProbeCache.get(candidatePath);
+			if (!probe) {
+				probe = isSqliteFile(candidatePath, backend);
+				sqliteProbeCache.set(candidatePath, probe);
+			}
+			return probe;
+		};
 		for (const candidate of candidates) {
-			let absolutePath = resolveReadPath(candidate.sqlitePath, this.session.cwd);
+			let absolutePath = resolveBackendReadPath(candidate.sqlitePath, this.session.cwd, backend);
 			let suffixResolution: { from: string; to: string } | undefined;
 
 			try {
-				const stat = await Bun.file(absolutePath).stat();
-				if (stat.isDirectory()) continue;
-				if (!(await isSqliteFile(absolutePath))) continue;
+				const stat = await backend.fs.stat(absolutePath, { signal });
+				if (stat.kind !== "file") continue;
+				if (!(await isSqlitePath(absolutePath))) continue;
 
 				return {
 					absolutePath,
@@ -646,15 +689,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					suffixResolution,
 				};
 			} catch (error) {
-				if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
+				if (!isNotFoundError(error)) continue;
 
-				const suffixMatch = await findUniqueSuffixMatch(candidate.sqlitePath, this.session.cwd, signal);
+				const suffixMatch = await findUniqueSuffixMatch(candidate.sqlitePath, this.session.cwd, backend, signal);
 				if (!suffixMatch) continue;
 
 				try {
-					const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
-					if (retryStat.isDirectory()) continue;
-					if (!(await isSqliteFile(suffixMatch.absolutePath))) continue;
+					const retryStat = await backend.fs.stat(suffixMatch.absolutePath, { signal });
+					if (retryStat.kind !== "file") continue;
+					if (!(await isSqlitePath(suffixMatch.absolutePath))) continue;
 
 					absolutePath = suffixMatch.absolutePath;
 					suffixResolution = { from: candidate.sqlitePath, to: suffixMatch.displayPath };
@@ -836,7 +879,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const truncation = truncateHead(text, { maxLines: Number.MAX_SAFE_INTEGER });
 		const directoryDetails: ReadToolDetails = { ...details, isDirectory: true };
 		const resultBuilder = toolResult<ReadToolDetails>(directoryDetails).text(truncation.content);
-		resultBuilder.sourcePath(archivePath).limits({ resultLimit: limitMeta.resultLimit?.reached });
+		resultBuilder.sourcePath(formatResultPath(archivePath, this.session.cwd)).limits({
+			resultLimit: limitMeta.resultLimit?.reached,
+		});
 		if (truncation.truncated) {
 			directoryDetails.truncation = truncation;
 			resultBuilder.truncation(truncation, { direction: "head" });
@@ -853,11 +898,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		options?: { raw?: boolean },
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		throwIfAborted(signal);
-		const archive = await openArchive(resolvedArchivePath.absolutePath);
+		const archive = await openArchive(resolvedArchivePath.absolutePath, this.session, signal);
 		throwIfAborted(signal);
 
+		const displayArchivePath = formatResultPath(resolvedArchivePath.absolutePath, this.session.cwd);
 		const details: ReadToolDetails = {
-			resolvedPath: resolvedArchivePath.absolutePath,
+			resolvedPath: displayArchivePath,
 			suffixResolution: resolvedArchivePath.suffixResolution,
 		};
 
@@ -887,13 +933,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						resolvedArchivePath.suffixResolution,
 					),
 				)
-				.sourcePath(resolvedArchivePath.absolutePath)
+				.sourcePath(displayArchivePath)
 				.done();
 		}
 
 		const result = this.#buildInMemoryTextResult(text, offset, limit, {
 			details,
-			sourcePath: resolvedArchivePath.absolutePath,
+			sourcePath: displayArchivePath,
 			entityLabel: "archive entry",
 			raw: options?.raw,
 		});
@@ -915,20 +961,27 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			queryString: resolvedSqlitePath.queryString,
 		};
 		const selector = parseSqliteSelector(selectorInput.subPath, selectorInput.queryString);
+		const displaySqlitePath = formatResultPath(resolvedSqlitePath.absolutePath, this.session.cwd);
 		const details: ReadToolDetails = {
-			resolvedPath: resolvedSqlitePath.absolutePath,
+			resolvedPath: displaySqlitePath,
 			suffixResolution: resolvedSqlitePath.suffixResolution,
 		};
+		const backend = this.session.backend;
 
-		let db: Database | null = null;
 		try {
-			db = new Database(resolvedSqlitePath.absolutePath, { readonly: true, strict: true });
-			db.run("PRAGMA busy_timeout = 3000");
-			throwIfAborted(signal);
-
 			switch (selector.kind) {
 				case "list": {
-					const listLimit = applyListLimit(listTables(db), { limit: 500 });
+					const listResult = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						signal,
+					});
+					if (!("tables" in listResult)) {
+						throw new ToolError("SQLite table listing returned rows instead of tables");
+					}
+					const listLimit = applyListLimit(
+						listResult.tables.map(table => ({ name: table.name, rowCount: table.row_count })),
+						{ limit: 500 },
+					);
 					const output = prependSuffixResolutionNotice(
 						renderTableList(listLimit.items),
 						resolvedSqlitePath.suffixResolution,
@@ -937,7 +990,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					details.truncation = truncation.truncated ? truncation : undefined;
 					const resultBuilder = toolResult<ReadToolDetails>(details)
 						.text(truncation.content)
-						.sourcePath(resolvedSqlitePath.absolutePath)
+						.sourcePath(displaySqlitePath)
 						.limits({ resultLimit: listLimit.meta.resultLimit?.reached });
 					if (truncation.truncated) {
 						resultBuilder.truncation(truncation, { direction: "head" });
@@ -945,26 +998,62 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					return resultBuilder.done();
 				}
 				case "schema": {
-					const sampleRows = queryRows(db, selector.table, { limit: selector.sampleLimit, offset: 0 });
-					let output = renderSchema(getTableSchema(db, selector.table), {
-						columns: sampleRows.columns,
+					const sampleRows = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						table: selector.table,
+						limit: selector.sampleLimit,
+						offset: 0,
+						signal,
+					});
+					if ("tables" in sampleRows) {
+						throw new ToolError("SQLite schema lookup returned table listing");
+					}
+					const schemaSqlResult = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						q: `SELECT sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name = ${quoteSqliteStringLiteral(selector.table)} LIMIT 1`,
+						signal,
+					});
+					if ("tables" in schemaSqlResult) {
+						throw new ToolError("SQLite schema query returned table listing");
+					}
+					const createSql = schemaSqlResult.rows[0]?.sql;
+					if (typeof createSql !== "string" || createSql.length === 0) {
+						throw new ToolError(`SQLite table '${selector.table}' not found`);
+					}
+					const countResult = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						q: `SELECT COUNT(*) AS count FROM ${quoteSqliteIdentifier(selector.table)}`,
+						signal,
+					});
+					if ("tables" in countResult) {
+						throw new ToolError("SQLite count query returned table listing");
+					}
+					const totalCountValue = countResult.rows[0]?.count;
+					const totalCount = typeof totalCountValue === "number" ? totalCountValue : Number(totalCountValue ?? 0);
+					let output = renderSchema(createSql, {
+						columns: sampleRows.columns.map(column => column.name),
 						rows: sampleRows.rows,
 					});
-					if (sampleRows.rows.length < sampleRows.totalCount) {
-						const remaining = sampleRows.totalCount - sampleRows.rows.length;
+					if (sampleRows.rows.length < totalCount) {
+						const remaining = totalCount - sampleRows.rows.length;
 						output += `\n[${remaining} more rows; append :${selector.table}?limit=20&offset=${sampleRows.rows.length} to the database path to continue]`;
 					}
 					return toolResult<ReadToolDetails>(details)
 						.text(prependSuffixResolutionNotice(output, resolvedSqlitePath.suffixResolution))
-						.sourcePath(resolvedSqlitePath.absolutePath)
+						.sourcePath(displaySqlitePath)
 						.done();
 				}
 				case "row": {
-					const lookup = resolveTableRowLookup(db, selector.table);
-					const row =
-						lookup.kind === "pk"
-							? getRowByKey(db, selector.table, lookup, selector.key)
-							: getRowByRowId(db, selector.table, selector.key);
+					const rowResult = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						table: selector.table,
+						key: selector.key,
+						signal,
+					});
+					if ("tables" in rowResult) {
+						throw new ToolError("SQLite row lookup returned table listing");
+					}
+					const row = rowResult.rows[0];
 					if (!row) {
 						return toolResult<ReadToolDetails>(details)
 							.text(
@@ -973,48 +1062,86 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 									resolvedSqlitePath.suffixResolution,
 								),
 							)
-							.sourcePath(resolvedSqlitePath.absolutePath)
+							.sourcePath(displaySqlitePath)
 							.done();
 					}
 					return toolResult<ReadToolDetails>(details)
 						.text(prependSuffixResolutionNotice(renderRow(row), resolvedSqlitePath.suffixResolution))
-						.sourcePath(resolvedSqlitePath.absolutePath)
+						.sourcePath(displaySqlitePath)
 						.done();
 				}
 				case "query": {
-					const page = queryRows(db, selector.table, selector);
+					const validatedWhere = validateSqliteWhereClause(selector.where);
+					const page = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						table: selector.table,
+						where: validatedWhere,
+						order: selector.order,
+						limit: selector.limit,
+						offset: selector.offset,
+						signal,
+					});
+					if ("tables" in page) {
+						throw new ToolError("SQLite table query returned table listing");
+					}
+					const whereClause = validatedWhere ? ` WHERE ${validatedWhere}` : "";
+					const countResult = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						q: `SELECT COUNT(*) AS count FROM ${quoteSqliteIdentifier(selector.table)}${whereClause}`,
+						signal,
+					});
+					if ("tables" in countResult) {
+						throw new ToolError("SQLite count query returned table listing");
+					}
+					const totalCountValue = countResult.rows[0]?.count;
+					const totalCount = typeof totalCountValue === "number" ? totalCountValue : Number(totalCountValue ?? 0);
 					return toolResult<ReadToolDetails>(details)
 						.text(
 							prependSuffixResolutionNotice(
-								renderTable(page.columns, page.rows, {
-									totalCount: page.totalCount,
-									offset: selector.offset,
-									limit: selector.limit,
-									table: selector.table,
-									dbPath: resolvedSqlitePath.absolutePath,
-								}),
+								renderTable(
+									page.columns.map(column => column.name),
+									page.rows,
+									{
+										totalCount,
+										offset: selector.offset,
+										limit: selector.limit,
+										table: selector.table,
+										dbPath: displaySqlitePath,
+									},
+								),
 								resolvedSqlitePath.suffixResolution,
 							),
 						)
-						.sourcePath(resolvedSqlitePath.absolutePath)
+						.sourcePath(displaySqlitePath)
 						.done();
 				}
 				case "raw": {
-					const result = executeReadQuery(db, selector.sql);
+					const result = await backend.sqlite.read({
+						path: resolvedSqlitePath.absolutePath,
+						q: selector.sql,
+						signal,
+					});
+					if ("tables" in result) {
+						throw new ToolError("SQLite raw query returned table listing");
+					}
 					return toolResult<ReadToolDetails>(details)
 						.text(
 							prependSuffixResolutionNotice(
-								renderTable(result.columns, result.rows, {
-									totalCount: result.rows.length,
-									offset: 0,
-									limit: result.rows.length || DEFAULT_MAX_LINES,
-									table: "query",
-									dbPath: resolvedSqlitePath.absolutePath,
-								}),
+								renderTable(
+									result.columns.map(column => column.name),
+									result.rows,
+									{
+										totalCount: result.rows.length,
+										offset: 0,
+										limit: result.rows.length || DEFAULT_MAX_LINES,
+										table: "query",
+										dbPath: displaySqlitePath,
+									},
+								),
 								resolvedSqlitePath.suffixResolution,
 							),
 						)
-						.sourcePath(resolvedSqlitePath.absolutePath)
+						.sourcePath(displaySqlitePath)
 						.done();
 				}
 			}
@@ -1024,30 +1151,39 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (error instanceof ToolError) {
 				throw error;
 			}
-			throw new ToolError(error instanceof Error ? error.message : String(error));
-		} finally {
-			db?.close();
+			throw new ToolError(
+				`SQLite read failed for ${displaySqlitePath}: ${sanitizePathInMessage(
+					error instanceof Error ? error.message : String(error),
+					resolvedSqlitePath.absolutePath,
+					this.session.cwd,
+				)}`,
+			);
 		}
 	}
 
 	async #trySummarize(absolutePath: string, fileSize: number, signal?: AbortSignal): Promise<SummaryResult | null> {
 		if (fileSize > MAX_SUMMARY_BYTES) return null;
 
-		try {
-			throwIfAborted(signal);
-			const code = await Bun.file(absolutePath).text();
-			throwIfAborted(signal);
-			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
+		const backend = this.session.backend;
+		const minBodyLines = this.session.settings.get("read.summarize.minBodyLines");
+		const minCommentLines = this.session.settings.get("read.summarize.minCommentLines");
+		const readAstOptions: ReadAstOptions = {
+			language: getLanguageFromPath(absolutePath),
+			signal,
+			minBodyLines,
+			minCommentLines,
+		};
+		throwIfAborted(signal);
+		const summaryProbe = await backend.fs.readLines(absolutePath, {
+			encoding: "utf-8",
+			maxLines: MAX_SUMMARY_LINES + 1,
+			signal,
+		});
+		throwIfAborted(signal);
+		const totalLines = getReadLinesTotalLines(summaryProbe) ?? summaryProbe.lines.length;
+		if (totalLines > MAX_SUMMARY_LINES || isReadLinesSourceTruncated(summaryProbe)) return null;
 
-			return summarizeCode({
-				code,
-				path: absolutePath,
-				minBodyLines: this.session.settings.get("read.summarize.minBodyLines"),
-				minCommentLines: this.session.settings.get("read.summarize.minCommentLines"),
-			});
-		} catch {
-			return null;
-		}
+		return mapAstSummary(await backend.fs.readAst(absolutePath, readAstOptions));
 	}
 
 	#renderSummary(summary: SummaryResult): {
@@ -1208,35 +1344,33 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (sqlitePath) {
 			return this.#readSqlite(sqlitePath, signal);
 		}
+		const backend = this.session.backend;
 
 		const localTarget = splitPathAndSel(readPath);
 		const localReadPath = localTarget.path;
 		const parsed = parseSel(localTarget.sel);
 
-		let absolutePath = resolveReadPath(localReadPath, this.session.cwd);
+		let absolutePath = resolveBackendReadPath(localReadPath, this.session.cwd, backend);
 		let suffixResolution: { from: string; to: string } | undefined;
 
 		let isDirectory = false;
 		let fileSize = 0;
 		try {
-			const stat = await Bun.file(absolutePath).stat();
+			const stat = await backend.fs.stat(absolutePath, { signal });
 			fileSize = stat.size;
-			isDirectory = stat.isDirectory();
+			isDirectory = stat.kind === "dir";
 		} catch (error) {
 			if (isNotFoundError(error)) {
-				// Attempt unique suffix resolution before falling back to fuzzy suggestions
-				if (!isRemoteMountPath(absolutePath)) {
-					const suffixMatch = await findUniqueSuffixMatch(localReadPath, this.session.cwd, signal);
-					if (suffixMatch) {
-						try {
-							const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
-							absolutePath = suffixMatch.absolutePath;
-							fileSize = retryStat.size;
-							isDirectory = retryStat.isDirectory();
-							suffixResolution = { from: localReadPath, to: suffixMatch.displayPath };
-						} catch {
-							// Suffix match candidate no longer stats — fall through to error path
-						}
+				const suffixMatch = await findUniqueSuffixMatch(localReadPath, this.session.cwd, backend, signal);
+				if (suffixMatch) {
+					try {
+						const retryStat = await backend.fs.stat(suffixMatch.absolutePath, { signal });
+						absolutePath = suffixMatch.absolutePath;
+						fileSize = retryStat.size;
+						isDirectory = retryStat.kind === "dir";
+						suffixResolution = { from: localReadPath, to: suffixMatch.displayPath };
+					} catch {
+						// Suffix match candidate no longer stats — fall through to error path
 					}
 				}
 
@@ -1248,6 +1382,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 		}
 
+		const displayPath = formatResultPath(absolutePath, this.session.cwd);
 		if (isDirectory) {
 			const dirResult = await this.#readDirectory(absolutePath, selToOffsetLimit(parsed).limit, signal);
 			if (suffixResolution) {
@@ -1257,7 +1392,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			return dirResult;
 		}
 
-		const imageMetadata = await readImageMetadata(absolutePath);
+		const imageMetadata = await readImageMetadataFromBackend(absolutePath, backend, signal);
 		const mimeType = imageMetadata?.mimeType;
 		const ext = path.extname(absolutePath).toLowerCase();
 		const _hasEditTool = this.session.hasEditTool ?? true;
@@ -1272,6 +1407,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			| undefined;
 
 		if (mimeType) {
+			assertSupportedMime(mimeType);
 			if (this.#inspectImageEnabled) {
 				const metadata = imageMetadata;
 				const outputMime = metadata?.mimeType ?? mimeType;
@@ -1297,60 +1433,67 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				];
 				content = [{ type: "text", text: metadataLines.join("\n") }];
 				details = {};
-				sourcePath = absolutePath;
+				sourcePath = displayPath;
 			} else {
 				if (fileSize > MAX_IMAGE_SIZE) {
 					const sizeStr = formatBytes(fileSize);
 					const maxStr = formatBytes(MAX_IMAGE_SIZE);
 					throw new ToolError(`Image file too large: ${sizeStr} exceeds ${maxStr} limit.`);
 				}
-				try {
-					const imageInput = await loadImageInput({
-						path: readPath,
-						cwd: this.session.cwd,
-						autoResize: this.#autoResizeImages,
-						maxBytes: MAX_IMAGE_SIZE,
-						resolvedPath: absolutePath,
-						detectedMimeType: mimeType,
-					});
-					if (!imageInput) {
-						throw new ToolError(`Read image file [${mimeType}] failed: unsupported image format.`);
+				const blob = await backend.fs.readBlob(absolutePath, { signal });
+
+				let image = {
+					type: "image",
+					data: Buffer.from(blob.bytes).toString("base64"),
+					mimeType,
+				} satisfies ImageContent;
+				let textNote = `Read image file [${mimeType}]`;
+
+				if (this.#autoResizeImages) {
+					try {
+						const resized = await resizeImage(image);
+						const narrowedMime = resized.mimeType;
+						assertSupportedMime(narrowedMime);
+						image = {
+							type: "image",
+							data: Buffer.from(resized.buffer).toString("base64"),
+							mimeType: narrowedMime,
+						};
+						const dimensionNote = formatDimensionNote(resized);
+						if (dimensionNote) {
+							textNote += `\n${dimensionNote}`;
+						}
+					} catch {
+						// keep original image when resize fails
 					}
-					content = [
-						{ type: "text", text: imageInput.textNote },
-						{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
-					];
-					details = {};
-					sourcePath = imageInput.resolvedPath;
-				} catch (error) {
-					if (error instanceof ImageInputTooLargeError) {
-						throw new ToolError(error.message);
-					}
-					throw error;
 				}
+
+				content = [{ type: "text", text: textNote }, image];
+				details = {};
+				sourcePath = displayPath;
 			}
 		} else if (isNotebookPath(absolutePath) && !isRawSelector(parsed)) {
 			const { offset, limit } = selToOffsetLimit(parsed);
 			return this.#buildInMemoryTextResult(
-				await readEditableNotebookText(absolutePath, localReadPath),
+				await readEditableNotebookTextFromBackend(absolutePath, localReadPath, backend, signal),
 				offset,
 				limit,
 				{
-					details: { resolvedPath: absolutePath },
-					sourcePath: absolutePath,
+					details: { resolvedPath: displayPath },
+					sourcePath: displayPath,
 					entityLabel: "notebook",
 				},
 			);
 		} else if (shouldConvertWithMarkit) {
 			// Convert document via markit.
-			const result = await convertFileWithMarkit(absolutePath, signal);
+			const result = await convertDocumentFromBackend(absolutePath, ext, backend, signal);
 			if (result.ok) {
 				// Apply truncation to converted content
 				const truncation = truncateHead(result.content);
 				const outputText = truncation.content;
 
 				details = { truncation };
-				sourcePath = absolutePath;
+				sourcePath = displayPath;
 				truncationInfo = { result: truncation, options: { direction: "head", startLine: 1 } };
 
 				content = [{ type: "text", text: outputText }];
@@ -1376,7 +1519,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						},
 					};
 
-					sourcePath = absolutePath;
+					sourcePath = displayPath;
 					content = [{ type: "text", text: renderedSummary.text }];
 				}
 			}
@@ -1384,155 +1527,291 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (!content) {
 				// Raw text or line-range mode
 				const { offset, limit } = selToOffsetLimit(parsed);
-				// User-requested 0-indexed range start. Lines BEFORE this become
-				// leading context (added below if offset is explicit).
-				const requestedStart = offset ? Math.max(0, offset - 1) : 0;
-				const expandStart = offset !== undefined && offset > 1;
-				const expandEnd = limit !== undefined;
-				const leadingContext = expandStart ? Math.min(requestedStart, RANGE_CONTEXT_LINES) : 0;
-				const trailingContext = expandEnd ? RANGE_CONTEXT_LINES : 0;
-				const startLine = requestedStart - leadingContext;
-				const startLineDisplay = startLine + 1;
+				if (parsed.kind === "lines") {
+					const requestedStart = Math.max(0, parsed.startLine - 1);
+					const leadingContext = parsed.startLine > 1 ? Math.min(requestedStart, RANGE_CONTEXT_LINES) : 0;
+					const trailingContext = RANGE_CONTEXT_LINES;
+					const startLine = requestedStart - leadingContext;
+					const effectiveLimit = limit ?? this.#defaultLimit;
+					const maxLinesToCollect = Math.min(effectiveLimit + leadingContext + trailingContext, DEFAULT_MAX_LINES);
+					const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					const fileRead = await backend.fs.readLines(absolutePath, {
+						encoding: "utf-8",
+						range: {
+							start: startLine + 1,
+							end: startLine + maxLinesToCollect + 1,
+						},
+						signal,
+					});
+					if (fileRead.lines.length === 0) {
+						const totalFileLines = getReadLinesTotalLines(fileRead);
+						const message =
+							totalFileLines === undefined
+								? `Line ${requestedStart + 1} is beyond end of file.`
+								: formatBeyondEndOfFileMessage(requestedStart + 1, totalFileLines);
+						return toolResult<ReadToolDetails>({ resolvedPath: displayPath, suffixResolution })
+							.text(message)
+							.done();
+					}
 
-				const DEFAULT_LIMIT = this.#defaultLimit;
-				const effectiveLimit = limit ?? DEFAULT_LIMIT;
-				const maxLinesToCollect = Math.min(effectiveLimit + leadingContext + trailingContext, DEFAULT_MAX_LINES);
-				const selectedLineLimit = effectiveLimit + leadingContext + trailingContext;
-				// Scale byte budget with line limit so the configured line count actually fits.
-				// Assume ~512 bytes/line average; never go below the shared default.
-				const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					const hasMoreLines = fileRead.lines.length > maxLinesToCollect;
+					const visibleLines = hasMoreLines ? fileRead.lines.slice(0, maxLinesToCollect) : fileRead.lines;
+					const selectedContentFull = visibleLines.join("\n");
+					const truncatedSelection = truncateHead(selectedContentFull, {
+						maxLines: maxLinesToCollect,
+						maxBytes: maxBytesForRead,
+					});
+					const collectedLines =
+						truncatedSelection.content.length === 0 ? [] : truncatedSelection.content.split("\n");
+					const collectedBytes = truncatedSelection.outputBytes;
+					const stoppedByByteLimit = truncatedSelection.truncatedBy === "bytes";
+					const firstLineText = visibleLines[0] ?? "";
+					const firstLineByteLength = Buffer.byteLength(firstLineText, "utf-8");
+					const firstLinePreview =
+						truncatedSelection.firstLineExceedsLimit && firstLineText.length > 0
+							? truncateHeadBytes(firstLineText, maxBytesForRead)
+							: undefined;
+					const truncation: TruncationResult = {
+						content: collectedLines.join("\n"),
+						truncated: stoppedByByteLimit,
+						truncatedBy: stoppedByByteLimit ? "bytes" : undefined,
+						totalLines: visibleLines.length,
+						totalBytes: Buffer.byteLength(selectedContentFull, "utf-8"),
+						outputLines: collectedLines.length,
+						outputBytes: collectedBytes,
+						lastLinePartial: false,
+						firstLineExceedsLimit: firstLineByteLength > maxBytesForRead,
+					};
 
-				const streamResult = await streamLinesFromFile(
-					absolutePath,
-					startLine,
-					maxLinesToCollect,
-					maxBytesForRead,
-					selectedLineLimit,
-					signal,
-				);
+					if (collectedLines.length > 0 && !truncation.firstLineExceedsLimit) {
+						getFileReadCache(this.session).recordContiguous(absolutePath, fileRead.startLine, collectedLines);
+					}
 
-				const {
-					lines: collectedLines,
-					totalFileLines,
-					collectedBytes,
-					stoppedByByteLimit,
-					firstLinePreview,
-					firstLineByteLength,
-				} = streamResult;
+					const isRawMode = isRawSelector(parsed);
+					const shouldAddHashLines = !isRawMode && displayMode.hashLines;
+					const shouldAddLineNumbers = isRawMode ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
+					let capturedDisplayContent: { text: string; startLine: number } | undefined;
+					const formatText = (text: string, startNum: number): string => {
+						capturedDisplayContent = { text, startLine: startNum };
+						return formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
+					};
 
-				// Check if offset is out of bounds - return graceful message instead of throwing
-				if (requestedStart >= totalFileLines) {
-					const suggestion =
-						totalFileLines === 0
-							? "The file is empty."
-							: `Use :1 to read from the start, or :${totalFileLines} to read the last line.`;
-					return toolResult<ReadToolDetails>({ resolvedPath: absolutePath, suffixResolution })
-						.text(
-							`Line ${requestedStart + 1} is beyond end of file (${totalFileLines} lines total). ${suggestion}`,
-						)
-						.done();
-				}
-
-				const selectedContent = collectedLines.join("\n");
-				const userLimitedLines = collectedLines.length;
-
-				const totalSelectedLines = totalFileLines - startLine;
-				const totalSelectedBytes = collectedBytes;
-				const wasTruncated = collectedLines.length < totalSelectedLines || stoppedByByteLimit;
-				const firstLineExceedsLimit = firstLineByteLength !== undefined && firstLineByteLength > maxBytesForRead;
-
-				const truncation: TruncationResult = {
-					content: selectedContent,
-					truncated: wasTruncated,
-					truncatedBy: stoppedByByteLimit ? "bytes" : wasTruncated ? "lines" : undefined,
-					totalLines: totalSelectedLines,
-					totalBytes: totalSelectedBytes,
-					outputLines: collectedLines.length,
-					outputBytes: collectedBytes,
-					lastLinePartial: false,
-					firstLineExceedsLimit,
-				};
-
-				if (collectedLines.length > 0 && !firstLineExceedsLimit) {
-					getFileReadCache(this.session).recordContiguous(absolutePath, startLineDisplay, collectedLines);
-				}
-
-				const isRawMode = isRawSelector(parsed);
-				const shouldAddHashLines = !isRawMode && displayMode.hashLines;
-				const shouldAddLineNumbers = isRawMode ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
-				let capturedDisplayContent: { text: string; startLine: number } | undefined;
-				const formatText = (text: string, startNum: number): string => {
-					capturedDisplayContent = { text, startLine: startNum };
-					return formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
-				};
-
-				let outputText: string;
-
-				if (truncation.firstLineExceedsLimit) {
-					const firstLineBytes = firstLineByteLength ?? 0;
-					const snippet = firstLinePreview ?? { text: "", bytes: 0 };
-
-					if (shouldAddHashLines) {
-						outputText = `[Line ${startLineDisplay} is ${formatBytes(
-							firstLineBytes,
-						)}, exceeds ${formatBytes(maxBytesForRead)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
+					let outputText: string;
+					if (truncation.firstLineExceedsLimit) {
+						const snippet = firstLinePreview ?? { text: "", bytes: 0 };
+						if (shouldAddHashLines) {
+							outputText = `[Line ${fileRead.startLine} is ${formatBytes(
+								firstLineByteLength,
+							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
+						} else {
+							outputText = formatText(snippet.text, fileRead.startLine);
+						}
+						if (snippet.text.length === 0) {
+							outputText = `[Line ${fileRead.startLine} is ${formatBytes(
+								firstLineByteLength,
+							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
+						}
+						details = { truncation };
+						sourcePath = displayPath;
+						truncationInfo = {
+							result: truncation,
+							options: { direction: "head", startLine: fileRead.startLine },
+						};
 					} else {
-						outputText = formatText(snippet.text, startLineDisplay);
+						outputText = formatText(truncation.content, fileRead.startLine);
+						if (truncation.truncated) {
+							details = { truncation };
+							sourcePath = displayPath;
+							truncationInfo = {
+								result: truncation,
+								options: { direction: "head", startLine: fileRead.startLine },
+							};
+						} else {
+							details = {};
+							sourcePath = displayPath;
+						}
+						if (hasMoreLines) {
+							const nextOffset = fileRead.startLine + visibleLines.length;
+							outputText += `\n\n[More lines in file. Use :${nextOffset} to continue]`;
+						}
 					}
-					if (snippet.text.length === 0) {
-						outputText = `[Line ${startLineDisplay} is ${formatBytes(
-							firstLineBytes,
-						)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
+
+					if (capturedDisplayContent) {
+						details.displayContent = capturedDisplayContent;
 					}
-					details = { truncation };
-					sourcePath = absolutePath;
-					truncationInfo = {
-						result: truncation,
-						options: { direction: "head", startLine: startLineDisplay, totalFileLines },
+
+					content = [{ type: "text", text: outputText }];
+				} else {
+					const readLinesOptions: ReadLinesOptionsWithSourceLimits = {
+						encoding: "utf-8",
+						maxLines: DEFAULT_MAX_LINES,
+						maxBytes: DEFAULT_MAX_BYTES,
+						signal,
 					};
-				} else if (truncation.truncated) {
-					outputText = formatText(truncation.content, startLineDisplay);
-					details = { truncation };
-					sourcePath = absolutePath;
-					truncationInfo = {
-						result: truncation,
-						options: { direction: "head", startLine: startLineDisplay, totalFileLines },
-					};
-				} else if (startLine + userLimitedLines < totalFileLines) {
-					const remaining = totalFileLines - (startLine + userLimitedLines);
+					let fileRead = await backend.fs.readLines(absolutePath, readLinesOptions);
+					let sourceTruncated = isReadLinesSourceTruncated(fileRead);
+					let sourceWindowStart = 0;
+					let allLinesText = readLinesResultToText(fileRead);
+					let allLines = allLinesText.split(/\r\n|\n|\r/);
+					const requestedStart = offset ? Math.max(0, offset - 1) : 0;
+
+					if (offset !== undefined && sourceTruncated && requestedStart >= allLines.length) {
+						fileRead = await backend.fs.readLines(absolutePath, {
+							encoding: "utf-8",
+							range: {
+								start: offset,
+								end: offset + DEFAULT_MAX_LINES - 1,
+							},
+							signal,
+						});
+						sourceTruncated = isReadLinesSourceTruncated(fileRead);
+						sourceWindowStart = requestedStart;
+						allLinesText = readLinesResultToText(fileRead);
+						allLines = allLinesText.split(/\r\n|\n|\r/);
+					}
+
+					const expandStart = offset !== undefined && offset > 1;
+					const expandEnd = limit !== undefined;
+					const leadingContext =
+						expandStart && sourceWindowStart === 0 ? Math.min(requestedStart, RANGE_CONTEXT_LINES) : 0;
+					const trailingContext = expandEnd ? RANGE_CONTEXT_LINES : 0;
+					const startLine = requestedStart - leadingContext;
+					const startLineDisplay = startLine + 1;
+					const sliceStartIndex = startLine - sourceWindowStart;
+
+					const DEFAULT_LIMIT = this.#defaultLimit;
+					const effectiveLimit = limit ?? DEFAULT_LIMIT;
+					const maxLinesToCollect = Math.min(effectiveLimit + leadingContext + trailingContext, DEFAULT_MAX_LINES);
+					const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					const totalFileLines = getReadLinesTotalLines(fileRead);
+					const inferredTotalFileLines =
+						totalFileLines ?? (sourceTruncated ? undefined : sourceWindowStart + allLines.length);
+
+					if (inferredTotalFileLines !== undefined && requestedStart >= inferredTotalFileLines) {
+						return toolResult<ReadToolDetails>({ resolvedPath: displayPath, suffixResolution })
+							.text(formatBeyondEndOfFileMessage(requestedStart + 1, inferredTotalFileLines))
+							.done();
+					}
+
+					const selectedContentFull = allLines.slice(sliceStartIndex).join("\n");
+					const truncatedSelection = truncateHead(selectedContentFull, {
+						maxLines: maxLinesToCollect,
+						maxBytes: maxBytesForRead,
+					});
+					const collectedLines =
+						truncatedSelection.content.length === 0 ? [] : truncatedSelection.content.split("\n");
+					const collectedBytes = truncatedSelection.outputBytes;
+					const stoppedByByteLimit = truncatedSelection.truncatedBy === "bytes";
+					const firstLineText = allLines[sliceStartIndex] ?? "";
+					const firstLineByteLength = Buffer.byteLength(firstLineText, "utf-8");
+					const firstLinePreview =
+						truncatedSelection.firstLineExceedsLimit && firstLineText.length > 0
+							? truncateHeadBytes(firstLineText, maxBytesForRead)
+							: undefined;
+
+					const selectedContent = collectedLines.join("\n");
+					const userLimitedLines = collectedLines.length;
+					const totalSelectedLines =
+						inferredTotalFileLines === undefined
+							? Math.max(0, allLines.length - sliceStartIndex)
+							: inferredTotalFileLines - startLine;
+					const totalSelectedBytes =
+						selectedContentFull.length === 0 ? 0 : Buffer.byteLength(selectedContentFull, "utf-8");
+					const wasTruncated = sourceTruncated || collectedLines.length < totalSelectedLines || stoppedByByteLimit;
+					const firstLineExceedsLimit = firstLineByteLength > maxBytesForRead;
 					const nextOffset = startLine + userLimitedLines + 1;
 
-					outputText = formatText(truncation.content, startLineDisplay);
-					outputText += `\n\n[${remaining} more lines in file. Use :${nextOffset} to continue]`;
-					details = {};
-					sourcePath = absolutePath;
-				} else {
-					// No truncation, no user limit exceeded
-					outputText = formatText(truncation.content, startLineDisplay);
-					details = {};
-					sourcePath = absolutePath;
-				}
+					const truncation: TruncationResult = {
+						content: selectedContent,
+						truncated: wasTruncated,
+						truncatedBy: stoppedByByteLimit ? "bytes" : wasTruncated ? "lines" : undefined,
+						totalLines: totalSelectedLines,
+						totalBytes: totalSelectedBytes,
+						outputLines: collectedLines.length,
+						outputBytes: collectedBytes,
+						lastLinePartial: false,
+						firstLineExceedsLimit,
+					};
 
-				if (capturedDisplayContent) {
-					details.displayContent = capturedDisplayContent;
-				}
+					if (collectedLines.length > 0 && !firstLineExceedsLimit) {
+						getFileReadCache(this.session).recordContiguous(absolutePath, startLineDisplay, collectedLines);
+					}
 
-				content = [{ type: "text", text: outputText }];
+					const isRawMode = isRawSelector(parsed);
+					const shouldAddHashLines = !isRawMode && displayMode.hashLines;
+					const shouldAddLineNumbers = isRawMode ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
+					let capturedDisplayContent: { text: string; startLine: number } | undefined;
+					const formatText = (text: string, startNum: number): string => {
+						capturedDisplayContent = { text, startLine: startNum };
+						return formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
+					};
+
+					let outputText: string;
+					if (truncation.firstLineExceedsLimit) {
+						const snippet = firstLinePreview ?? { text: "", bytes: 0 };
+						if (shouldAddHashLines) {
+							outputText = `[Line ${startLineDisplay} is ${formatBytes(
+								firstLineByteLength,
+							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
+						} else {
+							outputText = formatText(snippet.text, startLineDisplay);
+						}
+						if (snippet.text.length === 0) {
+							outputText = `[Line ${startLineDisplay} is ${formatBytes(
+								firstLineByteLength,
+							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
+						}
+						details = { truncation };
+						sourcePath = displayPath;
+						truncationInfo = {
+							result: truncation,
+							options: { direction: "head", startLine: startLineDisplay, totalFileLines },
+						};
+					} else if (truncation.truncated) {
+						outputText = formatText(truncation.content, startLineDisplay);
+						if (sourceTruncated) {
+							outputText += `\n\n[More lines in file. Use :${nextOffset} to continue]`;
+						}
+						details = { truncation };
+						sourcePath = displayPath;
+						truncationInfo = {
+							result: truncation,
+							options: { direction: "head", startLine: startLineDisplay, totalFileLines },
+						};
+					} else if (totalFileLines !== undefined && startLine + userLimitedLines < totalFileLines) {
+						const remaining = totalFileLines - (startLine + userLimitedLines);
+						outputText = formatText(truncation.content, startLineDisplay);
+						outputText += `\n\n[${remaining} more lines in file. Use :${nextOffset} to continue]`;
+						details = {};
+						sourcePath = displayPath;
+					} else {
+						outputText = formatText(truncation.content, startLineDisplay);
+						details = {};
+						sourcePath = displayPath;
+					}
+
+					if (capturedDisplayContent) {
+						details.displayContent = capturedDisplayContent;
+					}
+
+					content = [{ type: "text", text: outputText }];
+				}
 			}
 		}
 
+		const contentBlocks = content ?? [];
 		if (suffixResolution) {
 			details.suffixResolution = suffixResolution;
 			// Inline resolution notice into first text block so the model sees the actual path
 			const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
-			const firstText = content.find((c): c is TextContent => c.type === "text");
+			const firstText = contentBlocks.find((c): c is TextContent => c.type === "text");
 			if (firstText) {
 				firstText.text = `${notice}\n${firstText.text}`;
 			} else {
-				content = [{ type: "text", text: notice }, ...content];
+				content = [{ type: "text", text: notice }, ...contentBlocks];
 			}
 		}
-		const resultBuilder = toolResult(details).content(content);
+		const resultBuilder = toolResult(details).content(content ?? []);
 		if (sourcePath) {
 			resultBuilder.sourcePath(sourcePath);
 		}
@@ -1608,26 +1887,42 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		throwIfAborted(signal);
 		let tree: DirectoryTree;
 		try {
-			tree = await buildDirectoryTree(absolutePath, {
-				maxDepth: READ_DIRECTORY_MAX_DEPTH,
-				perDirLimit: READ_DIRECTORY_CHILD_LIMIT,
-				rootLimit: null,
-				lineCap: limit ?? null,
-			});
+			const backend = this.session.backend;
+			tree =
+				backend.kind === "local"
+					? await buildDirectoryTree(absolutePath, {
+							maxDepth: READ_DIRECTORY_MAX_DEPTH,
+							perDirLimit: READ_DIRECTORY_CHILD_LIMIT,
+							rootLimit: null,
+							lineCap: limit ?? null,
+						})
+					: await buildBackendDirectoryTree(absolutePath, backend.fs, {
+							cwd: this.session.cwd,
+							maxDepth: READ_DIRECTORY_MAX_DEPTH,
+							perDirLimit: READ_DIRECTORY_CHILD_LIMIT,
+							rootLimit: null,
+							lineCap: limit ?? null,
+							signal,
+						});
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
+			const message = sanitizePathInMessage(
+				error instanceof Error ? error.message : String(error),
+				absolutePath,
+				this.session.cwd,
+			);
 			throw new ToolError(`Cannot read directory: ${message}`);
 		}
 		throwIfAborted(signal);
 
 		const output = tree.totalLines <= 1 ? "(empty directory)" : tree.rendered;
 		const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
+		const displayPath = formatResultPath(tree.rootPath, this.session.cwd);
 		const details: ReadToolDetails = {
 			isDirectory: true,
-			resolvedPath: tree.rootPath,
+			resolvedPath: displayPath,
 		};
 
-		const resultBuilder = toolResult(details).text(truncation.content).sourcePath(tree.rootPath);
+		const resultBuilder = toolResult(details).text(truncation.content).sourcePath(displayPath);
 		if (tree.truncated) {
 			resultBuilder.limits({ resultLimit: 1 });
 		}

@@ -34,6 +34,8 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
 import "./discovery";
+import type { Backend } from "./backend/backend";
+import { type BackendSelectOptions, pickBackend } from "./backend/select";
 import { resolveConfigValue } from "./config/resolve-config-value";
 import { initializeWithSettings } from "./discovery";
 import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "./eval/py/executor";
@@ -88,9 +90,7 @@ import {
 import { AgentSession } from "./session/agent-session";
 import { AuthStorage } from "./session/auth-storage";
 import { convertToLlm } from "./session/messages";
-import { SessionManager } from "./session/session-manager";
-import { closeAllConnections } from "./ssh/connection-manager";
-import { unmountAll } from "./ssh/sshfs-mount";
+import { createLocalSessionPathContext, SessionManager, type SessionPathContext } from "./session/session-manager";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -117,7 +117,6 @@ import {
 	HIDDEN_TOOLS,
 	isSearchProviderPreference,
 	type LspStartupServerInfo,
-	loadSshTool,
 	ReadTool,
 	ResolveTool,
 	renderSearchToolBm25Description,
@@ -142,6 +141,8 @@ import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
+	/** Explicit local/remote session identity. When provided, execution cwd comes from this context. */
+	sessionPathContext?: SessionPathContext;
 	/** Global config directory. Default: ~/.omp/agent */
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
@@ -236,6 +237,11 @@ export interface CreateAgentSessionOptions {
 	/** Settings instance. Default: Settings.init({ cwd, agentDir }) */
 	settings?: Settings;
 
+	/** Override backend selection for this session. */
+	remoteBackend?: BackendSelectOptions["remote"];
+	/** Dispose SSH tunnel / remote launcher after backend cleanup. */
+	disposeRemoteConnection?: () => Promise<void>;
+
 	/** Whether UI is available (enables interactive tools like ask). Default: false */
 	hasUI?: boolean;
 }
@@ -268,6 +274,15 @@ export type * from "./extensibility/extensions";
 export type { Skill } from "./extensibility/skills";
 export type { FileSlashCommand } from "./extensibility/slash-commands";
 export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResult } from "./mcp";
+export type {
+	ConnectedSessionPathContext,
+	LocalSessionPathContext,
+	PersistedSessionPathContext,
+	RemoteBackendSessionDescriptor,
+	RemoteTargetIdentity,
+	SessionCapabilityBuckets,
+	SessionPathContext,
+} from "./session/session-manager";
 export type { Tool } from "./tools";
 export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -281,7 +296,6 @@ export {
 	EvalTool,
 	FindTool,
 	HIDDEN_TOOLS,
-	loadSshTool,
 	ReadTool,
 	ResolveTool,
 	SearchTool,
@@ -438,29 +452,28 @@ const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
 
-let sshCleanupRegistered = false;
-
-async function cleanupSshResources(): Promise<void> {
-	const results = await Promise.allSettled([closeAllConnections(), unmountAll()]);
-	for (const result of results) {
-		if (result.status === "rejected") {
-			logger.warn("SSH cleanup failed", { error: String(result.reason) });
-		}
-	}
-}
-
-function registerSshCleanup(): void {
-	if (sshCleanupRegistered) return;
-	sshCleanupRegistered = true;
-	postmortem.register("ssh-cleanup", cleanupSshResources);
-}
-
 let pythonCleanupRegistered = false;
 
 function registerPythonCleanup(): void {
 	if (pythonCleanupRegistered) return;
 	pythonCleanupRegistered = true;
 	postmortem.register("python-cleanup", disposeAllKernelSessions);
+}
+
+function attachRemoteBackendDescriptor(
+	context: SessionPathContext,
+	remoteBackend: BackendSelectOptions["remote"] | undefined,
+): SessionPathContext {
+	if (context.kind !== "connected" || !remoteBackend) return context;
+	return {
+		...context,
+		remoteSession: {
+			...context.remoteSession,
+			baseUrl: remoteBackend.baseUrl,
+			token: remoteBackend.token,
+			cwd: remoteBackend.cwd ?? context.remoteSession.cwd ?? context.remoteCwd,
+		},
+	};
 }
 
 function customToolToDefinition(tool: CustomTool): ToolDefinition {
@@ -663,18 +676,24 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const cwd = options.cwd ?? getProjectDir();
+	const sessionPathContext =
+		options.sessionPathContext ??
+		options.sessionManager?.getSessionPathContext() ??
+		createLocalSessionPathContext(options.cwd ?? getProjectDir());
+	const cwd = sessionPathContext.executionCwd;
+	const localWorkspaceCwd = sessionPathContext.localWorkspaceCwd;
+	const discoveryCwd = sessionPathContext.capabilities.localWorkspaceDiscovery ? localWorkspaceCwd : cwd;
+	const sessionCapabilities = sessionPathContext.capabilities;
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
 
-	registerSshCleanup();
 	registerPythonCleanup();
 
 	// Use provided or create AuthStorage and ModelRegistry
 	const authStorage = options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir));
 	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage);
 
-	const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+	const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd: discoveryCwd, agentDir }));
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
@@ -686,7 +705,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const STARTUP_SCAN_DEADLINE_MS = 5000;
 	const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
 		? Promise.resolve(options.workspaceTree)
-		: logger.time("buildWorkspaceTree", () => buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }));
+		: logger.time("buildWorkspaceTree", () =>
+				buildWorkspaceTree(discoveryCwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }),
+			);
 	workspaceTreePromise.catch(() => {});
 
 	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
@@ -694,21 +715,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// session-context build, tool creation, MCP discovery, and extension discovery.
 	const contextFilesPromise = options.contextFiles
 		? Promise.resolve(options.contextFiles)
-		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
+		: logger.time("discoverContextFiles", discoverContextFiles, discoveryCwd, agentDir);
 	contextFilesPromise.catch(() => {});
 	const promptTemplatesPromise = options.promptTemplates
 		? Promise.resolve(options.promptTemplates)
-		: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
+		: logger.time("discoverPromptTemplates", discoverPromptTemplates, discoveryCwd, agentDir);
 	promptTemplatesPromise.catch(() => {});
 	const slashCommandsPromise = options.slashCommands
 		? Promise.resolve(options.slashCommands)
-		: logger.time("discoverSlashCommands", discoverSlashCommands, cwd);
+		: logger.time("discoverSlashCommands", discoverSlashCommands, discoveryCwd);
 	slashCommandsPromise.catch(() => {});
 	const skillsSettings = settings.getGroup("skills");
 	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
 	const discoveredSkillsPromise =
 		options.skills === undefined
-			? logger.time("discoverSkills", discoverSkills, cwd, agentDir, {
+			? logger.time("discoverSkills", discoverSkills, discoveryCwd, agentDir, {
 					...skillsSettings,
 					disabledExtensions: disabledExtensionIds,
 				})
@@ -734,7 +755,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const sessionManager =
 		options.sessionManager ??
 		logger.time("sessionManager", () =>
-			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
+			SessionManager.createForSessionPath(
+				sessionPathContext,
+				SessionManager.getDefaultSessionDirForContext(sessionPathContext, agentDir),
+			),
 		);
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	const modelApiKeyAvailability = new Map<string, boolean>();
@@ -756,7 +780,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// reflect actual loaded secrets, not just the setting toggle.
 	let obfuscator: SecretObfuscator | undefined;
 	if (settings.get("secrets.enabled")) {
-		const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
+		const fileEntries = await logger.time("loadSecrets", loadSecrets, discoveryCwd, agentDir);
 		const envEntries = collectEnvSecrets();
 		const allEntries = [...envEntries, ...fileEntries];
 		if (allEntries.length > 0) {
@@ -862,7 +886,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const rulesResult =
 			options.rules !== undefined
 				? { items: options.rules, warnings: undefined }
-				: await loadCapability<Rule>(ruleCapability.id, { cwd });
+				: await loadCapability<Rule>(ruleCapability.id, { cwd: discoveryCwd });
 		const rulebookRules: Rule[] = [];
 		const alwaysApplyRules: Rule[] = [];
 		for (const rule of rulesResult.items) {
@@ -896,7 +920,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				logger.warn("Startup scan exceeded deadline; deferring to system prompt fallback", {
 					name,
 					timeoutMs: STARTUP_SCAN_DEADLINE_MS,
-					cwd,
+					cwd: discoveryCwd,
 				});
 				return undefined;
 			}),
@@ -910,7 +934,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
-	const enableLsp = options.enableLsp ?? true;
+	const enableLsp = (options.enableLsp ?? true) && sessionCapabilities.lsp;
 	const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
 	const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
 	const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
@@ -969,6 +993,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const resolvedAgentDisplayName =
 		options.agentDisplayName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? "sub" : "main");
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
+	let backend: Backend | undefined;
 
 	try {
 		const getActiveModelString = (): string | undefined => {
@@ -977,9 +1002,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (model) return formatModelString(model);
 			return undefined;
 		};
+		const remoteBackend =
+			options.remoteBackend ??
+			(sessionPathContext.kind === "connected" && sessionPathContext.remoteSession.baseUrl
+				? {
+						baseUrl: sessionPathContext.remoteSession.baseUrl,
+						token: sessionPathContext.remoteSession.token,
+						cwd: sessionPathContext.remoteSession.cwd ?? sessionPathContext.remoteExecutionCwd,
+					}
+				: undefined);
+		if (sessionPathContext.kind === "connected" && !remoteBackend && !$env.RWP_URL) {
+			throw new Error(`Connected session ${sessionPathContext.displayCwd} requires an active remote backend`);
+		}
+		const toolSessionPathContext = attachRemoteBackendDescriptor(sessionPathContext, remoteBackend);
+		backend = pickBackend({ cwd: toolSessionPathContext.executionCwd, env: Bun.env, remote: remoteBackend });
 		const toolSession: ToolSession = {
-			cwd,
+			cwd: toolSessionPathContext.executionCwd,
+			sessionPath: toolSessionPathContext,
+			capabilities: sessionCapabilities,
 			hasUI: options.hasUI ?? false,
+			backend,
 			enableLsp,
 			get hasEditTool() {
 				const requestedToolNames = options.toolNames
@@ -1083,13 +1125,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const enableMCP = options.enableMCP ?? true;
 		const customTools: CustomTool[] = [];
 		if (enableMCP && !mcpManager) {
-			const mcpResult = await logger.time("discoverAndLoadMCPTools", discoverAndLoadMCPTools, cwd, {
+			const mcpResult = await logger.time("discoverAndLoadMCPTools", discoverAndLoadMCPTools, discoveryCwd, {
 				onConnecting: serverNames => {
 					if (options.hasUI && serverNames.length > 0) {
 						process.stderr.write(`${chalk.gray(`Connecting to MCP servers: ${serverNames.join(", ")}…`)}\n`);
 					}
 				},
-				enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
+				enableProjectConfig:
+					sessionCapabilities.projectMcpDiscovery && (settings.get("mcp.enableProjectConfig") ?? true),
 				// Always filter Exa - we have native integration
 				filterExa: true,
 				// Filter browser MCP servers when builtin browser tool is active
@@ -1136,7 +1179,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"discoverAndLoadCustomTools",
 			discoverAndLoadCustomTools,
 			[],
-			cwd,
+			discoveryCwd,
 			builtInToolNames,
 			action => queueResolveHandler(toolSession, action),
 		);
@@ -1157,7 +1200,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let extensionsResult: LoadExtensionsResult;
 		if (options.disableExtensionDiscovery) {
 			const configuredPaths = options.additionalExtensionPaths ?? [];
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, configuredPaths, cwd, eventBus);
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensions,
+				configuredPaths,
+				discoveryCwd,
+				eventBus,
+			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -1171,7 +1220,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				"discoverAndLoadExtensions",
 				discoverAndLoadExtensions,
 				configuredPaths,
-				cwd,
+				discoveryCwd,
 				eventBus,
 				disabledExtensionIds,
 			);
@@ -1186,7 +1235,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const factory = inlineExtensions[i];
 				const loaded = await loadExtensionFromFactory(
 					factory,
-					cwd,
+					discoveryCwd,
 					eventBus,
 					extensionsResult.runtime,
 					`<inline-${i}>`,
@@ -1250,7 +1299,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Discover custom commands (TypeScript slash commands)
 		const customCommandsResult: CustomCommandsLoadResult = options.disableExtensionDiscovery
 			? { commands: [], errors: [] }
-			: await logger.time("discoverCustomCommands", loadCustomCommandsInternal, { cwd, agentDir });
+			: await logger.time("discoverCustomCommands", loadCustomCommandsInternal, { cwd: discoveryCwd, agentDir });
 		if (!options.disableExtensionDiscovery) {
 			for (const { path, error } of customCommandsResult.errors) {
 				logger.error("Failed to load custom command", { path, error });
@@ -1262,7 +1311,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionRunner = new ExtensionRunner(
 				extensionsResult.extensions,
 				extensionsResult.runtime,
-				cwd,
+				discoveryCwd,
 				sessionManager,
 				modelRegistry,
 			);
@@ -1340,7 +1389,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		let cursorEventEmitter: ((event: AgentEvent) => void) | undefined;
 		const cursorExecHandlers = new CursorExecHandlers({
-			cwd,
+			cwd: discoveryCwd,
 			tools: toolRegistry,
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
@@ -1748,10 +1797,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		{
 			const originalDispose = session.dispose.bind(session);
 			session.dispose = async () => {
+				let primaryError: unknown;
 				try {
 					await originalDispose();
+				} catch (error) {
+					primaryError = error;
+				}
+				try {
+					if (remoteBackend) {
+						await backend?.dispose();
+					}
+				} catch (error) {
+					if (primaryError === undefined) {
+						primaryError = error;
+					} else {
+						logger.warn("Failed to dispose backend during session shutdown", { error: String(error) });
+					}
+				}
+				try {
+					await options.disposeRemoteConnection?.();
+				} catch (error) {
+					if (primaryError === undefined) {
+						primaryError = error;
+					} else {
+						logger.warn("Failed to dispose remote connection during session shutdown", { error: String(error) });
+					}
 				} finally {
 					agentRegistry.unregister(resolvedAgentId);
+				}
+				if (primaryError !== undefined) {
+					throw primaryError;
 				}
 			};
 		}
@@ -1892,6 +1967,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
+				await backend?.dispose().catch(cleanupError => {
+					logger.warn("Failed to dispose backend after startup error", {
+						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+					});
+				});
+				await options.disposeRemoteConnection?.().catch(cleanupError => {
+					logger.warn("Failed to dispose remote connection after startup error", {
+						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+					});
+				});
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 			}
 		} catch (cleanupError) {

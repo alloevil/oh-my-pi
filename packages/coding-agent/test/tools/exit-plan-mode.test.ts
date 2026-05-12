@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ExitPlanModeTool } from "@oh-my-pi/pi-coding-agent/tools/exit-plan-mode";
+import { LocalBackend } from "../../src/backend";
 
 describe("ExitPlanModeTool", () => {
 	let tmpDir: string;
@@ -27,6 +28,7 @@ describe("ExitPlanModeTool", () => {
 			hasUI: false,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
+			backend: new LocalBackend({ cwd: tmpDir }),
 			settings: Settings.isolated(),
 			getArtifactsDir: () => artifactsDir,
 			getSessionId: () => "session-a",

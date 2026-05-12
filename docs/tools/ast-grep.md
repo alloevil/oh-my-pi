@@ -21,6 +21,9 @@
 | `pat` | `string` | Yes | Single AST pattern. The wrapper trims it and rejects empty strings. |
 | `paths` | `string[]` | Yes | One or more files, directories, globs, or internal URLs with backing files. Empty entries are rejected. Globs are forbidden for internal URLs. |
 | `skip` | `number` | No | Match offset. Defaults to `0`, then `Math.floor(...)`; negatives and non-finite values fail. |
+| `limit` | `number` | No | Maximum matches to return. Defaults to `50`, floored, and clamped by backend/native handling to at least `1`. |
+| `language` | `string` | No | Force one parser language instead of per-file extension inference. |
+| `strictness` | `"smart" \| "relaxed" \| "strict"` | No | AST match strictness override. Defaults to backend/native smart matching. |
 
 Pattern grammar and language support exposed to the model:
 - `$NAME` — capture one AST node.
@@ -53,17 +56,19 @@ Pattern grammar and language support exposed to the model:
 4. `parseSearchPath()` splits a single path into `basePath` plus optional `glob`. `resolveExplicitSearchPaths()` collapses multiple inputs into a common base plus a brace-union glob, or separate `targets` when the only common base is a filesystem root.
 5. The wrapper stats the resolved base path to decide whether output should be grouped as a directory result.
 6. Execution dispatches to either:
-   - one native `astGrep(...)` call for a single resolved base, or
-   - `runMultiTargetAstGrep(...)`, which calls the native binding once per target, rebases paths back to the common root, sorts globally, then applies `skip` and the wrapper limit.
-7. Native `ast_grep` in `crates/pi-natives/src/ast.rs`:
+   - one backend `edit.grepAst(...)` call for a single resolved base, or
+   - `runMultiTargetAstGrep(...)`, which calls the backend once per target, rebases paths back to the common root, sorts globally, then applies wrapper `skip`/`limit` paging.
+7. Each backend call passes `{ pattern, paths, language, strictness, limit: skip + limit + 1 }` so the wrapper can detect whether another page exists.
+8. Backend completion summaries follow the async-iterator summary contract: `{ parseErrors?, filesSearched?, limitReached? }`.
+9. Native/backend AST matching then:
    - normalizes and deduplicates patterns,
    - resolves a `MatchStrictness` (`smart` by default),
    - collects candidate files from a file or gitignore-aware directory scan,
    - infers language per candidate from extension unless `lang` was provided,
    - compiles the pattern separately for each language present,
    - reads each file, reports syntax-error trees as parse issues, runs `find_all`, and optionally captures metavariable bindings.
-8. Native results are sorted by path and source position, then paged by `offset`/`limit`.
-9. The TS wrapper normalizes parse-error strings, deduplicates them, groups matches by formatted path, renders anchor lines, appends limit/parse notices, and returns `toolResult(...).text(...).done()`.
+10. Native results are sorted by path and source position.
+11. The TS wrapper normalizes parse-error strings, deduplicates them, groups matches by formatted path, renders anchor lines, appends limit/parse notices, and returns `toolResult(...).text(...).done()`.
 
 ## Modes / Variants
 - Single file: native path is the file; output is a flat list of rendered match lines.

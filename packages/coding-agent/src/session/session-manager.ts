@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -61,6 +62,20 @@ export interface SessionHeader {
 	titleSource?: "auto" | "user";
 	timestamp: string;
 	cwd: string;
+	/** Stable local/remote identity used for session scoping. Duplicated from sessionPath for fast list/resume reads. */
+	sessionIdentity?: string;
+	/** Cwd/target string suitable for UI display. */
+	displayCwd?: string;
+	/** Human-readable connected target label (for example user@host:port). */
+	displayTarget?: string;
+	/** Connected SSH host, when this header belongs to a remote session. */
+	remoteHost?: string;
+	/** Connected remote execution cwd, when this header belongs to a remote session. */
+	remoteCwd?: string;
+	/** Connected target label, when this header belongs to a remote session. */
+	targetLabel?: string;
+	/** Explicit local/connected path identity for sessions whose execution identity is not just cwd. */
+	sessionPath?: PersistedSessionPathContext;
 	parentSession?: string;
 }
 
@@ -68,6 +83,319 @@ export interface NewSessionOptions {
 	parentSession?: string;
 	/** Skip flushing the current session and delete it instead of saving. */
 	drop?: boolean;
+}
+
+export interface SessionCapabilityBuckets {
+	/** File read/write/edit/search/find operations are available for the execution cwd. */
+	fs: boolean;
+	/** Shell commands are available for the execution cwd. */
+	shell: boolean;
+	/** Eval kernels are available for the execution cwd. */
+	eval: boolean;
+	/** Child agent sessions can inherit this session identity. */
+	subagents: boolean;
+	/** Local workspace files may be used for startup/config discovery. */
+	localWorkspaceDiscovery: boolean;
+	/** Project-scoped MCP config discovery is safe for this identity. */
+	projectMcpDiscovery: boolean;
+	/** LSP integrations are safe for this identity. */
+	lsp: boolean;
+	/** Debug adapter integrations are safe for this identity. */
+	debug: boolean;
+	/** Browser/CDP integrations are safe for this identity. */
+	browser: boolean;
+	/** Local task/recipe discovery is safe for this identity. */
+	recipes: boolean;
+}
+
+export interface RemoteTargetIdentity {
+	kind: "ssh";
+	host: string;
+	username?: string;
+	port?: number;
+	label: string;
+}
+
+export interface RemoteBackendSessionDescriptor {
+	kind: "rwp";
+	transport: "ssh";
+	baseUrl?: string;
+	token?: string;
+	cwd?: string;
+	sessionId?: string;
+}
+
+export interface LocalSessionPathContext {
+	kind: "local";
+	localWorkspaceCwd: string;
+	executionCwd: string;
+	displayCwd: string;
+	displayTarget: string;
+	sessionIdentity: string;
+	capabilities: SessionCapabilityBuckets;
+}
+
+export interface ConnectedSessionPathContext {
+	kind: "connected";
+	localWorkspaceCwd: string;
+	executionCwd: string;
+	remoteExecutionCwd: string;
+	/** Alias persisted for UI/session-list consumers that should not know legacy field names. */
+	remoteCwd: string;
+	/** Canonical SSH hostname; target.label may include user/port for display. */
+	remoteHost: string;
+	/** Human-readable connected target label, for example user@host:port. */
+	targetLabel: string;
+	displayCwd: string;
+	displayTarget: string;
+	sessionIdentity: string;
+	target: RemoteTargetIdentity;
+	remoteSession: RemoteBackendSessionDescriptor;
+	capabilities: SessionCapabilityBuckets;
+}
+
+export type SessionPathContext = LocalSessionPathContext | ConnectedSessionPathContext;
+
+export type PersistedSessionPathContext =
+	| LocalSessionPathContext
+	| (Omit<ConnectedSessionPathContext, "remoteSession"> & {
+			remoteSession: Omit<RemoteBackendSessionDescriptor, "baseUrl" | "token">;
+	  });
+
+const LOCAL_SESSION_CAPABILITIES: SessionCapabilityBuckets = {
+	fs: true,
+	shell: true,
+	eval: true,
+	subagents: true,
+	localWorkspaceDiscovery: true,
+	projectMcpDiscovery: true,
+	lsp: true,
+	debug: true,
+	browser: true,
+	recipes: true,
+};
+
+const CONNECTED_SESSION_CAPABILITIES: SessionCapabilityBuckets = {
+	fs: true,
+	shell: true,
+	eval: true,
+	subagents: true,
+	localWorkspaceDiscovery: true,
+	projectMcpDiscovery: false,
+	lsp: false,
+	debug: false,
+	browser: false,
+	recipes: false,
+};
+
+function cloneCapabilities(capabilities: SessionCapabilityBuckets): SessionCapabilityBuckets {
+	return { ...capabilities };
+}
+
+export function getDefaultConnectedSessionCapabilities(): SessionCapabilityBuckets {
+	return cloneCapabilities(CONNECTED_SESSION_CAPABILITIES);
+}
+
+export function createLocalSessionPathContext(cwd: string): LocalSessionPathContext {
+	const resolvedCwd = path.resolve(cwd);
+	return {
+		kind: "local",
+		localWorkspaceCwd: resolvedCwd,
+		executionCwd: resolvedCwd,
+		displayCwd: resolvedCwd,
+		displayTarget: resolvedCwd,
+		sessionIdentity: resolvedCwd,
+		capabilities: cloneCapabilities(LOCAL_SESSION_CAPABILITIES),
+	};
+}
+
+function cloneSessionPathContext<T extends SessionPathContext>(context: T): T {
+	if (context.kind === "connected") {
+		return {
+			...context,
+			target: { ...context.target },
+			remoteSession: { ...context.remoteSession },
+			capabilities: cloneCapabilities(context.capabilities),
+		} as T;
+	}
+	return { ...context, capabilities: cloneCapabilities(context.capabilities) } as T;
+}
+
+function formatConnectedSessionIdentity(target: RemoteTargetIdentity, remoteCwd: string): string {
+	const url = new URL("ssh://placeholder");
+	url.hostname = target.host;
+	if (target.username) url.username = target.username;
+	if (target.port !== undefined) url.port = String(target.port);
+	url.pathname = remoteCwd;
+	return remoteCwd ? url.toString() : url.toString().replace(/\/$/, "");
+}
+
+function toPersistedSessionPathContext(context: SessionPathContext): PersistedSessionPathContext | undefined {
+	if (context.kind !== "connected") return undefined;
+	const { remoteSession, ...rest } = context;
+	return {
+		...rest,
+		target: { ...context.target },
+		capabilities: cloneCapabilities(context.capabilities),
+		remoteSession: {
+			kind: remoteSession.kind,
+			transport: remoteSession.transport,
+			cwd: remoteSession.cwd ?? context.remoteCwd,
+			sessionId: remoteSession.sessionId,
+		},
+	};
+}
+
+function normalizeSessionPathContext(context: SessionPathContext | undefined, fallbackCwd: string): SessionPathContext {
+	if (!context) return createLocalSessionPathContext(fallbackCwd);
+	const cloned = cloneSessionPathContext(context);
+	if (cloned.kind === "connected") {
+		const remoteCwd = cloned.remoteCwd || cloned.remoteExecutionCwd || cloned.executionCwd;
+		const remoteHost = cloned.remoteHost || cloned.target.host;
+		const targetLabel = cloned.targetLabel || cloned.target.label || cloned.displayTarget || remoteHost;
+		const target: RemoteTargetIdentity = {
+			...cloned.target,
+			host: remoteHost,
+			label: targetLabel,
+		};
+		return {
+			...cloned,
+			target,
+			executionCwd: remoteCwd,
+			remoteExecutionCwd: remoteCwd,
+			remoteCwd,
+			remoteHost,
+			targetLabel,
+			displayCwd: cloned.displayCwd || `${targetLabel}:${remoteCwd}`,
+			displayTarget: cloned.displayTarget || targetLabel,
+			sessionIdentity: cloned.sessionIdentity || formatConnectedSessionIdentity(target, remoteCwd),
+			remoteSession: { ...cloned.remoteSession, cwd: cloned.remoteSession.cwd ?? remoteCwd },
+		};
+	}
+	return createLocalSessionPathContext(cloned.executionCwd || fallbackCwd);
+}
+
+function withRuntimeSessionPathContext(loaded: SessionPathContext, runtime: SessionPathContext): SessionPathContext {
+	if (loaded.kind !== "connected" || runtime.kind !== "connected") return loaded;
+	const sameTarget = loaded.remoteHost === runtime.remoteHost || loaded.targetLabel === runtime.targetLabel;
+	if (loaded.sessionIdentity !== runtime.sessionIdentity && (!sameTarget || loaded.remoteCwd !== runtime.remoteCwd)) {
+		return loaded;
+	}
+	return normalizeSessionPathContext(
+		{
+			...loaded,
+			localWorkspaceCwd: runtime.localWorkspaceCwd,
+			remoteSession: {
+				...loaded.remoteSession,
+				baseUrl: runtime.remoteSession.baseUrl,
+				token: runtime.remoteSession.token,
+				cwd: loaded.remoteSession.cwd ?? loaded.remoteCwd,
+			},
+		},
+		loaded.executionCwd,
+	);
+}
+
+function getSessionHeaderPathFields(
+	context: SessionPathContext,
+): Pick<
+	SessionHeader,
+	| "cwd"
+	| "sessionIdentity"
+	| "displayCwd"
+	| "displayTarget"
+	| "remoteHost"
+	| "remoteCwd"
+	| "targetLabel"
+	| "sessionPath"
+> {
+	if (context.kind !== "connected") {
+		return { cwd: context.executionCwd };
+	}
+	return {
+		cwd: context.executionCwd,
+		sessionIdentity: context.sessionIdentity,
+		displayCwd: context.displayCwd,
+		displayTarget: context.displayTarget,
+		remoteHost: context.remoteHost,
+		remoteCwd: context.remoteCwd,
+		targetLabel: context.targetLabel,
+		sessionPath: toPersistedSessionPathContext(context),
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function parsePersistedSessionPathContext(value: unknown, fallbackCwd: string): SessionPathContext | undefined {
+	if (!isRecord(value)) return undefined;
+	if (value.kind === "connected") {
+		const target = isRecord(value.target) ? value.target : undefined;
+		const remoteSession = isRecord(value.remoteSession) ? value.remoteSession : undefined;
+		const remoteHostValue =
+			typeof value.remoteHost === "string"
+				? value.remoteHost
+				: typeof target?.host === "string"
+					? target.host
+					: undefined;
+		const targetLabel =
+			typeof value.targetLabel === "string"
+				? value.targetLabel
+				: typeof target?.label === "string"
+					? target.label
+					: typeof value.displayTarget === "string"
+						? value.displayTarget
+						: remoteHostValue;
+		const remoteHost = remoteHostValue ?? targetLabel;
+		let remoteExecutionCwd = fallbackCwd;
+		if (typeof value.executionCwd === "string") remoteExecutionCwd = value.executionCwd;
+		if (typeof remoteSession?.cwd === "string") remoteExecutionCwd = remoteSession.cwd;
+		if (typeof value.remoteExecutionCwd === "string") remoteExecutionCwd = value.remoteExecutionCwd;
+		if (typeof value.remoteCwd === "string") remoteExecutionCwd = value.remoteCwd;
+		if (!remoteHost || !targetLabel || !remoteExecutionCwd) return undefined;
+		const parsedTarget: RemoteTargetIdentity = {
+			kind: "ssh",
+			host: remoteHost,
+			username: typeof target?.username === "string" ? target.username : undefined,
+			port: typeof target?.port === "number" ? target.port : undefined,
+			label: targetLabel,
+		};
+		return normalizeSessionPathContext(
+			{
+				kind: "connected",
+				localWorkspaceCwd: typeof value.localWorkspaceCwd === "string" ? value.localWorkspaceCwd : getProjectDir(),
+				executionCwd: typeof value.executionCwd === "string" ? value.executionCwd : remoteExecutionCwd,
+				remoteExecutionCwd,
+				remoteCwd: remoteExecutionCwd,
+				remoteHost,
+				targetLabel,
+				displayCwd:
+					typeof value.displayCwd === "string" ? value.displayCwd : `${targetLabel}:${remoteExecutionCwd}`,
+				displayTarget: typeof value.displayTarget === "string" ? value.displayTarget : targetLabel,
+				sessionIdentity:
+					typeof value.sessionIdentity === "string"
+						? value.sessionIdentity
+						: formatConnectedSessionIdentity(parsedTarget, remoteExecutionCwd),
+				target: parsedTarget,
+				remoteSession: {
+					kind: "rwp",
+					transport: "ssh",
+					cwd: typeof remoteSession?.cwd === "string" ? remoteSession.cwd : remoteExecutionCwd,
+					sessionId: typeof remoteSession?.sessionId === "string" ? remoteSession.sessionId : undefined,
+				},
+				capabilities: {
+					...CONNECTED_SESSION_CAPABILITIES,
+					...(isRecord(value.capabilities) ? value.capabilities : {}),
+				} as SessionCapabilityBuckets,
+			},
+			fallbackCwd,
+		);
+	}
+	if (value.kind === "local" && typeof value.executionCwd === "string") {
+		return createLocalSessionPathContext(value.executionCwd);
+	}
+	return undefined;
 }
 
 export interface SessionEntryBase {
@@ -255,6 +583,14 @@ export interface SessionInfo {
 	id: string;
 	/** Working directory where the session was started. Empty string for old sessions. */
 	cwd: string;
+	/** Stable session identity used for persistence scoping. */
+	sessionIdentity?: string;
+	/** Cwd/target string suitable for UI display. */
+	displayCwd?: string;
+	/** Connected target label, e.g. user@host:port. */
+	connectedTargetLabel?: string;
+	/** Persisted path context, if present in the session header. */
+	sessionPath?: PersistedSessionPathContext;
 	title?: string;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
@@ -270,6 +606,13 @@ export interface SessionInfo {
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
+	| "getExecutionCwd"
+	| "getLocalWorkspaceCwd"
+	| "getDisplayCwd"
+	| "getSessionIdentity"
+	| "getSessionPathContext"
+	| "getConnectedSessionContext"
+	| "getSessionCapabilities"
 	| "getSessionDir"
 	| "getSessionId"
 	| "getSessionFile"
@@ -479,6 +822,30 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 		return undefined;
 	}
 	return path.dirname(sessionDir);
+}
+
+function encodeConnectedSessionDirName(sessionIdentity: string): string {
+	const digest = createHash("sha256").update(sessionIdentity).digest("base64url").slice(0, 32);
+	return `connected-${digest}`;
+}
+
+function computeSessionDirForContext(
+	context: SessionPathContext,
+	storage: SessionStorage,
+	sessionsRoot: string = getSessionsDir(),
+): string {
+	if (context.kind !== "connected") {
+		return computeDefaultSessionDir(context.executionCwd, storage, sessionsRoot);
+	}
+	migrateHomeSessionDirs(sessionsRoot);
+	const sessionDir = path.join(sessionsRoot, encodeConnectedSessionDirName(context.sessionIdentity));
+	storage.ensureDirSync(sessionDir);
+	return sessionDir;
+}
+
+function isSessionScopeEqual(a: string, b: string): boolean {
+	if (a.includes("://") || b.includes("://")) return a === b;
+	return path.resolve(a) === path.resolve(b);
 }
 
 /** Exported for compaction.test.ts */
@@ -766,8 +1133,8 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 		const breadcrumbCwd = lines[0];
 		const sessionFile = lines[1];
 
-		// Only return if cwd matches (user might have cd'd)
-		if (path.resolve(breadcrumbCwd) !== path.resolve(cwd)) return null;
+		// Only return if cwd/session identity matches (user might have cd'd or reconnected elsewhere)
+		if (!isSessionScopeEqual(breadcrumbCwd, cwd)) return null;
 
 		// Verify the session file still exists
 		const stat = fs.statSync(sessionFile, { throwIfNoEntry: false });
@@ -1393,6 +1760,13 @@ interface SessionListHeader {
 	type: "session";
 	id: string;
 	cwd?: string;
+	sessionIdentity?: string;
+	displayCwd?: string;
+	displayTarget?: string;
+	remoteHost?: string;
+	remoteCwd?: string;
+	targetLabel?: string;
+	sessionPath?: PersistedSessionPathContext;
 	title?: string;
 	parentSession?: string;
 	timestamp?: string;
@@ -1404,10 +1778,19 @@ function parseSessionListHeader(
 ): SessionListHeader | undefined {
 	const parsedHeader = entries[0];
 	if (parsedHeader?.type === "session" && typeof parsedHeader.id === "string") {
+		const cwd = typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined;
+		const sessionPath = parsePersistedSessionPathContext(parsedHeader.sessionPath, cwd ?? "");
 		return {
 			type: "session",
 			id: parsedHeader.id,
-			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
+			cwd,
+			sessionIdentity: typeof parsedHeader.sessionIdentity === "string" ? parsedHeader.sessionIdentity : undefined,
+			displayCwd: typeof parsedHeader.displayCwd === "string" ? parsedHeader.displayCwd : undefined,
+			displayTarget: typeof parsedHeader.displayTarget === "string" ? parsedHeader.displayTarget : undefined,
+			remoteHost: typeof parsedHeader.remoteHost === "string" ? parsedHeader.remoteHost : undefined,
+			remoteCwd: typeof parsedHeader.remoteCwd === "string" ? parsedHeader.remoteCwd : undefined,
+			targetLabel: typeof parsedHeader.targetLabel === "string" ? parsedHeader.targetLabel : undefined,
+			sessionPath: sessionPath ? toPersistedSessionPathContext(sessionPath) : undefined,
 			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
 			timestamp: typeof parsedHeader.timestamp === "string" ? parsedHeader.timestamp : undefined,
@@ -1425,6 +1808,12 @@ function parseSessionListHeader(
 		type: "session",
 		id,
 		cwd: extractStringProperty(firstLine, "cwd"),
+		sessionIdentity: extractStringProperty(firstLine, "sessionIdentity"),
+		displayCwd: extractStringProperty(firstLine, "displayCwd"),
+		displayTarget: extractStringProperty(firstLine, "displayTarget"),
+		remoteHost: extractStringProperty(firstLine, "remoteHost"),
+		remoteCwd: extractStringProperty(firstLine, "remoteCwd"),
+		targetLabel: extractStringProperty(firstLine, "targetLabel"),
 		title: extractStringProperty(firstLine, "title"),
 		parentSession: extractStringProperty(firstLine, "parentSession"),
 		timestamp: extractStringProperty(firstLine, "timestamp"),
@@ -1483,10 +1872,16 @@ async function collectSessionFromFile(
 		firstMessage ||= extractFirstUserMessageFromPrefix(content) ?? "";
 		const messageCount = Math.max(parsedMessageCount, countMessageMarkers(content));
 		const stats = storage.statSync(file);
+		const sessionPath = header.sessionPath;
 		return {
 			path: file,
 			id: header.id,
 			cwd: header.cwd ?? "",
+			sessionIdentity: header.sessionIdentity ?? sessionPath?.sessionIdentity,
+			displayCwd: header.displayCwd ?? sessionPath?.displayCwd,
+			connectedTargetLabel:
+				header.targetLabel ?? (sessionPath?.kind === "connected" ? sessionPath.target.label : undefined),
+			sessionPath,
 			title: header.title ?? shortSummary,
 			parentSessionPath: header.parentSession,
 			created: new Date(header.timestamp ?? ""),
@@ -1586,11 +1981,38 @@ export async function resolveResumableSession(
 
 	return { session: globalMatch, scope: "global" };
 }
+
+export async function resolveResumableSessionForContext(
+	sessionArg: string,
+	context: SessionPathContext,
+	sessionDir?: string,
+	storage: SessionStorage = new FileSessionStorage(),
+): Promise<ResolvedSessionMatch | undefined> {
+	const localSessionDir = sessionDir ?? SessionManager.getDefaultSessionDirForContext(context, undefined, storage);
+	const localSessions = await SessionManager.listForSessionPath(context, localSessionDir, storage);
+	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+	if (localMatch) {
+		return { session: localMatch, scope: "local" };
+	}
+
+	if (sessionDir) {
+		return undefined;
+	}
+
+	const globalSessions = await SessionManager.listAll(storage);
+	const globalMatch = globalSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+	if (!globalMatch) {
+		return undefined;
+	}
+
+	return { session: globalMatch, scope: "global" };
+}
 interface SessionManagerStateSnapshot {
 	sessionId: string;
 	sessionName: string | undefined;
 	titleSource: "auto" | "user" | undefined;
 	sessionFile: string | undefined;
+	sessionPathContext: SessionPathContext;
 	flushed: boolean;
 	needsFullRewriteOnNextPersist: boolean;
 	fileEntries: FileEntry[];
@@ -1627,6 +2049,7 @@ export class SessionManager {
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
 	#adoptedArtifactManager: ArtifactManager | null = null;
+	#sessionPathContext: SessionPathContext;
 	// In-memory artifact fallback for non-persistent sessions (persist=false).
 	// Keyed by sequential numeric ID string; mirrors the file-based ArtifactManager ID scheme.
 	#inMemoryArtifacts: Map<string, string> | null = null;
@@ -1638,7 +2061,10 @@ export class SessionManager {
 		private sessionDir: string,
 		private readonly persist: boolean,
 		private readonly storage: SessionStorage,
+		sessionPathContext?: SessionPathContext,
 	) {
+		this.#sessionPathContext = normalizeSessionPathContext(sessionPathContext, cwd);
+		this.cwd = this.#sessionPathContext.executionCwd;
 		this.#blobStore = new BlobStore(getBlobsDir());
 		if (persist && sessionDir) {
 			this.storage.ensureDirSync(sessionDir);
@@ -1657,6 +2083,7 @@ export class SessionManager {
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
 			sessionFile: this.#sessionFile,
+			sessionPathContext: cloneSessionPathContext(this.#sessionPathContext),
 			flushed: this.#flushed,
 			needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
@@ -1670,6 +2097,8 @@ export class SessionManager {
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
 		this.#sessionFile = snapshot.sessionFile;
+		this.#sessionPathContext = cloneSessionPathContext(snapshot.sessionPathContext);
+		this.cwd = this.#sessionPathContext.executionCwd;
 		this.#flushed = snapshot.flushed;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
 		this.#fileEntries = [...snapshot.fileEntries];
@@ -1683,7 +2112,7 @@ export class SessionManager {
 		this.#adoptedArtifactManager = null;
 		this.#buildIndex();
 		if (this.#sessionFile) {
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			writeTerminalBreadcrumb(this.getSessionIdentity(), this.#sessionFile);
 		}
 	}
 
@@ -1703,10 +2132,21 @@ export class SessionManager {
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionFile = path.resolve(sessionFile);
-		writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+		writeTerminalBreadcrumb(this.getSessionIdentity(), this.#sessionFile);
 		this.#fileEntries = await loadEntriesFromFile(this.#sessionFile, this.storage);
 		if (this.#fileEntries.length > 0) {
 			const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
+			const runtimePathContext = this.#sessionPathContext;
+			const loadedPathContext = parsePersistedSessionPathContext(header?.sessionPath, header?.cwd ?? this.cwd);
+			if (loadedPathContext) {
+				const mergedPathContext = withRuntimeSessionPathContext(loadedPathContext, runtimePathContext);
+				this.#sessionPathContext = mergedPathContext;
+				this.cwd = mergedPathContext.executionCwd;
+			} else if (this.#sessionPathContext.kind === "local" && header?.cwd) {
+				this.#sessionPathContext = createLocalSessionPathContext(header.cwd);
+				this.cwd = this.#sessionPathContext.executionCwd;
+			}
+			writeTerminalBreadcrumb(this.getSessionIdentity(), this.#sessionFile);
 			this.#sessionId = header?.id ?? createSessionId();
 			this.#sessionName = header?.title;
 			this.#titleSource = header?.titleSource;
@@ -1781,7 +2221,7 @@ export class SessionManager {
 			title: oldHeader?.title ?? this.#sessionName,
 			titleSource: oldHeader?.titleSource ?? this.#titleSource,
 			timestamp,
-			cwd: this.cwd,
+			...getSessionHeaderPathFields(this.#sessionPathContext),
 			parentSession: oldSessionId,
 		};
 		this.#sessionName = newHeader.title;
@@ -1807,10 +2247,25 @@ export class SessionManager {
 		const resolvedCwd = path.resolve(newCwd);
 		if (resolvedCwd === this.cwd) return;
 
+		const nextSessionPathContext: SessionPathContext =
+			this.#sessionPathContext.kind === "connected"
+				? {
+						...this.#sessionPathContext,
+						executionCwd: resolvedCwd,
+						remoteExecutionCwd: resolvedCwd,
+						remoteCwd: resolvedCwd,
+						displayCwd: `${this.#sessionPathContext.targetLabel}:${resolvedCwd}`,
+						sessionIdentity: formatConnectedSessionIdentity(this.#sessionPathContext.target, resolvedCwd),
+						remoteSession: { ...this.#sessionPathContext.remoteSession, cwd: resolvedCwd },
+					}
+				: createLocalSessionPathContext(resolvedCwd);
 		const managedSessionsRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
-		const newSessionDir = managedSessionsRoot
-			? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
-			: computeDefaultSessionDir(resolvedCwd, this.storage);
+		const newSessionDir =
+			this.#sessionPathContext.kind === "connected"
+				? computeSessionDirForContext(nextSessionPathContext, this.storage)
+				: managedSessionsRoot
+					? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
+					: computeDefaultSessionDir(resolvedCwd, this.storage);
 		let hadSessionFile = false;
 
 		if (this.persist && this.#sessionFile) {
@@ -1871,11 +2326,12 @@ export class SessionManager {
 		// Update cwd and sessionDir after the move succeeds.
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
+		this.#sessionPathContext = nextSessionPathContext;
 
 		// Update the session header in fileEntries
 		const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 		if (header) {
-			header.cwd = resolvedCwd;
+			Object.assign(header, getSessionHeaderPathFields(this.#sessionPathContext));
 		}
 
 		// Rewrite the session file at its new location with updated header.
@@ -1889,7 +2345,7 @@ export class SessionManager {
 
 		// Update terminal breadcrumb
 		if (this.#sessionFile) {
-			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
+			writeTerminalBreadcrumb(this.getSessionIdentity(), this.#sessionFile);
 		}
 	}
 
@@ -1907,7 +2363,7 @@ export class SessionManager {
 			version: CURRENT_SESSION_VERSION,
 			id: this.#sessionId,
 			timestamp,
-			cwd: this.cwd,
+			...getSessionHeaderPathFields(this.#sessionPathContext),
 			parentSession: options?.parentSession,
 		};
 		this.#fileEntries = [header];
@@ -1924,7 +2380,7 @@ export class SessionManager {
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 			this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			writeTerminalBreadcrumb(this.getSessionIdentity(), this.#sessionFile);
 		}
 		return this.#sessionFile;
 	}
@@ -2104,6 +2560,36 @@ export class SessionManager {
 
 	getCwd(): string {
 		return this.cwd;
+	}
+
+	getExecutionCwd(): string {
+		return this.#sessionPathContext.executionCwd;
+	}
+
+	getLocalWorkspaceCwd(): string {
+		return this.#sessionPathContext.localWorkspaceCwd;
+	}
+
+	getDisplayCwd(): string {
+		return this.#sessionPathContext.displayCwd;
+	}
+
+	getSessionIdentity(): string {
+		return this.#sessionPathContext.sessionIdentity;
+	}
+
+	getSessionPathContext(): SessionPathContext {
+		return cloneSessionPathContext(this.#sessionPathContext);
+	}
+
+	getConnectedSessionContext(): ConnectedSessionPathContext | undefined {
+		return this.#sessionPathContext.kind === "connected"
+			? cloneSessionPathContext(this.#sessionPathContext)
+			: undefined;
+	}
+
+	getSessionCapabilities(): SessionCapabilityBuckets {
+		return cloneCapabilities(this.#sessionPathContext.capabilities);
 	}
 
 	/** Get usage statistics across all assistant messages in the session. */
@@ -2866,7 +3352,7 @@ export class SessionManager {
 			version: CURRENT_SESSION_VERSION,
 			id: newSessionId,
 			timestamp,
-			cwd: this.cwd,
+			...getSessionHeaderPathFields(this.#sessionPathContext),
 			parentSession: this.persist ? previousSessionFile : undefined,
 		};
 
@@ -2945,6 +3431,17 @@ export class SessionManager {
 	}
 
 	/**
+	 * Resolve the canonical default session directory for a local or connected session identity.
+	 */
+	static getDefaultSessionDirForContext(
+		context: SessionPathContext,
+		agentDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): string {
+		return computeSessionDirForContext(context, storage, getSessionsDir(agentDir));
+	}
+
+	/**
 	 * Create a new session.
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.omp/agent/sessions/<encoded-cwd>/).
@@ -2952,6 +3449,18 @@ export class SessionManager {
 	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
+		manager.#initNewSession();
+		return manager;
+	}
+
+	static createForSessionPath(
+		context: SessionPathContext,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): SessionManager {
+		const normalized = normalizeSessionPathContext(context, context.executionCwd);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDirForContext(normalized, undefined, storage);
+		const manager = new SessionManager(normalized.executionCwd, dir, true, storage, normalized);
 		manager.#initNewSession();
 		return manager;
 	}
@@ -2986,6 +3495,33 @@ export class SessionManager {
 		return manager;
 	}
 
+	static async forkFromForSessionPath(
+		sourcePath: string,
+		context: SessionPathContext,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionManager> {
+		const normalized = normalizeSessionPathContext(context, context.executionCwd);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDirForContext(normalized, undefined, storage);
+		const manager = new SessionManager(normalized.executionCwd, dir, true, storage, normalized);
+		const forkEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
+		migrateToCurrentVersion(forkEntries);
+		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
+		const sourceHeader = forkEntries.find(e => e.type === "session") as SessionHeader | undefined;
+		const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		manager.#newSessionSync({ parentSession: sourceHeader?.id });
+		const newHeader = manager.#fileEntries[0] as SessionHeader;
+		newHeader.title = sourceHeader?.title;
+		newHeader.titleSource = sourceHeader?.titleSource;
+		manager.#fileEntries = [newHeader, ...historyEntries];
+		manager.#sessionName = newHeader.title;
+		manager.#titleSource = newHeader.titleSource;
+		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+		manager.#buildIndex();
+		await manager.#rewriteFile();
+		return manager;
+	}
+
 	/**
 	 * Open a specific session file.
 	 * @param path Path to session file
@@ -2995,14 +3531,17 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		sessionPathContext?: SessionPathContext,
 	): Promise<SessionManager> {
 		// Extract cwd from session header if possible, otherwise use getProjectDir()
 		const entries = await loadEntriesFromFile(filePath, storage);
 		const header = entries.find(e => e.type === "session") as SessionHeader | undefined;
-		const cwd = header?.cwd ?? getProjectDir();
+		const loadedPathContext = parsePersistedSessionPathContext(header?.sessionPath, header?.cwd ?? getProjectDir());
+		const context = sessionPathContext ?? loadedPathContext;
+		const cwd = context?.executionCwd ?? header?.cwd ?? getProjectDir();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? path.resolve(filePath, "..");
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, context);
 		await manager.#initSessionFile(filePath);
 		return manager;
 	}
@@ -3030,12 +3569,41 @@ export class SessionManager {
 		return manager;
 	}
 
+	static async continueRecentForSessionPath(
+		context: SessionPathContext,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionManager> {
+		const normalized = normalizeSessionPathContext(context, context.executionCwd);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDirForContext(normalized, undefined, storage);
+		// Prefer terminal-scoped breadcrumb (handles concurrent sessions correctly)
+		const terminalSession = await readTerminalBreadcrumb(normalized.sessionIdentity);
+		const mostRecent = terminalSession ?? (await findMostRecentSession(dir, storage));
+		const manager = new SessionManager(normalized.executionCwd, dir, true, storage, normalized);
+		if (mostRecent) {
+			await manager.#initSessionFile(mostRecent);
+		} else {
+			manager.#initNewSession();
+		}
+		return manager;
+	}
+
 	/** Create an in-memory session (no file persistence) */
 	static inMemory(
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
 	): SessionManager {
 		const manager = new SessionManager(cwd, "", false, storage);
+		manager.#initNewSession();
+		return manager;
+	}
+
+	static inMemoryForSessionPath(
+		context: SessionPathContext,
+		storage: SessionStorage = new MemorySessionStorage(),
+	): SessionManager {
+		const normalized = normalizeSessionPathContext(context, context.executionCwd);
+		const manager = new SessionManager(normalized.executionCwd, "", false, storage, normalized);
 		manager.#initNewSession();
 		return manager;
 	}
@@ -3051,6 +3619,21 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		try {
+			const files = storage.listFilesSync(dir, "*.jsonl");
+			return await collectSessionsFromFiles(files, storage);
+		} catch {
+			return [];
+		}
+	}
+
+	static async listForSessionPath(
+		context: SessionPathContext,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionInfo[]> {
+		const normalized = normalizeSessionPathContext(context, context.executionCwd);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDirForContext(normalized, undefined, storage);
 		try {
 			const files = storage.listFilesSync(dir, "*.jsonl");
 			return await collectSessionsFromFiles(files, storage);

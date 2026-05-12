@@ -236,6 +236,25 @@ struct MatchCollector {
 	context_before:  SmallVec<[ContextLine; 8]>,
 }
 
+fn push_context_before(
+	pending_context_before: &mut SmallVec<[ContextLine; 8]>,
+	matches: &mut [CollectedMatch],
+	line_number: u64,
+	line: String,
+) {
+	if let Some(last_match) = matches.last_mut()
+		&& line_number < last_match.line_number
+	{
+		last_match
+			.context_before
+			.push(ContextLine { line_number: crate::utils::clamp_u32(line_number), line });
+		return;
+	}
+
+	pending_context_before
+		.push(ContextLine { line_number: crate::utils::clamp_u32(line_number), line });
+}
+
 struct CollectedMatch {
 	line_number:    u64,
 	line:           String,
@@ -387,9 +406,7 @@ impl Sink for MatchCollector {
 
 		match ctx.kind() {
 			SinkContextKind::Before => {
-				self
-					.context_before
-					.push(ContextLine { line_number: crate::utils::clamp_u32(line_number), line });
+				push_context_before(&mut self.context_before, &mut self.matches, line_number, line);
 			},
 			SinkContextKind::After => {
 				if let Some(last_match) = self.matches.last_mut() {

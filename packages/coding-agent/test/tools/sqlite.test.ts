@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import "../../src/tools/renderers";
+import { LocalBackend } from "../../src/backend";
 import { Settings } from "../../src/config/settings";
 import { ReadTool } from "../../src/tools/read";
 import { parseSqlitePathCandidates, parseSqliteSelector, renderTable } from "../../src/tools/sqlite-reader";
@@ -29,6 +30,7 @@ function createSession(cwd: string, overrides: Partial<SessionLike> = {}): Sessi
 		enableLsp: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		backend: new LocalBackend({ cwd }),
 		settings: Settings.isolated(),
 		...overrides,
 	} as SessionLike;

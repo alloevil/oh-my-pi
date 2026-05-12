@@ -4,16 +4,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { LocalBackend } from "../../src/backend";
 
 function createTestSession(cwd = "/tmp/test", overrides: Partial<ToolSession> = {}): ToolSession {
-	return {
+	const session = {
 		cwd,
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated(),
 		...overrides,
-	};
+	} as ToolSession;
+
+	session.backend = overrides.backend ?? new LocalBackend({ cwd: session.cwd });
+	return session;
 }
 
 describe("ast_grep parse errors", () => {

@@ -9,6 +9,7 @@ import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { TSchema } from "@sinclair/typebox";
 import Ajv, { type ValidateFunction } from "ajv";
+import type { BackendSelectOptions } from "../backend/select";
 import { ModelRegistry } from "../config/model-registry";
 import { resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -28,7 +29,7 @@ import { createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
-import { SessionManager } from "../session/session-manager";
+import { SessionManager, type SessionPathContext } from "../session/session-manager";
 import { type ContextFileEntry, truncateTail } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -171,6 +172,10 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/** Parent connected-session identity; omitted for local sessions to preserve local worktree cwd behavior. */
+	sessionPathContext?: SessionPathContext;
+	/** Serializable remote descriptor. Children rebuild their own RemoteBackend so disposal cannot close the parent's RWP session. */
+	remoteBackend?: BackendSelectOptions["remote"];
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -981,8 +986,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: (thinkingLevel ?? resolvedThinkingLevel);
 
 			const sessionManager = sessionFile
-				? await SessionManager.open(sessionFile)
-				: SessionManager.inMemory(worktree ?? cwd);
+				? await SessionManager.open(sessionFile, undefined, undefined, options.sessionPathContext)
+				: options.sessionPathContext
+					? SessionManager.inMemoryForSessionPath(options.sessionPathContext)
+					: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			}
@@ -994,6 +1001,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const { session } = await createAgentSession({
 				cwd: worktree ?? cwd,
+				sessionPathContext: options.sessionPathContext,
+				remoteBackend: options.remoteBackend,
 				authStorage,
 				modelRegistry,
 				settings: subagentSettings,

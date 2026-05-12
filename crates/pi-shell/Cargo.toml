@@ -23,7 +23,6 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 toml = "1.1"
 regex = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

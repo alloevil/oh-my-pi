@@ -26,6 +26,32 @@ type RecipeRenderResult = {
 	isError?: boolean;
 };
 
+interface BashCommandRunRequest {
+	command: string;
+	cwd?: string;
+}
+
+interface BashCommandRunner {
+	execute(
+		toolCallId: string,
+		request: BashCommandRunRequest,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
+		ctx?: AgentToolContext,
+	): Promise<AgentToolResult<BashToolDetails>>;
+}
+
+function createBashCommandRunner(session: ToolSession): BashCommandRunner {
+	const bash = new BashTool(session);
+	return {
+		execute(toolCallId, request, signal, onUpdate, ctx) {
+			return bash.execute(toolCallId, request, signal, onUpdate, ctx);
+		},
+	};
+}
+
+// Render types still mirror bash until render.ts can move to the same narrower contract.
+
 export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetails, Theme> {
 	readonly name = "recipe";
 	readonly label = "Run";
@@ -45,12 +71,15 @@ export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetail
 		args?: RecipeRenderArgs,
 	) => Component;
 
-	readonly #bash: BashTool;
 	readonly #runners: DetectedRunner[];
+	readonly #commandRunner: BashCommandRunner;
 
-	constructor(session: ToolSession, runners: DetectedRunner[]) {
+	constructor(
+		readonly session: ToolSession,
+		runners: DetectedRunner[],
+	) {
 		this.#runners = runners;
-		this.#bash = new BashTool(session);
+		this.#commandRunner = createBashCommandRunner(session);
 		this.description = prompt.render(recipeDescription, buildPromptModel(runners));
 		const renderer = createRecipeToolRenderer(runners);
 		this.renderCall = renderer.renderCall;
@@ -59,7 +88,8 @@ export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetail
 
 	static async createIf(session: ToolSession): Promise<RecipeTool | null> {
 		if (!session.settings.get("recipe.enabled")) return null;
-		const detected = (await Promise.all(RUNNERS.map(runner => runner.detect(session.cwd)))).filter(
+		const backend = session.backend;
+		const detected = (await Promise.all(RUNNERS.map(runner => runner.detect(session.cwd, backend)))).filter(
 			(runner): runner is DetectedRunner => runner !== null && runner.tasks.length > 0,
 		);
 		if (detected.length === 0) return null;
@@ -73,8 +103,17 @@ export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetail
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
-		const { command, cwd } = resolveCommand(op, this.#runners);
-		return await this.#bash.execute(toolCallId, { command, cwd }, signal, onUpdate, ctx);
+		const task = resolveCommand(op, this.#runners);
+		return await this.#commandRunner.execute(
+			toolCallId,
+			{
+				command: task.command,
+				cwd: task.cwd,
+			},
+			signal,
+			onUpdate,
+			ctx,
+		);
 	}
 }
 

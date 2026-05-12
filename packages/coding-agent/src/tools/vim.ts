@@ -4,6 +4,7 @@ import { extractSegments, sliceWithWidth, Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
 import * as Diff from "diff";
+import type { Backend } from "../backend";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
@@ -88,6 +89,13 @@ function fingerprintEqual(left: VimFingerprint | null, right: VimFingerprint | n
 		left.mtimeMs === right.mtimeMs &&
 		left.hash === right.hash
 	);
+}
+
+function isMissingFileError(error: unknown): boolean {
+	if (isEnoent(error)) return true;
+	if (!error || typeof error !== "object") return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "ENOENT" || code === "ENOTDIR" || code === "not-found";
 }
 
 function renderText(text: string): Component {
@@ -378,38 +386,43 @@ async function executeVimSteps(
 	}
 }
 
-async function statFingerprint(absolutePath: string): Promise<VimFingerprint | null> {
+async function statFingerprint(backend: Backend, absolutePath: string): Promise<VimFingerprint | null> {
 	try {
-		const file = Bun.file(absolutePath);
-		const stat = await file.stat();
-		if (!stat.isFile()) {
+		const stat = await backend.fs.stat(absolutePath);
+		if (!stat.exists) return null;
+		if (stat.kind !== "file") {
 			throw new ToolError(`Not a regular file: ${absolutePath}`);
 		}
-		const bytes = await file.bytes();
+		const { bytes, etag } = await backend.fs.readBlob(absolutePath);
 		return {
 			exists: true,
 			size: stat.size,
 			mtimeMs: stat.mtimeMs,
-			hash: String(Bun.hash(bytes)),
+			hash: etag ?? String(Bun.hash(bytes)),
 		};
 	} catch (error) {
-		if (isEnoent(error)) {
-			return null;
-		}
+		if (isMissingFileError(error)) return null;
 		throw error;
 	}
 }
 
 async function readTextFile(
+	backend: Backend,
 	absolutePath: string,
 ): Promise<{ lines: string[]; trailingNewline: boolean; fingerprint: VimFingerprint | null }> {
 	try {
-		const file = Bun.file(absolutePath);
-		const stat = await file.stat();
-		if (!stat.isFile()) {
+		const stat = await backend.fs.stat(absolutePath);
+		if (!stat.exists) {
+			return {
+				lines: [""],
+				trailingNewline: false,
+				fingerprint: null,
+			};
+		}
+		if (stat.kind !== "file") {
 			throw new ToolError(`Not a regular file: ${absolutePath}`);
 		}
-		const bytes = await file.bytes();
+		const { bytes, etag } = await backend.fs.readBlob(absolutePath);
 		for (const byte of bytes) {
 			if (byte === 0) {
 				throw new ToolError("Edit tool in vim mode only supports UTF-8 text files in v1");
@@ -425,11 +438,11 @@ async function readTextFile(
 				exists: true,
 				size: stat.size,
 				mtimeMs: stat.mtimeMs,
-				hash: String(Bun.hash(bytes)),
+				hash: etag ?? String(Bun.hash(bytes)),
 			},
 		};
 	} catch (error) {
-		if (isEnoent(error)) {
+		if (isMissingFileError(error)) {
 			return {
 				lines: [""],
 				trailingNewline: false,
@@ -478,17 +491,18 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
+			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }, session.backend)
 			: writethroughNoop;
 		this.description = prompt.render(vimDescription);
 	}
 
 	async #loadBuffer(targetPath: string): Promise<VimLoadedFile> {
 		const { absolutePath, displayPath } = normalizeTargetPath(targetPath, this.session.cwd);
-		if (await isSqliteFile(absolutePath)) {
+		const backend = this.session.backend;
+		if (await isSqliteFile(absolutePath, backend)) {
 			throw new ToolError("Edit tool in vim mode does not support SQLite targets in v1");
 		}
-		const loaded = await readTextFile(absolutePath);
+		const loaded = await readTextFile(backend, absolutePath);
 		return {
 			absolutePath,
 			displayPath,
@@ -501,7 +515,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 	async #beforeMutate(buffer: VimBuffer): Promise<void> {
 		enforcePlanModeWrite(this.session, buffer.displayPath, { op: buffer.baseFingerprint ? "update" : "create" });
 		if (!buffer.editabilityChecked && buffer.baseFingerprint) {
-			await assertEditableFile(buffer.filePath, buffer.displayPath);
+			await assertEditableFile(this.session.backend, buffer.filePath, buffer.displayPath);
 			buffer.editabilityChecked = true;
 		}
 	}
@@ -509,10 +523,10 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 	async #saveBuffer(buffer: VimBuffer, options?: { force?: boolean }): Promise<VimSaveResult> {
 		enforcePlanModeWrite(this.session, buffer.displayPath, { op: buffer.baseFingerprint ? "update" : "create" });
 		if (buffer.baseFingerprint) {
-			await assertEditableFile(buffer.filePath, buffer.displayPath);
+			await assertEditableFile(this.session.backend, buffer.filePath, buffer.displayPath);
 		}
 		if (!options?.force) {
-			const diskFingerprint = await statFingerprint(buffer.filePath);
+			const diskFingerprint = await statFingerprint(this.session.backend, buffer.filePath);
 			if (!fingerprintEqual(buffer.baseFingerprint, diskFingerprint)) {
 				throw new ToolError("File changed on disk since open; reload with :e! before saving.");
 			}
@@ -588,7 +602,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 				isNewBuffer = true;
 			} else if (!engine.buffer.modified) {
 				// Sync fingerprint from disk to handle LSP writethrough reformats
-				const fp = await statFingerprint(absolutePath);
+				const fp = await statFingerprint(this.session.backend, absolutePath);
 				if (fp) engine.buffer.baseFingerprint = fp;
 			}
 

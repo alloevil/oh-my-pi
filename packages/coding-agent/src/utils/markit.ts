@@ -54,6 +54,10 @@ function finalizeConversion(markdown?: string): MarkitConversionResult {
 	return { content: "", ok: false, error: "Conversion produced no output" };
 }
 
+function bufferView(bytes: Uint8Array): Buffer {
+	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
 export async function convertFileWithMarkit(filePath: string, signal?: AbortSignal): Promise<MarkitConversionResult> {
 	try {
 		const result = await runMarkitConversion(markit => markit.convertFile(filePath), signal);
@@ -78,7 +82,7 @@ export async function convertBufferWithMarkit(
 	};
 
 	try {
-		const result = await runMarkitConversion(markit => markit.convert(Buffer.from(buffer), streamInfo), signal);
+		const result = await runMarkitConversion(markit => markit.convert(bufferView(buffer), streamInfo), signal);
 		return finalizeConversion(result.markdown);
 	} catch (error) {
 		if (error instanceof ToolAbortError) {

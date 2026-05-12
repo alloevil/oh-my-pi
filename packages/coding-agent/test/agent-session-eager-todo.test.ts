@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, getBundledModel, type TextContent, type ToolCall } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { LocalBackend } from "@oh-my-pi/pi-coding-agent/backend";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -114,6 +115,7 @@ describe("AgentSession eager todo enforcement", () => {
 		const toolSession: ToolSession = {
 			cwd: tempDir.path(),
 			hasUI: false,
+			backend: new LocalBackend({ cwd: tempDir.path() }),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getSessionSpawns: () => "*",
 			settings,

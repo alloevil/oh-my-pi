@@ -1,12 +1,11 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import * as natives from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Static } from "@sinclair/typebox";
 import { Type } from "@sinclair/typebox";
+import type { Backend, StatResult } from "../backend";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import findDescription from "../prompts/tools/find.md" with { type: "text" };
@@ -27,7 +26,6 @@ import {
 	formatPathRelativeToCwd,
 	normalizePathLikeInput,
 	parseFindPattern,
-	partitionExistingPaths,
 	resolveExplicitFindPatterns,
 	resolveToCwd,
 } from "./path-utils";
@@ -50,6 +48,8 @@ export type FindToolInput = Static<typeof findSchema>;
 const DEFAULT_LIMIT = 1000;
 const GLOB_TIMEOUT_MS = 5000;
 
+const ROOT_SCOPE_UPDATE_INTERVAL = 100;
+type StatWithLinkKind = StatResult & { linkKind?: "symlink" };
 export interface FindToolDetails {
 	truncation?: TruncationResult;
 	resultLimitReached?: number;
@@ -60,7 +60,7 @@ export interface FindToolDetails {
 	files?: string[];
 	truncated?: boolean;
 	error?: string;
-	/** User-supplied paths whose base directory was missing on disk. The tool
+	/** User-supplied paths whose base directory was missing on the active backend. The tool
 	 * skipped these and continued with the surviving entries; surfaced as a
 	 * non-fatal warning in the renderer and in the model-facing text. */
 	missingPaths?: string[];
@@ -70,20 +70,78 @@ export interface FindToolDetails {
  * Pluggable operations for the find tool.
  * Override these to delegate file search to remote systems (e.g., SSH).
  */
+export interface FindOperationCallOptions {
+	hidden: boolean;
+	gitignore: boolean;
+	ignore: string[];
+	limit: number;
+	signal: AbortSignal;
+}
+
 export interface FindOperations {
 	/** Check if path exists */
-	exists: (absolutePath: string) => Promise<boolean> | boolean;
+	exists: (absolutePath: string, options: { signal: AbortSignal }) => Promise<boolean> | boolean;
 	/** Optional stat for distinguishing files vs directories. */
 	stat?: (
 		absolutePath: string,
+		options: { signal: AbortSignal },
 	) => Promise<{ isFile(): boolean; isDirectory(): boolean }> | { isFile(): boolean; isDirectory(): boolean };
-	/** Find files matching glob pattern. Returns relative paths. */
-	glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) => Promise<string[]> | string[];
+	/** Find files matching glob pattern. Returns relative paths or absolute paths within cwd scope. */
+	glob: (pattern: string, cwd: string, options: FindOperationCallOptions) => Promise<string[]> | string[];
 }
 
 export interface FindToolOptions {
 	/** Custom operations for find. Default: local filesystem + rg */
 	operations?: FindOperations;
+}
+
+interface FindInputProbe {
+	raw: string;
+	absoluteBasePath: string;
+	glob?: Bun.Glob;
+	matched: boolean;
+}
+
+function normalizeProbePath(filePath: string): string {
+	return filePath.replace(/\\/g, "/");
+}
+
+function relativePathWithin(basePath: string, filePath: string): string | undefined {
+	const relative = path.relative(basePath, filePath);
+	if (relative === "") return ".";
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		return undefined;
+	}
+	return normalizeProbePath(relative);
+}
+
+function createFindInputProbe(rawPattern: string, cwd: string): FindInputProbe {
+	const parsedPattern = parseFindPattern(rawPattern);
+	return {
+		raw: rawPattern,
+		absoluteBasePath: resolveToCwd(parsedPattern.basePath, cwd),
+		glob: parsedPattern.hasGlob ? new Bun.Glob(normalizeProbePath(parsedPattern.globPattern)) : undefined,
+		matched: false,
+	};
+}
+
+function markFindProbeMatches(probes: FindInputProbe[], entries: Array<{ path: string }>, cwd: string): void {
+	if (probes.length === 0 || entries.length === 0) return;
+	for (const entry of entries) {
+		const absoluteEntryPath = path.isAbsolute(entry.path) ? entry.path : path.resolve(cwd, entry.path);
+		for (const probe of probes) {
+			if (probe.matched) continue;
+			const relative = relativePathWithin(probe.absoluteBasePath, absoluteEntryPath);
+			if (relative === undefined) continue;
+			if (!probe.glob || probe.glob.match(relative === "." ? path.basename(absoluteEntryPath) : relative)) {
+				probe.matched = true;
+			}
+		}
+	}
+}
+
+function isPathNotFoundError(error: unknown): boolean {
+	return isEnoent(error) || (error instanceof Error && /(?:Path not found|ENOENT|not found)/i.test(error.message));
 }
 
 export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
@@ -120,24 +178,24 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			if (normalizedPatterns.some(pattern => pattern.length === 0)) {
 				throw new ToolError("`paths` must contain non-empty globs or paths");
 			}
+			const backend: Backend = this.session.backend;
+			const getBackend = (): Backend => backend;
 
-			// Tolerate missing entries in a multi-path call: skip ones whose base
-			// directory is gone, and only error if every entry is missing. Single
-			// missing path keeps the original ENOENT semantics — the user explicitly
-			// asked about that one path, so silent empty results would be misleading.
+			// Tolerate missing entries in a multi-path call after the backend glob
+			// primitive has resolved the inputs. Single missing paths keep the original
+			// ENOENT semantics — the user explicitly asked about that one path, so
+			// silent empty results would be misleading.
+			const isMultiPatternInput = normalizedPatterns.length > 1 && !this.#customOps;
 			let missingPaths: string[] = [];
-			let effectivePatterns = normalizedPatterns;
-			if (normalizedPatterns.length > 1 && !this.#customOps) {
-				const partition = await partitionExistingPaths(normalizedPatterns, this.session.cwd, parseFindPattern);
-				if (partition.valid.length === 0) {
-					throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
-				}
-				effectivePatterns = partition.valid;
-				missingPaths = partition.missing;
-			}
+			const findInputProbes = isMultiPatternInput
+				? normalizedPatterns.map(pattern => createFindInputProbe(pattern, this.session.cwd))
+				: [];
 
-			const multiPattern = await resolveExplicitFindPatterns(effectivePatterns, this.session.cwd);
-			const parsedPattern = multiPattern ? null : parseFindPattern(effectivePatterns[0] ?? ".");
+			const multiPattern =
+				normalizedPatterns.length > 1
+					? await resolveExplicitFindPatterns(normalizedPatterns, this.session.cwd)
+					: undefined;
+			const parsedPattern = multiPattern ? null : parseFindPattern(normalizedPatterns[0] ?? ".");
 			const hasGlob = multiPattern ? true : (parsedPattern?.hasGlob ?? false);
 			const globPattern = multiPattern?.globPattern ?? parsedPattern?.globPattern ?? "**/*";
 			const searchPath = resolveToCwd(multiPattern?.basePath ?? parsedPattern?.basePath ?? ".", this.session.cwd);
@@ -154,24 +212,120 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			const includeHidden = hidden ?? true;
 			const timeoutSignal = AbortSignal.timeout(GLOB_TIMEOUT_MS);
 			const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-			const formatMatchPath = (matchPath: string, fileType?: natives.FileType): string => {
+			const timeoutSeconds = Math.max(1, Math.round(GLOB_TIMEOUT_MS / 1000));
+			const runDelegatedOp = async <T>(operation: (delegateSignal: AbortSignal) => Promise<T>): Promise<T> => {
+				throwIfAborted(signal);
+				const controller = new AbortController();
+				return await new Promise<T>((resolve, reject) => {
+					let settled = false;
+					const finish = (callback: () => void): void => {
+						if (settled) {
+							return;
+						}
+						settled = true;
+						cleanup();
+						callback();
+					};
+					const onAbort = (): void => {
+						controller.abort(signal?.reason);
+						finish(() => reject(new ToolAbortError()));
+					};
+					const timeoutId = setTimeout(() => {
+						controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
+						finish(() => reject(new ToolError(`find timed out after ${timeoutSeconds}s`)));
+					}, GLOB_TIMEOUT_MS);
+					const cleanup = (): void => {
+						clearTimeout(timeoutId);
+						signal?.removeEventListener("abort", onAbort);
+					};
+
+					signal?.addEventListener("abort", onAbort, { once: true });
+					void Promise.resolve()
+						.then(() => operation(controller.signal))
+						.then(
+							value => finish(() => resolve(value)),
+							error => finish(() => reject(error)),
+						);
+				});
+			};
+			const formatMatchPath = (
+				matchPath: string,
+				fileType?: "file" | "dir" | "symlink" | "other",
+				basePath = searchPath,
+			): string => {
 				const hadTrailingSlash = matchPath.endsWith("/") || matchPath.endsWith("\\");
-				const absolutePath = path.isAbsolute(matchPath) ? matchPath : path.resolve(searchPath, matchPath);
+				const absolutePath = path.isAbsolute(matchPath) ? matchPath : path.resolve(basePath, matchPath);
 				return formatPathRelativeToCwd(absolutePath, this.session.cwd, {
-					trailingSlash: fileType === natives.FileType.Dir || hadTrailingSlash,
+					trailingSlash: fileType === "dir" || hadTrailingSlash,
+				});
+			};
+			const rootRelativeSearchPath = path.relative(this.session.cwd, searchPath).replaceAll("\\", "/") || ".";
+			const normalizedRequestedRoot = path.normalize(rootRelativeSearchPath);
+			const normalizeScopedEntryPath = (entryPath: string): string | null => {
+				if (path.isAbsolute(entryPath)) {
+					return null;
+				}
+
+				const normalizedEntryPath = path.normalize(entryPath);
+				if (normalizedEntryPath === ".." || normalizedEntryPath.startsWith(`..${path.sep}`)) {
+					return null;
+				}
+
+				return normalizedEntryPath === "" ? "." : normalizedEntryPath;
+			};
+			const isWithinRequestedRoot = (entryPath: string): boolean => {
+				const normalizedEntryPath = normalizeScopedEntryPath(entryPath);
+				if (!normalizedEntryPath) {
+					return false;
+				}
+
+				if (normalizedRequestedRoot === ".") {
+					return true;
+				}
+
+				return (
+					normalizedEntryPath === normalizedRequestedRoot ||
+					normalizedEntryPath.startsWith(`${normalizedRequestedRoot}${path.sep}`)
+				);
+			};
+
+			let lastPartialResultCount = 0;
+			const emitPartialResults = (files: string[], force = false): void => {
+				if (!onUpdate || files.length === 0) {
+					return;
+				}
+
+				const shouldEmit = force
+					? files.length !== lastPartialResultCount
+					: files.length - lastPartialResultCount >= ROOT_SCOPE_UPDATE_INTERVAL;
+				if (!shouldEmit) {
+					return;
+				}
+
+				lastPartialResultCount = files.length;
+				onUpdate({
+					content: [{ type: "text", text: files.join("\n") }],
+					details: {
+						scopePath,
+						fileCount: files.length,
+						files: [...files],
+						truncated: false,
+						missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
+					},
 				});
 			};
 
-			const missingPathsNote =
+			const getMissingPathsNote = (): string | undefined =>
 				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
 
-			const buildResult = (files: string[]): AgentToolResult<FindToolDetails> => {
+			const buildResult = (files: string[], sourceTruncated = false): AgentToolResult<FindToolDetails> => {
+				const missingPathsNote = getMissingPathsNote();
 				if (files.length === 0) {
 					const details: FindToolDetails = {
 						scopePath,
 						fileCount: 0,
 						files: [],
-						truncated: false,
+						truncated: sourceTruncated,
 						missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 					};
 					const text = missingPathsNote
@@ -191,7 +345,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 					scopePath,
 					fileCount: limited.length,
 					files: limited,
-					truncated: Boolean(limitMeta.resultLimit || truncation.truncated),
+					truncated: Boolean(sourceTruncated || limitMeta.resultLimit || truncation.truncated),
 					resultLimitReached: limitMeta.resultLimit?.reached,
 					truncation: truncation.truncated ? truncation : undefined,
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
@@ -207,96 +361,121 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				return resultBuilder.done();
 			};
 
-			if (this.#customOps?.glob) {
-				if (!(await this.#customOps.exists(searchPath))) {
+			const customOps = this.#customOps;
+			if (customOps?.glob) {
+				if (
+					!(await runDelegatedOp(delegateSignal =>
+						Promise.resolve(customOps.exists(searchPath, { signal: delegateSignal })),
+					))
+				) {
 					throw new ToolError(`Path not found: ${scopePath}`);
 				}
 
-				if (!hasGlob && this.#customOps.stat) {
-					const stat = await this.#customOps.stat(searchPath);
-					if (stat.isFile()) {
+				if (!hasGlob && customOps.stat) {
+					const stat = await runDelegatedOp(delegateSignal =>
+						Promise.resolve(customOps.stat?.(searchPath, { signal: delegateSignal })),
+					);
+					if (stat?.isFile()) {
 						return buildResult([scopePath]);
 					}
 				}
 
-				const results = await this.#customOps.glob(globPattern, searchPath, {
-					ignore: ["**/node_modules/**", "**/.git/**"],
-					limit: effectiveLimit,
-				});
-				const relativized = results.map(p => formatMatchPath(p));
+				const results = await runDelegatedOp(delegateSignal =>
+					Promise.resolve(
+						customOps.glob(globPattern, searchPath, {
+							hidden: includeHidden,
+							gitignore: true,
+							ignore: ["**/node_modules/**", "**/.git/**"],
+							limit: effectiveLimit,
+							signal: delegateSignal,
+						}),
+					),
+				);
+				const relativized = results
+					.map(matchPath => {
+						const absolutePath = path.isAbsolute(matchPath) ? matchPath : path.resolve(searchPath, matchPath);
+						return path.relative(this.session.cwd, absolutePath);
+					})
+					.filter(relativePath => isWithinRequestedRoot(relativePath))
+					.map(relativePath => formatMatchPath(relativePath, undefined, this.session.cwd));
 
 				return buildResult(relativized);
 			}
 
-			let searchStat: fs.Stats;
-			try {
-				searchStat = await fs.promises.stat(searchPath);
-			} catch (err) {
-				if (isEnoent(err)) {
+			const activeBackend = getBackend();
+			const statWithFollow = async (targetPath: string, followSymlinks = false): Promise<StatWithLinkKind> => {
+				return activeBackend.fs.stat(targetPath, { signal, followSymlinks }) as Promise<StatWithLinkKind>;
+			};
+			const statCache = new Map<string, StatWithLinkKind | null>();
+			const statInputBase = async (targetPath: string): Promise<StatWithLinkKind | null> => {
+				const cacheKey = path.resolve(targetPath);
+				if (statCache.has(cacheKey)) return statCache.get(cacheKey) ?? null;
+				try {
+					const stat = await statWithFollow(targetPath, true);
+					const cached = stat.exists ? stat : null;
+					statCache.set(cacheKey, cached);
+					return cached;
+				} catch (err) {
+					if (isEnoent(err)) {
+						statCache.set(cacheKey, null);
+						return null;
+					}
+					throw err;
+				}
+			};
+			const collectMissingFindPaths = async (): Promise<string[]> => {
+				const missing: string[] = [];
+				for (const probe of findInputProbes) {
+					if (probe.matched) continue;
+					const stat = await statInputBase(probe.absoluteBasePath);
+					if (!stat) missing.push(probe.raw);
+				}
+				return missing;
+			};
+
+			if (!multiPattern) {
+				const searchStat = await statInputBase(searchPath);
+				if (!searchStat) {
 					throw new ToolError(`Path not found: ${scopePath}`);
 				}
-				throw err;
+
+				if (!hasGlob && searchStat.kind === "file") {
+					return buildResult([scopePath]);
+				}
+				if (searchStat.kind !== "dir") {
+					throw new ToolError(`Path is not a directory: ${scopePath}`);
+				}
 			}
 
-			if (!hasGlob && searchStat.isFile()) {
-				return buildResult([scopePath]);
-			}
-			if (!searchStat.isDirectory()) {
-				throw new ToolError(`Path is not a directory: ${searchPath}`);
-			}
-
-			let matches: natives.GlobMatch[];
-			const onUpdateMatches: string[] = [];
-			const updateIntervalMs = 200;
-			let lastUpdate = 0;
-			const emitUpdate = () => {
-				if (!onUpdate) return;
-				const now = Date.now();
-				if (now - lastUpdate < updateIntervalMs) return;
-				lastUpdate = now;
-				const details: FindToolDetails = {
-					scopePath,
-					fileCount: onUpdateMatches.length,
-					files: onUpdateMatches.slice(),
-					truncated: false,
-				};
-				onUpdate({
-					content: [{ type: "text", text: onUpdateMatches.join("\n") }],
-					details,
-				});
-			};
-			const onMatch = onUpdate
-				? (err: Error | null, match: natives.GlobMatch | null) => {
-						if (err || signal?.aborted || !match?.path) return;
-						const relativePath = formatMatchPath(match.path, match.fileType);
-						onUpdateMatches.push(relativePath);
-						emitUpdate();
-					}
-				: undefined;
-
-			const doGlob = async (useGitignore: boolean) =>
-				untilAborted(combinedSignal, () =>
-					natives.glob(
-						{
-							pattern: globPattern,
-							path: searchPath,
-							fileType: natives.FileType.File,
-							hidden: includeHidden,
-							maxResults: effectiveLimit,
-							sortByMtime: true,
-							gitignore: useGitignore,
-							signal: combinedSignal,
-						},
-						onMatch,
-					),
-				);
-
+			let entries: Array<{ path: string; type: "file" | "dir" | "symlink" | "other" }>;
+			let sourceTruncated = false;
 			try {
-				const result = await doGlob(true);
-				// Sort by mtime descending (most recent first) in JS instead of native.
-				// This allows native glob to early-terminate at maxResults.
-				result.matches.sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
-				matches = result.matches;
+				// backend.fs.glob currently resolves a full GlobResult rather than
+				// streaming matches incrementally, so partial updates are emitted while
+				// formatting the completed entry list below.
+				const result = await untilAborted(combinedSignal, () =>
+					backend.fs.glob({
+						patterns: [globPattern],
+						paths: [rootRelativeSearchPath],
+						includeHidden,
+						types: ["file"],
+						limit: effectiveLimit,
+						signal: combinedSignal,
+					}),
+				);
+				const leakedEntries = result.entries.filter(entry => !isWithinRequestedRoot(entry.path));
+				entries =
+					leakedEntries.length === 0
+						? result.entries
+						: result.entries.filter(entry => isWithinRequestedRoot(entry.path));
+				markFindProbeMatches(findInputProbes, entries, this.session.cwd);
+				if (multiPattern) {
+					missingPaths = await collectMissingFindPaths();
+					if (missingPaths.length === findInputProbes.length) {
+						throw new ToolError(`Path not found: ${missingPaths.join(", ")}`);
+					}
+				}
+				sourceTruncated = result.truncated || leakedEntries.length > 0;
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") {
 					if (timeoutSignal.aborted && !signal?.aborted) {
@@ -305,20 +484,26 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 					}
 					throw new ToolAbortError();
 				}
-				throw error;
+				if (multiPattern && isPathNotFoundError(error)) {
+					entries = [];
+					missingPaths = await collectMissingFindPaths();
+					if (missingPaths.length === findInputProbes.length) {
+						throw new ToolError(`Path not found: ${missingPaths.join(", ")}`);
+					}
+				} else {
+					throw error;
+				}
 			}
 
 			const relativized: string[] = [];
-			for (const match of matches) {
+			for (const entry of entries) {
 				throwIfAborted(signal);
-				if (!match.path) {
-					continue;
-				}
-
-				relativized.push(formatMatchPath(match.path, match.fileType));
+				relativized.push(formatMatchPath(entry.path, entry.type, this.session.cwd));
+				emitPartialResults(relativized);
 			}
+			emitPartialResults(relativized, true);
 
-			return buildResult(relativized);
+			return buildResult(relativized, sourceTruncated);
 		});
 	}
 }

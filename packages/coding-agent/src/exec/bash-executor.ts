@@ -170,7 +170,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 					},
 					(err, chunk) => {
 						if (!err) {
-							enqueueChunk(chunk);
+							enqueueChunk(chunk.text);
 						}
 					},
 				)
@@ -187,11 +187,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 					},
 					(err, chunk) => {
 						if (!err) {
-							enqueueChunk(chunk);
+							enqueueChunk(chunk.text);
 						}
 					},
 				);
-
 		const winner = await Promise.race([
 			runPromise.then(result => ({ kind: "result" as const, result })),
 			hardTimeoutDeferred.promise.then(() => ({ kind: "hard-timeout" as const })),

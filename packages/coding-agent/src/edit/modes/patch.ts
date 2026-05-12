@@ -5,28 +5,13 @@
  * for robust handling of whitespace and formatting differences.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { StringEnum } from "@oh-my-pi/pi-ai";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
-import {
-	type FileDiagnosticsResult,
-	flushLspWritethroughBatch,
-	type WritethroughCallback,
-	type WritethroughDeferredHandle,
-} from "../../lsp";
-import type { ToolSession } from "../../tools";
-import { assertEditableFile } from "../../tools/auto-generated-guard";
-import {
-	invalidateFsScanAfterDelete,
-	invalidateFsScanAfterRename,
-	invalidateFsScanAfterWrite,
-} from "../../tools/fs-cache-invalidation";
-import { outputMeta } from "../../tools/output-meta";
+import { type Backend, LocalBackend } from "../../backend";
+import type { FileDiagnosticsResult } from "../../lsp";
 import { resolveToCwd } from "../../tools/path-utils";
-import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import {
 	ApplyPatchError,
 	type DiffHunk,
@@ -44,8 +29,7 @@ import {
 	restoreLineEndings,
 	stripBom,
 } from "../normalize";
-import { readEditFileText, serializeEditFileText } from "../read-file";
-import type { EditToolDetails, LspBatchRequest } from "../renderer";
+import { serializeEditFileText } from "../read-file";
 import {
 	type ContextLineResult,
 	DEFAULT_FUZZY_THRESHOLD,
@@ -67,11 +51,12 @@ export interface PatchInput {
 
 export interface FileSystem {
 	exists(path: string): Promise<boolean>;
-	read(path: string): Promise<string>;
+	readText(path: string): Promise<string>;
 	readBinary?: (path: string) => Promise<Uint8Array>;
-	write(path: string, content: string): Promise<void>;
+	writeText(path: string, text: string): Promise<void>;
 	delete(path: string): Promise<void>;
-	mkdir(path: string): Promise<void>;
+	mkdir(path: string, opts?: { recursive?: boolean }): Promise<void>;
+	rename?: (path: string, nextPath: string, opts?: { overwrite?: boolean }) => Promise<void>;
 }
 
 interface FileChange {
@@ -99,27 +84,36 @@ export interface ApplyPatchOptions {
 // Default File System
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Default filesystem implementation using Bun APIs */
-export const defaultFileSystem: FileSystem = {
-	async exists(path: string): Promise<boolean> {
-		return Bun.file(path).exists();
-	},
-	async read(path: string): Promise<string> {
-		return readEditFileText(path, path);
-	},
-	async readBinary(path: string): Promise<Uint8Array> {
-		return fs.promises.readFile(path);
-	},
-	async write(path: string, content: string): Promise<void> {
-		await Bun.write(path, await serializeEditFileText(path, path, content));
-	},
-	async delete(path: string): Promise<void> {
-		await fs.promises.unlink(path);
-	},
-	async mkdir(path: string): Promise<void> {
-		await fs.promises.mkdir(path, { recursive: true });
-	},
-};
+/** Backend-backed filesystem adapter for patch application. */
+export function backendPatchFs(backend: Backend, opts?: { cwd?: string; signal?: AbortSignal }): FileSystem {
+	const resolvePath = (filePath: string): string => (opts?.cwd ? resolveToCwd(filePath, opts.cwd) : filePath);
+	return {
+		async exists(filePath: string): Promise<boolean> {
+			return backend.fs.exists(resolvePath(filePath), { signal: opts?.signal });
+		},
+		async readText(filePath: string): Promise<string> {
+			const bytes = (await backend.fs.readBlob(resolvePath(filePath))).bytes;
+			return new TextDecoder().decode(bytes);
+		},
+		async readBinary(filePath: string): Promise<Uint8Array> {
+			return (await backend.fs.readBlob(resolvePath(filePath))).bytes;
+		},
+		async writeText(filePath: string, text: string): Promise<void> {
+			const resolvedPath = resolvePath(filePath);
+			const serialized = await serializeEditFileText(resolvedPath, filePath, text);
+			await backend.fs.writeBlob(resolvedPath, new TextEncoder().encode(serialized), { signal: opts?.signal });
+		},
+		async delete(filePath: string): Promise<void> {
+			await backend.fs.delete(resolvePath(filePath), { signal: opts?.signal });
+		},
+		async mkdir(filePath: string, mkdirOpts?: { recursive?: boolean }): Promise<void> {
+			await backend.fs.mkdir(resolvePath(filePath), { ...mkdirOpts, signal: opts?.signal });
+		},
+		async rename(filePath: string, nextPath: string, renameOpts?: { overwrite?: boolean }): Promise<void> {
+			await backend.fs.rename(resolvePath(filePath), resolvePath(nextPath), { ...renameOpts, signal: opts?.signal });
+		},
+	};
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Internal Types
@@ -998,12 +992,25 @@ function applyTrailingNewlinePolicy(content: string, hadFinalNewline: boolean): 
 
 async function readExistingPatchFile(fileSystem: FileSystem, absolutePath: string, path: string): Promise<string> {
 	try {
-		return await fileSystem.read(absolutePath);
+		return await fileSystem.readText(absolutePath);
 	} catch (error) {
 		if (isEnoent(error) || (error instanceof Error && error.message.startsWith("File not found:"))) {
 			throw new ApplyPatchError(`File not found: ${path}`);
 		}
 		throw error;
+	}
+}
+function isPathWithinCwd(filePath: string, cwd: string): boolean {
+	const relative = path.relative(path.resolve(cwd), path.resolve(filePath));
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function assertPreviewPathInCwd(filePath: string, cwd: string, field: "path" | "rename"): void {
+	if (path.isAbsolute(filePath)) {
+		throw new ApplyPatchError(`Patch preview ${field} must be relative to cwd`);
+	}
+	if (!isPathWithinCwd(resolveToCwd(filePath, cwd), cwd)) {
+		throw new ApplyPatchError(`Patch preview ${field} must stay within cwd: ${filePath}`);
 	}
 }
 
@@ -1414,18 +1421,20 @@ export async function applyPatch(input: PatchInput, options: ApplyPatchOptions):
 	return applyNormalizedPatch(input, options);
 }
 
+function isRenameUnsupported(error: unknown): boolean {
+	if (error instanceof TypeError) {
+		return /rename is not a function/.test(error.message);
+	}
+	return error instanceof Error && /^not implemented:/i.test(error.message);
+}
+
 /**
  * Apply a normalized patch operation to the filesystem.
  * @internal
  */
 async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOptions): Promise<ApplyPatchResult> {
-	const {
-		cwd,
-		dryRun = false,
-		fs = defaultFileSystem,
-		fuzzyThreshold = DEFAULT_FUZZY_THRESHOLD,
-		allowFuzzy = true,
-	} = options;
+	const { cwd, dryRun = false, fuzzyThreshold = DEFAULT_FUZZY_THRESHOLD, allowFuzzy = true } = options;
+	const fileSystem = options.fs ?? backendPatchFs(new LocalBackend({ cwd }), { cwd });
 
 	const resolvePath = (p: string): string => resolveToCwd(p, cwd);
 	const absolutePath = resolvePath(input.path);
@@ -1443,6 +1452,9 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		if (!input.diff) {
 			throw new ApplyPatchError("Create operation requires diff (file content)");
 		}
+		if (await fileSystem.exists(absolutePath)) {
+			throw new ApplyPatchError(`File already exists: ${input.path}`);
+		}
 		// Strip + prefixes if present (handles diffs formatted as additions)
 		const normalizedContent = normalizeCreateContent(input.diff);
 		const content = normalizedContent.endsWith("\n") ? normalizedContent : `${normalizedContent}\n`;
@@ -1450,9 +1462,9 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		if (!dryRun) {
 			const parentDir = path.dirname(absolutePath);
 			if (parentDir && parentDir !== ".") {
-				await fs.mkdir(parentDir);
+				await fileSystem.mkdir(parentDir, { recursive: true });
 			}
-			await fs.write(absolutePath, content);
+			await fileSystem.writeText(absolutePath, content);
 		}
 
 		return {
@@ -1466,9 +1478,9 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 
 	// Handle DELETE operation
 	if (op === "delete") {
-		const oldContent = await readExistingPatchFile(fs, absolutePath, input.path);
+		const oldContent = await readExistingPatchFile(fileSystem, absolutePath, input.path);
 		if (!dryRun) {
-			await fs.delete(absolutePath);
+			await fileSystem.delete(absolutePath);
 		}
 
 		return {
@@ -1485,11 +1497,11 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		throw new ApplyPatchError("Update operation requires diff (hunks)");
 	}
 
-	const originalContent = await readExistingPatchFile(fs, absolutePath, input.path);
+	const originalContent = await readExistingPatchFile(fileSystem, absolutePath, input.path);
 	const { bom: bomFromText, text: strippedContent } = stripBom(originalContent);
 	let bom = bomFromText;
-	if (!bom && fs.readBinary) {
-		const bytes = await fs.readBinary(absolutePath);
+	if (!bom && fileSystem.readBinary) {
+		const bytes = await fileSystem.readBinary(absolutePath);
 		if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
 			bom = "\uFEFF";
 		}
@@ -1517,12 +1529,25 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		if (isMove) {
 			const parentDir = path.dirname(destPath);
 			if (parentDir && parentDir !== ".") {
-				await fs.mkdir(parentDir);
+				await fileSystem.mkdir(parentDir, { recursive: true });
 			}
-			await fs.write(destPath, finalContent);
-			await fs.delete(absolutePath);
+			await fileSystem.writeText(absolutePath, finalContent);
+			if (fileSystem.rename) {
+				try {
+					await fileSystem.rename(absolutePath, destPath, { overwrite: true });
+				} catch (error) {
+					if (!isRenameUnsupported(error)) {
+						throw error;
+					}
+					await fileSystem.writeText(destPath, finalContent);
+					await fileSystem.delete(absolutePath);
+				}
+			} else {
+				await fileSystem.writeText(destPath, finalContent);
+				await fileSystem.delete(absolutePath);
+			}
 		} else {
-			await fs.write(absolutePath, finalContent);
+			await fileSystem.writeText(absolutePath, finalContent);
 		}
 	}
 
@@ -1559,6 +1584,10 @@ export async function computePatchDiff(
 	  }
 > {
 	try {
+		assertPreviewPathInCwd(input.path, cwd, "path");
+		if (input.rename) {
+			assertPreviewPathInCwd(input.rename, cwd, "rename");
+		}
 		const result = await previewPatch(input, {
 			cwd,
 			fuzzyThreshold: options?.fuzzyThreshold,
@@ -1601,82 +1630,7 @@ export const patchEditSchema = Type.Object(
 export type PatchEditEntry = Static<typeof patchEditEntrySchema>;
 export type PatchParams = Static<typeof patchEditSchema>;
 
-export interface ExecutePatchSingleOptions {
-	session: ToolSession;
-	path: string;
-	params: PatchEditEntry;
-	signal?: AbortSignal;
-	batchRequest?: LspBatchRequest;
-	allowFuzzy: boolean;
-	fuzzyThreshold: number;
-	writethrough: WritethroughCallback;
-	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
-}
-
-class LspFileSystem implements FileSystem {
-	#lastDiagnostics: FileDiagnosticsResult | undefined;
-	#fileCache: Record<string, Bun.BunFile> = {};
-
-	constructor(
-		private readonly writethrough: WritethroughCallback,
-		private readonly signal?: AbortSignal,
-		private readonly batchRequest?: LspBatchRequest,
-		private readonly deferredForPath?: (path: string) => WritethroughDeferredHandle,
-	) {}
-
-	#getFile(path: string): Bun.BunFile {
-		if (this.#fileCache[path]) {
-			return this.#fileCache[path];
-		}
-		const file = Bun.file(path);
-		this.#fileCache[path] = file;
-		return file;
-	}
-
-	async exists(path: string): Promise<boolean> {
-		return this.#getFile(path).exists();
-	}
-
-	async read(path: string): Promise<string> {
-		return readEditFileText(path, path);
-	}
-
-	async readBinary(path: string): Promise<Uint8Array> {
-		const bytes = await fs.promises.readFile(path);
-		return bytes;
-	}
-
-	async write(path: string, content: string): Promise<void> {
-		const file = this.#getFile(path);
-		const finalContent = await serializeEditFileText(path, path, content);
-		const deferredForPath = this.deferredForPath;
-		const result = await this.writethrough(
-			path,
-			finalContent,
-			this.signal,
-			file,
-			this.batchRequest,
-			deferredForPath ? (dst: string) => deferredForPath(dst) : undefined,
-		);
-		if (result) {
-			this.#lastDiagnostics = result;
-		}
-	}
-
-	async delete(path: string): Promise<void> {
-		await this.#getFile(path).unlink();
-	}
-
-	async mkdir(path: string): Promise<void> {
-		await fs.promises.mkdir(path, { recursive: true });
-	}
-
-	getDiagnostics(): FileDiagnosticsResult | undefined {
-		return this.#lastDiagnostics;
-	}
-}
-
-function mergeDiagnosticsWithWarnings(
+export function mergeDiagnosticsWithWarnings(
 	diagnostics: FileDiagnosticsResult | undefined,
 	warnings: string[],
 ): FileDiagnosticsResult | undefined {
@@ -1694,93 +1648,5 @@ function mergeDiagnosticsWithWarnings(
 		...diagnostics,
 		messages: [...warningMessages, ...diagnostics.messages],
 		summary: `${diagnostics.summary}; Patch warnings: ${warnings.length}`,
-	};
-}
-
-export async function executePatchSingle(
-	options: ExecutePatchSingleOptions,
-): Promise<AgentToolResult<EditToolDetails, typeof patchEditEntrySchema>> {
-	const {
-		session,
-		path,
-		params,
-		signal,
-		batchRequest,
-		allowFuzzy,
-		fuzzyThreshold,
-		writethrough,
-		beginDeferredDiagnosticsForPath,
-	} = options;
-	const { op: rawOp, rename, diff } = params;
-
-	const op: Operation = rawOp === "create" || rawOp === "delete" ? rawOp : "update";
-
-	enforcePlanModeWrite(session, path, { op, move: rename });
-	const resolvedPath = resolvePlanPath(session, path);
-	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
-
-	await assertEditableFile(resolvedPath, path);
-
-	const input: PatchInput = { path: resolvedPath, op, rename: resolvedRename, diff };
-	const patchFileSystem = new LspFileSystem(writethrough, signal, batchRequest, beginDeferredDiagnosticsForPath);
-	const result = await applyPatch(input, {
-		cwd: session.cwd,
-		fs: patchFileSystem,
-		fuzzyThreshold,
-		allowFuzzy,
-	});
-
-	if (resolvedRename) {
-		invalidateFsScanAfterRename(resolvedPath, resolvedRename);
-	} else if (result.change.type === "delete") {
-		invalidateFsScanAfterDelete(resolvedPath);
-	} else {
-		invalidateFsScanAfterWrite(resolvedPath);
-	}
-	const effectiveRename = result.change.newPath ? rename : undefined;
-
-	let diffResult: { diff: string; firstChangedLine: number | undefined } = {
-		diff: "",
-		firstChangedLine: undefined,
-	};
-	if (result.change.type === "update" && result.change.oldContent && result.change.newContent) {
-		const normalizedOld = normalizeToLF(stripBom(result.change.oldContent).text);
-		const normalizedNew = normalizeToLF(stripBom(result.change.newContent).text);
-		diffResult = generateUnifiedDiffString(normalizedOld, normalizedNew);
-	}
-
-	let resultText: string;
-	switch (result.change.type) {
-		case "create":
-			resultText = `Created ${path}`;
-			break;
-		case "delete":
-			resultText = `Deleted ${path}`;
-			break;
-		case "update":
-			resultText = effectiveRename ? `Updated and moved ${path} to ${effectiveRename}` : `Updated ${path}`;
-			break;
-	}
-
-	let diagnostics = patchFileSystem.getDiagnostics();
-	if (op === "delete" && batchRequest?.flush) {
-		const flushedDiagnostics = await flushLspWritethroughBatch(batchRequest.id, session.cwd, signal);
-		diagnostics ??= flushedDiagnostics;
-	}
-	const mergedDiagnostics = mergeDiagnosticsWithWarnings(diagnostics, result.warnings ?? []);
-	const meta = outputMeta()
-		.diagnostics(mergedDiagnostics?.summary ?? "", mergedDiagnostics?.messages ?? [])
-		.get();
-
-	return {
-		content: [{ type: "text", text: resultText }],
-		details: {
-			diff: diffResult.diff,
-			firstChangedLine: diffResult.firstChangedLine,
-			diagnostics: mergedDiagnostics,
-			op,
-			move: effectiveRename,
-			meta,
-		},
 	};
 }

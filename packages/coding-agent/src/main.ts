@@ -51,7 +51,21 @@ import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
-import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
+import {
+	type ConnectedSessionPathContext,
+	createLocalSessionPathContext,
+	getDefaultConnectedSessionCapabilities,
+	resolveResumableSessionForContext,
+	type SessionInfo,
+	SessionManager,
+	type SessionPathContext,
+} from "./session/session-manager";
+import {
+	connectRemote,
+	formatSshDisplayCwd,
+	formatSshSessionIdentity,
+	type RemoteConnectionResult,
+} from "./ssh/connect-remote";
 import { resolvePromptInput } from "./system-prompt";
 import type { LspStartupServerInfo } from "./tools";
 import { getChangelogPath, getNewEntries, parseChangelog } from "./utils/changelog";
@@ -272,66 +286,109 @@ async function getChangelogForDisplay(parsed: Args): Promise<string | undefined>
 async function flushChangelogVersion(): Promise<void> {
 	try {
 		await settings.flush();
-	} catch (error: unknown) {
+	} catch (error) {
 		logger.warn("Failed to persist lastChangelogVersion", { error });
 	}
 }
 
-async function createSessionManager(parsed: Args, cwd: string): Promise<SessionManager | undefined> {
+function buildConnectedSessionPathContext(
+	localWorkspaceCwd: string,
+	remoteConnection: RemoteConnectionResult,
+	remoteExecutionCwd: string = remoteConnection.identity.remoteExecutionCwd ?? ".",
+): ConnectedSessionPathContext {
+	const displayCwd = formatSshDisplayCwd(remoteConnection.host, remoteExecutionCwd);
+	const target = { ...remoteConnection.identity.target };
+	return {
+		kind: "connected",
+		localWorkspaceCwd,
+		executionCwd: remoteExecutionCwd,
+		remoteExecutionCwd,
+		remoteCwd: remoteExecutionCwd,
+		remoteHost: target.host,
+		targetLabel: target.label,
+		displayCwd,
+		displayTarget: remoteConnection.identity.displayTarget,
+		sessionIdentity: formatSshSessionIdentity(remoteConnection.host, remoteExecutionCwd),
+		target,
+		remoteSession: {
+			kind: "rwp",
+			transport: "ssh",
+			baseUrl: remoteConnection.remote.baseUrl,
+			token: remoteConnection.remote.token,
+			cwd: remoteExecutionCwd,
+		},
+		capabilities: getDefaultConnectedSessionCapabilities(),
+	};
+}
+
+async function createSessionManager(
+	parsed: Args,
+	sessionPathContext: SessionPathContext,
+): Promise<SessionManager | undefined> {
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new Error("--fork requires session persistence");
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+			return await SessionManager.forkFromForSessionPath(forkSource, sessionPathContext, parsed.sessionDir);
 		}
-		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
+		const match = await resolveResumableSessionForContext(forkSource, sessionPathContext, parsed.sessionDir);
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+		return await SessionManager.forkFromForSessionPath(match.session.path, sessionPathContext, parsed.sessionDir);
 	}
 
 	if (parsed.noSession) {
-		return SessionManager.inMemory();
+		return SessionManager.inMemoryForSessionPath(sessionPathContext);
 	}
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			return await SessionManager.open(sessionArg, parsed.sessionDir, undefined, sessionPathContext);
 		}
-		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
+		const match = await resolveResumableSessionForContext(sessionArg, sessionPathContext, parsed.sessionDir);
 		if (!match) {
 			throw new Error(`Session "${sessionArg}" not found.`);
 		}
 		if (match.scope === "global") {
-			const normalizedCwd = normalizePathForComparison(cwd);
-			const normalizedMatchCwd = normalizePathForComparison(match.session.cwd || cwd);
-			if (normalizedCwd !== normalizedMatchCwd) {
+			const identity = sessionPathContext.sessionIdentity;
+			const matchIdentity = match.session.sessionIdentity ?? match.session.cwd ?? identity;
+			const sameIdentity =
+				sessionPathContext.kind === "connected"
+					? identity === matchIdentity
+					: normalizePathForComparison(identity) === normalizePathForComparison(matchIdentity);
+			if (!sameIdentity) {
 				const shouldFork = await promptForkSession(match.session);
 				if (!shouldFork) {
-					throw new Error(`Session "${sessionArg}" is in another project (${match.session.cwd}).`);
+					throw new Error(
+						`Session "${sessionArg}" is in another project (${match.session.displayCwd ?? match.session.cwd}).`,
+					);
 				}
-				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+				return await SessionManager.forkFromForSessionPath(
+					match.session.path,
+					sessionPathContext,
+					parsed.sessionDir,
+				);
 			}
 		}
-		return await SessionManager.open(match.session.path, parsed.sessionDir);
+		return await SessionManager.open(match.session.path, parsed.sessionDir, undefined, sessionPathContext);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await SessionManager.continueRecentForSessionPath(sessionPathContext, parsed.sessionDir);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, parsed.sessionDir);
+		return SessionManager.createForSessionPath(sessionPathContext, parsed.sessionDir);
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (settings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecentForSessionPath(sessionPathContext, parsed.sessionDir);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -424,9 +481,12 @@ async function buildSessionOptions(
 	scopedModels: ScopedModel[],
 	sessionManager: SessionManager | undefined,
 	modelRegistry: ModelRegistry,
+	sessionPathContext: SessionPathContext,
+	remoteConnection: RemoteConnectionResult | undefined,
 ): Promise<{ options: CreateAgentSessionOptions }> {
 	const options: CreateAgentSessionOptions = {
-		cwd: parsed.cwd ?? getProjectDir(),
+		cwd: sessionPathContext.localWorkspaceCwd,
+		sessionPathContext,
 	};
 
 	// Auto-discover SYSTEM.md if no CLI system prompt provided
@@ -577,6 +637,17 @@ async function buildSessionOptions(
 		options.additionalExtensionPaths = [];
 	}
 
+	if (remoteConnection) {
+		options.remoteBackend = {
+			...remoteConnection.remote,
+			cwd:
+				sessionPathContext.kind === "connected"
+					? sessionPathContext.remoteExecutionCwd
+					: remoteConnection.remote.cwd,
+		};
+		options.disposeRemoteConnection = remoteConnection.disposeRemoteConnection;
+	}
+
 	return { options };
 }
 
@@ -725,22 +796,42 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 		);
 	}
 
+	const remoteConnection = parsedArgs.connect
+		? await logger.time("connectRemote", connectRemote, parsedArgs.connect)
+		: undefined;
+	const sessionPathContext = remoteConnection
+		? buildConnectedSessionPathContext(cwd, remoteConnection)
+		: createLocalSessionPathContext(cwd);
+
 	// Create session manager based on CLI flags
-	let sessionManager = await logger.time("createSessionManager", createSessionManager, parsedArgs, cwd);
+	let sessionManager: SessionManager | undefined;
+	try {
+		sessionManager = await logger.time("createSessionManager", createSessionManager, parsedArgs, sessionPathContext);
+	} catch (error) {
+		await remoteConnection?.disposeRemoteConnection();
+		throw error;
+	}
 
 	// Handle --resume (no value): show session picker
 	if (parsedArgs.resume === true && !parsedArgs.fork) {
-		const sessions = await logger.time("SessionManager.list", SessionManager.list, cwd, parsedArgs.sessionDir);
+		const sessions = await logger.time(
+			"SessionManager.list",
+			SessionManager.listForSessionPath,
+			sessionPathContext,
+			parsedArgs.sessionDir,
+		);
 		if (sessions.length === 0) {
+			await remoteConnection?.disposeRemoteConnection();
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
 		}
 		const selectedPath = await logger.time("selectSession", selectSession, sessions);
 		if (!selectedPath) {
+			await remoteConnection?.disposeRemoteConnection();
 			process.stdout.write(`${chalk.dim("No session selected")}\n`);
 			return;
 		}
-		sessionManager = await SessionManager.open(selectedPath);
+		sessionManager = await SessionManager.open(selectedPath, undefined, undefined, sessionPathContext);
 	}
 
 	await pluginPreloadPromise;
@@ -780,6 +871,8 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 		scopedModels,
 		sessionManager,
 		modelRegistry,
+		sessionPathContext,
+		remoteConnection,
 	);
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
@@ -860,11 +953,26 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 
 	const extensionFlagValues = session.extensionRunner?.getFlagValues() ?? new Map<string, boolean | string>();
 	const createAcpSession = async (cwd: string) => {
-		const nextSettings = await session.settings.cloneForCwd(cwd);
-		const nextSessionManager = SessionManager.create(cwd, parsedArgs.sessionDir);
+		const nextSessionPathContext =
+			sessionOptions.sessionPathContext?.kind === "connected" && remoteConnection
+				? buildConnectedSessionPathContext(
+						sessionOptions.sessionPathContext.localWorkspaceCwd,
+						remoteConnection,
+						cwd,
+					)
+				: createLocalSessionPathContext(cwd);
+		const nextSettings = await session.settings.cloneForCwd(nextSessionPathContext.localWorkspaceCwd);
+		const nextSessionManager = SessionManager.createForSessionPath(nextSessionPathContext, parsedArgs.sessionDir);
 		const { session: nextSession } = await createAgentSession({
 			...sessionOptions,
-			cwd,
+			cwd: nextSessionPathContext.localWorkspaceCwd,
+			sessionPathContext: nextSessionPathContext,
+			remoteBackend:
+				nextSessionPathContext.kind === "connected" && sessionOptions.remoteBackend
+					? { ...sessionOptions.remoteBackend, cwd: nextSessionPathContext.remoteExecutionCwd }
+					: sessionOptions.remoteBackend,
+			// ACP child sessions rebuild their own backend but share the parent-owned SSH tunnel.
+			disposeRemoteConnection: undefined,
 			sessionManager: nextSessionManager,
 			settings: nextSettings,
 			authStorage,

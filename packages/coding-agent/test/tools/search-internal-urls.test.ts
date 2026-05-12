@@ -7,6 +7,7 @@ import { InternalUrlRouter, LocalProtocolHandler } from "@oh-my-pi/pi-coding-age
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
 import { AgentRegistry } from "../../src/registry/agent-registry";
+import { LocalBackend } from "../../src/backend";
 
 function getResultText(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
@@ -52,6 +53,7 @@ describe("SearchTool internal URL resolution", () => {
 			hasUI: false,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
+			backend: new LocalBackend({ cwd: tmpDir }),
 			settings: Settings.isolated({ "search.contextBefore": 0, "search.contextAfter": 0 }),
 			...overrides,
 		};
