@@ -222,7 +222,11 @@ class SandboxManager:
         """
         target = self.pool_path(repo)
         if (target / ".git").exists() or (target / "HEAD").exists():
-            # Idempotent refresh. Remote URL is stable; no rewrite needed.
+            # Idempotent refresh. An older deploy may have baked a
+            # credentialed `https://user:pass@github.com/...` into
+            # `.git/config`; rewrite to the credential-free URL we now own
+            # before fetching so the PAT never persists on disk.
+            self._reset_origin_url(target, clone_url)
             self.transport.fetch_pool(repo=repo, pool_dir=target)
             return target
         target.mkdir(parents=True, exist_ok=True)
@@ -233,6 +237,20 @@ class SandboxManager:
             target=target,
         )
         return target
+
+    @staticmethod
+    def _reset_origin_url(repo_dir: Path, clone_url: str) -> None:
+        """`git remote set-url origin <clone_url>` if origin exists and differs.
+
+        Best-effort: silent no-op on failure (probe `get-url` first so we don't
+        spam logs on first-time clones where origin isn't configured yet).
+        """
+        probe = _safe_run(["git", "remote", "get-url", "origin"], cwd=repo_dir)
+        if probe.returncode != 0:
+            return
+        if probe.stdout.strip() == clone_url:
+            return
+        _safe_run(["git", "remote", "set-url", "origin", clone_url], cwd=repo_dir)
 
     # ---- per-issue workspace ----
     def workspace_root(self, repo: str, number: int) -> Path:
