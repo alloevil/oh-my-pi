@@ -3,7 +3,7 @@
  *
  * Three scoping modes (`HindsightConfig.scoping`):
  *   - `global`              — single shared bank, no per-project filter.
- *   - `per-project`         — one bank per cwd basename, hard isolation.
+ *   - `per-project`         — one bank per git primary-root basename, hard isolation.
  *   - `per-project-tagged`  — single shared bank, retains carry a `project:<name>`
  *                              tag and recall filters on it but still surfaces
  *                              untagged ("global") memories alongside.
@@ -19,6 +19,7 @@
 
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
+import { repo } from "../utils/git";
 import type { HindsightApi } from "./client";
 import type { HindsightConfig } from "./config";
 
@@ -50,9 +51,22 @@ function baseBankId(config: HindsightConfig): string {
 	return prefix ? `${prefix}-${base}` : base;
 }
 
-/** Best-effort project label from a working-directory path. */
-function projectLabel(directory: string): string {
+/**
+ * Best-effort project label for a working-directory path.
+ *
+ * When inside a git repository, uses the primary repo root's basename so that
+ * all linked worktrees of the same repo share a single stable label. Falls
+ * back to the immediate directory basename when git is unavailable or the
+ * directory is outside any repository.
+ */
+async function projectLabel(directory: string): Promise<string> {
 	if (!directory) return UNKNOWN_PROJECT;
+	try {
+		const primary = await repo.primaryRoot(directory);
+		if (primary) return path.basename(primary) || UNKNOWN_PROJECT;
+	} catch {
+		// git unavailable, not a repo, or I/O error — use directory basename
+	}
 	return path.basename(directory) || UNKNOWN_PROJECT;
 }
 
@@ -62,15 +76,15 @@ function projectLabel(directory: string): string {
  * Always returns a non-empty `bankId`. Tag fields are populated only for
  * `per-project-tagged`.
  */
-export function computeBankScope(config: HindsightConfig, directory: string): BankScope {
+export async function computeBankScope(config: HindsightConfig, directory: string): Promise<BankScope> {
 	const base = baseBankId(config);
 	switch (config.scoping) {
 		case "global":
 			return { bankId: base };
 		case "per-project":
-			return { bankId: `${base}-${projectLabel(directory)}` };
+			return { bankId: `${base}-${await projectLabel(directory)}` };
 		case "per-project-tagged": {
-			const tag = `${PROJECT_TAG_PREFIX}${projectLabel(directory)}`;
+			const tag = `${PROJECT_TAG_PREFIX}${await projectLabel(directory)}`;
 			return {
 				bankId: base,
 				retainTags: [tag],
@@ -88,8 +102,8 @@ export function computeBankScope(config: HindsightConfig, directory: string): Ba
  * scope. New code should prefer `computeBankScope` directly so it can also
  * apply the tag fields.
  */
-export function deriveBankId(config: HindsightConfig, directory: string): string {
-	return computeBankScope(config, directory).bankId;
+export async function deriveBankId(config: HindsightConfig, directory: string): Promise<string> {
+	return (await computeBankScope(config, directory)).bankId;
 }
 
 /**

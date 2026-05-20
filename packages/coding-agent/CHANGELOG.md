@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `hindsight.scoping: per-project-tagged` (and `per-project`) fragmenting memory across git worktrees of the same repository. `projectLabel` now resolves to the primary repo root's basename via `repo.primaryRoot`, so all linked worktrees share a single stable project tag instead of each getting a different tag derived from their checkout directory name. ([#1217](https://github.com/can1357/oh-my-pi/issues/1217))
+
 ## [15.1.7] - 2026-05-19
 
 ### Fixed

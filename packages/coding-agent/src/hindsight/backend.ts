@@ -77,7 +77,7 @@ export const hindsightBackend: MemoryBackend = {
 		}
 
 		const client = createHindsightClient(config);
-		const scope = computeBankScope(config, session.sessionManager.getCwd());
+		const scope = await computeBankScope(config, session.sessionManager.getCwd());
 
 		const state = new HindsightSessionState({
 			sessionId,
