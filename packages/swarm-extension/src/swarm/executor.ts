@@ -58,6 +58,8 @@ export async function executeSwarmAgent(
 		stateTracker,
 	} = options;
 
+	const subprocessAuthStorage = modelRegistry?.authStorage ?? authStorage;
+
 	const agentId = `swarm-${swarmName}-${agent.name}-${iteration}`;
 
 	const agentDef: AgentDefinition = {
@@ -84,7 +86,7 @@ export async function executeSwarmAgent(
 			modelOverride,
 			signal,
 			onProgress: progress => onProgress?.(agent.name, progress),
-			authStorage,
+			authStorage: subprocessAuthStorage,
 			modelRegistry,
 			settings,
 			enableLsp: false,
