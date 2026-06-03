@@ -38,6 +38,8 @@ import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId 
 const PROVIDER_AUTH_FALLBACKS: Record<string, readonly string[]> = {
 	minimax: ["minimax-code"],
 	"minimax-cn": ["minimax-code-cn"],
+	"minimax-code": ["minimax"],
+	"minimax-code-cn": ["minimax-cn"],
 };
 
 function getProviderAuthFallbacks(provider: string): readonly string[] {
@@ -3315,7 +3317,9 @@ export class AuthStorage {
 	 * and get a best-effort token. For GitHub Copilot we preserve enterprise
 	 * routing metadata so discovery can hit the correct host.
 	 */
-	async peekApiKey(provider: string): Promise<string | undefined> {
+	async peekApiKey(provider: string, visitedProviders: Set<string> = new Set()): Promise<string | undefined> {
+		if (visitedProviders.has(provider)) return undefined;
+		visitedProviders.add(provider);
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) {
 			return runtimeKey;
@@ -3350,7 +3354,7 @@ export class AuthStorage {
 		if (envKey) return envKey;
 
 		for (const fallbackProvider of getProviderAuthFallbacks(provider)) {
-			const apiKey = await this.peekApiKey(fallbackProvider);
+			const apiKey = await this.peekApiKey(fallbackProvider, visitedProviders);
 			if (apiKey) return apiKey;
 		}
 
@@ -3367,7 +3371,14 @@ export class AuthStorage {
 	 * 5. Environment variable
 	 * 6. Fallback resolver (models.yml custom providers, last-resort)
 	 */
-	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+	async getApiKey(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+		visitedProviders: Set<string> = new Set(),
+	): Promise<string | undefined> {
+		if (visitedProviders.has(provider)) return undefined;
+		visitedProviders.add(provider);
 		// Runtime override takes highest priority
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) {
@@ -3404,7 +3415,7 @@ export class AuthStorage {
 		if (envKey) return envKey;
 
 		for (const fallbackProvider of getProviderAuthFallbacks(provider)) {
-			const apiKey = await this.getApiKey(fallbackProvider, sessionId, options);
+			const apiKey = await this.getApiKey(fallbackProvider, sessionId, options, visitedProviders);
 			if (apiKey) return apiKey;
 		}
 

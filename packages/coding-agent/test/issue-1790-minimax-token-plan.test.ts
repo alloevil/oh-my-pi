@@ -63,6 +63,24 @@ describe("MiniMax Token Plan catalog availability (issue #1790)", () => {
 		});
 	});
 
+	test("a CN Anthropic-compatible Token Plan config key makes the CN OpenAI-compatible M3 SKU selectable", async () => {
+		authStorage.setConfigApiKey("minimax-cn", "sk-cn");
+
+		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.json"));
+		const model = registry
+			.getAvailable()
+			.find(candidate => candidate.provider === "minimax-code-cn" && candidate.id === "MiniMax-M3");
+
+		expect(model).toMatchObject({
+			api: "openai-completions",
+			provider: "minimax-code-cn",
+			baseUrl: "https://api.minimaxi.com/v1",
+			contextWindow: 512000,
+			maxTokens: 128000,
+		});
+		expect(await authStorage.getApiKey("minimax-code-cn")).toBe("sk-cn");
+	});
+
 	test("CN Token Plan logout removes the mirrored OpenAI-compatible M3 SKU", async () => {
 		using _hook = hookFetch(
 			() => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
