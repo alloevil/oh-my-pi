@@ -454,14 +454,41 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 	return stagedPath;
 }
 
-function validateLoadedBindings(ctx, bindings, candidate) {
-	// In workspace dev (running out of `packages/natives/native/` rather than a
-	// `node_modules` install or a compiled bundle) the local `.node` only gains
-	// the renamed sentinel after `bun --cwd=packages/natives run build`. Skip
-	// validation there so a stale post-pull dev tree boots while the rebuild
-	// completes; install and compiled-binary paths still validate.
-	if (ctx.isWorkspaceLoad) return;
+/**
+ * Validate that `bindings` matches `ctx.packageVersion`'s expected ABI.
+ *
+ * - Compiled binary and `node_modules` installs: the per-release version
+ *   sentinel MUST be present; missing → throw so the caller surfaces the
+ *   actionable reinstall hint instead of crashing later at first call.
+ * - Workspace dev (`packages/natives/native/` checked out, no `node_modules/`
+ *   on the path): the local `.node` only gains the renamed sentinel after
+ *   `bun --cwd=packages/natives run build`, so the loader intentionally
+ *   accepts a stale binary to let the rebuild proceed in the background.
+ *   When the sentinel is absent we emit a one-time stderr hint pointing at
+ *   the rebuild command — boot still succeeds, but the next `<sym> is not a
+ *   function` crash is no longer mysterious (see #1777).
+ *
+ * `stderr` is injectable so tests can capture the warning without spying on
+ * the global; production callers pass nothing and the default `process.stderr`
+ * is used.
+ *
+ * @param {{ versionSentinelExport: string; isWorkspaceLoad: boolean; packageVersion: string }} ctx
+ * @param {Record<string, unknown>} bindings
+ * @param {string} candidate
+ * @param {{ stderr?: { write(chunk: string): unknown } }} [options]
+ */
+export function validateLoadedBindings(ctx, bindings, candidate, options = {}) {
 	if (typeof bindings[ctx.versionSentinelExport] === "function") return;
+	if (ctx.isWorkspaceLoad) {
+		const stderr = options.stderr ?? process.stderr;
+		stderr.write(
+			`[@oh-my-pi/pi-natives] Loaded workspace ${candidate} but it predates ` +
+				`pi-natives@${ctx.packageVersion} (missing \`${ctx.versionSentinelExport}\`). ` +
+				"Native calls added since the last rebuild will throw `<sym> is not a function`. " +
+				"Rebuild: bun --cwd=packages/natives run build\n",
+		);
+		return;
+	}
 	throw new Error(
 		`Loaded ${candidate} but it does not expose the @oh-my-pi/pi-natives@${ctx.packageVersion} ` +
 			`version sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different ` +

@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed `bash` crashing with `nativeApplyBashFixups is not a function` after `git pull` lands a new `@oh-my-pi/pi-natives` export before the workspace `.node` is rebuilt. `applyBashFixups` now guards the native import and returns the input verbatim (no stripping) when the binding is `undefined`; the pi-natives loader prints a one-time rebuild hint at boot so the degraded state is visible up front instead of surfacing on the first bash call ([#1777](https://github.com/can1357/oh-my-pi/issues/1777)).
 - Fixed `/review`'s uncommitted-change mode in Jujutsu repositories to read `jj diff --git` from the current workspace, so non-default JJ workspaces include their working-copy changes instead of falling back to the colocated Git checkout.
 - Fixed empty assistant stop retry continuations preserving auto-retry state until a non-empty assistant turn completes or recovery reaches its retry cap.
 - Fixed TTSR rule conditions never matching streamed `edit`/`write` tool calls whose wire format obscures the real content (hashline `+` body rows, apply_patch envelopes, JSON-escaped `write` content). The edit and write tools now expose a `matcherDigest` normalization and TTSR matches against the introduced source text, so rule regexes stay universal regardless of the active edit mode.

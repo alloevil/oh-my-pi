@@ -62,4 +62,22 @@ export interface ExtractEmbeddedAddonArchiveInput {
 }
 
 export function extractEmbeddedAddonArchive(input: ExtractEmbeddedAddonArchiveInput): string[];
+
+export interface ValidateLoadedBindingsContext {
+	versionSentinelExport: string;
+	isWorkspaceLoad: boolean;
+	packageVersion: string;
+}
+
+export interface ValidateLoadedBindingsOptions {
+	stderr?: { write(chunk: string): unknown };
+}
+
+export function validateLoadedBindings(
+	ctx: ValidateLoadedBindingsContext,
+	bindings: Record<string, unknown>,
+	candidate: string,
+	options?: ValidateLoadedBindingsOptions,
+): void;
+
 export function loadNative(): Record<string, unknown>;

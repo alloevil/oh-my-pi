@@ -29,9 +29,31 @@ export interface BashFixupResult {
 }
 
 /**
+ * Apply both fixups using an explicit native binding. Exposed for tests so
+ * the workspace-stale fallback can be exercised without touching the ESM
+ * import.
+ *
+ * `native` is the value of `@oh-my-pi/pi-natives` `applyBashFixups` (or
+ * `undefined` when a stale workspace `.node` predates the export — see
+ * #1777 and `validateLoadedBindings` in
+ * `packages/natives/native/loader-state.js`). When the binding is missing
+ * the command is returned verbatim with `stripped: []`; the loader has
+ * already printed a rebuild hint to stderr, so callers don't need to.
+ */
+export function applyBashFixupsWith(
+	native: ((command: string) => BashFixupResult) | undefined,
+	command: string,
+): BashFixupResult {
+	if (typeof native !== "function") {
+		return { command, stripped: [] };
+	}
+	return native(command);
+}
+
+/**
  * Apply both fixups to a bash command. On any parse failure, multi-line input,
  * or no-op transform, returns the input verbatim with `stripped: []`.
  */
 export function applyBashFixups(command: string): BashFixupResult {
-	return nativeApplyBashFixups(command);
+	return applyBashFixupsWith(nativeApplyBashFixups, command);
 }

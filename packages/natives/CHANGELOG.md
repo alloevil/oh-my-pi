@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `validateLoadedBindings` silently allowing a stale workspace `.node` to satisfy the loader when the per-release version sentinel was missing, so the first call into a newly-added native export crashed with `<sym> is not a function` and no actionable diagnostic. The loader now writes a one-time stderr hint pointing at `bun --cwd=packages/natives run build` when the workspace `.node` predates the current release; install and compiled-binary paths still throw the existing reinstall error ([#1777](https://github.com/can1357/oh-my-pi/issues/1777)).
+
 ## [15.7.0] - 2026-05-31
 
 ### Added

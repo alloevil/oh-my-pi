@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { applyBashFixups, type BashFixupResult } from "../../src/tools/bash-command-fixup";
+import { applyBashFixups, applyBashFixupsWith, type BashFixupResult } from "../../src/tools/bash-command-fixup";
 
 function fixup(command: string): BashFixupResult {
 	return applyBashFixups(command);
@@ -122,4 +122,31 @@ describe("applyBashFixups — preserves semantics-bearing pipelines", () => {
 			expect(out.stripped).toEqual([]);
 		});
 	}
+});
+
+describe("applyBashFixupsWith — workspace-stale native fallback (issue #1777)", () => {
+	it("returns passthrough when the native binding is undefined", () => {
+		// Mirrors a workspace-dev tree where `git pull` added the export to
+		// `packages/coding-agent/src/tools/bash-command-fixup.ts` before the
+		// local `.node` was rebuilt. The ESM binding from
+		// `@oh-my-pi/pi-natives` resolves to `undefined`; the loader's
+		// workspace early-return is intentional, so the call site must guard.
+		const out = applyBashFixupsWith(undefined, "ls | head -5 && cmd 2>&1");
+		expect(out.command).toBe("ls | head -5 && cmd 2>&1");
+		expect(out.stripped).toEqual([]);
+	});
+
+	it("delegates to the native binding when present", () => {
+		// The contract this guard defends: when the native is loaded normally
+		// the wrapper is a pure forwarder, never substituting the input.
+		const expected: BashFixupResult = { command: "ls", stripped: ["| head -5"] };
+		let received = "";
+		const fake = (command: string): BashFixupResult => {
+			received = command;
+			return expected;
+		};
+		const out = applyBashFixupsWith(fake, "ls | head -5");
+		expect(received).toBe("ls | head -5");
+		expect(out).toBe(expected);
+	});
 });
