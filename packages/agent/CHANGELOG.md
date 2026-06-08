@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Fixed one-at-a-time steering and follow-up queues so callers can enqueue a message group that is delivered in the same turn.
 - Fixed stalled aborted assistant responses so the run now stops without waiting for provider iterator cleanup and returns the aborted message promptly
 - Fixed `afterToolCall` handling so it now runs for completed tool executions even after a run is aborted so tool post-processing still applies
 - Fixed `agentLoopDetailed().detailed()` so run telemetry and coverage are captured before `stream.result()` resolves.

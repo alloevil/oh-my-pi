@@ -80,6 +80,40 @@ describe("Agent", () => {
 		expect(mock.calls.length).toBe(2);
 	});
 
+	it("continue() should deliver a queued steering group in one turn", async () => {
+		const mock = createMockModel({ responses: [{ content: ["Processed group"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		agent.replaceMessages([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Initial" }],
+				timestamp: Date.now() - 10,
+			},
+			createAssistantMessage([{ type: "text", text: "Initial response" }]),
+		]);
+		agent.steer([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Steering prompt" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "custom",
+				customType: "workflow-notice",
+				content: "Workflow notice",
+				display: false,
+				timestamp: Date.now(),
+			},
+		]);
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+		const queuedMessages = agent.state.messages.slice(-3, -1);
+		expect(queuedMessages.map(message => message.role)).toEqual(["user", "custom"]);
+	});
+
 	it("prompt() emits assistant error lifecycle for Anthropic output-blocked stream errors before assistant start", async () => {
 		const mock = createMockModel({ responses: [] });
 		const errorText = "Output blocked by content filtering policy";

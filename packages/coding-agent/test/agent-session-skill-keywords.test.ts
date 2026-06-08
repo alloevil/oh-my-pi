@@ -25,11 +25,19 @@ describe("AgentSession skill prompt keyword steering", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage | undefined;
 	let session: AgentSession;
+	let holdFirstTurn = false;
+	let finishHeldTurn: (() => void) | undefined;
+	let heldTurnStarted: PromiseWithResolvers<void> | undefined;
+	let secondTurnObserved: PromiseWithResolvers<void> | undefined;
 	const observedTurns: ObservedSkillTurn[] = [];
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-agent-session-skill-keywords-");
 		observedTurns.length = 0;
+		holdFirstTurn = false;
+		finishHeldTurn = undefined;
+		heldTurnStarted = undefined;
+		secondTurnObserved = undefined;
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -47,6 +55,7 @@ describe("AgentSession skill prompt keyword steering", () => {
 			},
 			convertToLlm,
 			streamFn: (_model, context) => {
+				const turnIndex = observedTurns.length;
 				observedTurns.push({
 					texts: context.messages.map(message => {
 						const content = message.content;
@@ -58,7 +67,22 @@ describe("AgentSession skill prompt keyword steering", () => {
 							.join("\n");
 					}),
 				});
+				if (turnIndex === 1) {
+					secondTurnObserved?.resolve();
+				}
 				const stream = new AssistantMessageEventStream();
+				if (holdFirstTurn && turnIndex === 0) {
+					queueMicrotask(() => {
+						const response = createAssistantMessage("waiting");
+						stream.push({ type: "start", partial: response });
+						heldTurnStarted?.resolve();
+					});
+					finishHeldTurn = () => {
+						const response = createAssistantMessage("done");
+						stream.push({ type: "done", reason: "stop", message: response });
+					};
+					return stream;
+				}
 				queueMicrotask(() => {
 					const response = createAssistantMessage("done");
 					stream.push({ type: "start", partial: response });
@@ -107,5 +131,41 @@ describe("AgentSession skill prompt keyword steering", () => {
 		expect(observedTurn.texts).toContain(`Skill body\n\n---\n\nSkill: ${skillPath}\nUser: ${details.args}`);
 		expect(observedTurn.texts).toContain(WORKFLOW_NOTICE);
 		expect(session.sessionManager.getTurnBudget()).toEqual({ total: 500_000, spent: 0, hard: true });
+	});
+
+	it("groups queued skill keyword notices with the streaming skill prompt", async () => {
+		holdFirstTurn = true;
+		heldTurnStarted = Promise.withResolvers<void>();
+		secondTurnObserved = Promise.withResolvers<void>();
+		const firstPrompt = session.prompt("initial request");
+		await heldTurnStarted.promise;
+
+		const skillPath = path.join(tempDir.path(), "deep-research.md");
+		const details: SkillPromptDetails = {
+			name: "deep-research",
+			path: skillPath,
+			args: "workflowz compare these approaches",
+			lineCount: 1,
+		};
+		await session.promptCustomMessage(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: `Skill body\n\n---\n\nSkill: ${skillPath}\nUser: ${details.args}`,
+				display: true,
+				details,
+				attribution: "user",
+			},
+			{ streamingBehavior: "steer" },
+		);
+
+		finishHeldTurn?.();
+		await secondTurnObserved.promise;
+		await session.waitForIdle();
+		await firstPrompt;
+
+		const queuedSkillTurn = observedTurns[1];
+		if (!queuedSkillTurn) throw new Error("Expected queued skill turn to be captured");
+		expect(queuedSkillTurn.texts).toContain(`Skill body\n\n---\n\nSkill: ${skillPath}\nUser: ${details.args}`);
+		expect(queuedSkillTurn.texts).toContain(WORKFLOW_NOTICE);
 	});
 });

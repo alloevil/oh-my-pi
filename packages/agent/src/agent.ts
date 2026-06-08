@@ -277,8 +277,8 @@ export class Agent {
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
-	#steeringQueue: AgentMessage[] = [];
-	#followUpQueue: AgentMessage[] = [];
+	#steeringQueue: AgentMessage[][] = [];
+	#followUpQueue: AgentMessage[][] = [];
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
@@ -705,19 +705,27 @@ export class Agent {
 	}
 
 	/**
-	 * Queue a steering message to interrupt the agent mid-run.
-	 * Delivered after current tool execution, skips remaining tools.
+	 * Queue a steering message or message group to interrupt the agent mid-run.
+	 * Each call is dequeued as one unit, even in one-at-a-time mode.
 	 */
-	steer(m: AgentMessage) {
-		this.#steeringQueue.push(m);
+	steer(m: AgentMessage | AgentMessage[]) {
+		if (Array.isArray(m)) {
+			if (m.length > 0) this.#steeringQueue.push(m);
+			return;
+		}
+		this.#steeringQueue.push([m]);
 	}
 
 	/**
-	 * Queue a follow-up message to be processed after the agent finishes.
-	 * Delivered only when agent has no more tool calls or steering messages.
+	 * Queue a follow-up message or message group to be processed after the agent finishes.
+	 * Each call is dequeued as one unit, even in one-at-a-time mode.
 	 */
-	followUp(m: AgentMessage) {
-		this.#followUpQueue.push(m);
+	followUp(m: AgentMessage | AgentMessage[]) {
+		if (Array.isArray(m)) {
+			if (m.length > 0) this.#followUpQueue.push(m);
+			return;
+		}
+		this.#followUpQueue.push([m]);
 	}
 
 	clearSteeringQueue() {
@@ -742,11 +750,11 @@ export class Agent {
 			if (this.#steeringQueue.length > 0) {
 				const first = this.#steeringQueue[0];
 				this.#steeringQueue = this.#steeringQueue.slice(1);
-				return [first];
+				return first;
 			}
 			return [];
 		}
-		const steering = this.#steeringQueue.slice();
+		const steering = this.#steeringQueue.flat();
 		this.#steeringQueue = [];
 		return steering;
 	}
@@ -756,11 +764,11 @@ export class Agent {
 			if (this.#followUpQueue.length > 0) {
 				const first = this.#followUpQueue[0];
 				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return [first];
+				return first;
 			}
 			return [];
 		}
-		const followUp = this.#followUpQueue.slice();
+		const followUp = this.#followUpQueue.flat();
 		this.#followUpQueue = [];
 		return followUp;
 	}
@@ -770,7 +778,8 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
-		return this.#steeringQueue.pop();
+		const last = this.#steeringQueue.pop();
+		return last?.[last.length - 1];
 	}
 
 	/**
@@ -778,7 +787,8 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
-		return this.#followUpQueue.pop();
+		const last = this.#followUpQueue.pop();
+		return last?.[last.length - 1];
 	}
 
 	clearMessages() {

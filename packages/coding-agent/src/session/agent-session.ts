@@ -4423,13 +4423,9 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 			if (options.streamingBehavior === "followUp") {
-				await this.#queueFollowUp(expandedText, options?.images);
+				await this.#queueFollowUp(expandedText, options?.images, keywordNotices);
 			} else {
-				await this.#queueSteer(expandedText, options?.images);
-			}
-			// Steer/follow-up the keyword notices alongside the queued user message.
-			for (const notice of keywordNotices) {
-				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+				await this.#queueSteer(expandedText, options?.images, keywordNotices);
 			}
 			return;
 		}
@@ -4495,17 +4491,6 @@ export class AgentSession {
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
 		}
 
-		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new AgentBusyError();
-			}
-			await this.sendCustomMessage(message, { deliverAs: options.streamingBehavior });
-			for (const notice of keywordNotices) {
-				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
-			}
-			return;
-		}
-
 		const customMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,
@@ -4515,6 +4500,20 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+
+		if (this.isStreaming) {
+			if (!options?.streamingBehavior) {
+				throw new AgentBusyError();
+			}
+			const normalizedCustomMessage = await this.#normalizeAgentMessageImages(customMessage);
+			const queuedMessages: AgentMessage[] = [normalizedCustomMessage, ...keywordNotices];
+			if (options.streamingBehavior === "followUp") {
+				this.agent.followUp(queuedMessages);
+			} else {
+				this.agent.steer(queuedMessages);
+			}
+			return;
+		}
 
 		await this.#promptWithMessage(customMessage, textContent, {
 			...options,
@@ -4854,7 +4853,7 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	async #queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	async #queueSteer(text: string, images?: ImageContent[], appendMessages?: AgentMessage[]): Promise<void> {
 		const normalizedImages = await normalizeModelContextImages(images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#steeringMessages.push({ text: displayText });
@@ -4862,19 +4861,22 @@ export class AgentSession {
 		if (normalizedImages && normalizedImages.length > 0) {
 			content.push(...normalizedImages);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			steering: true,
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		this.agent.steer([
+			{
+				role: "user",
+				content,
+				steering: true,
+				attribution: "user",
+				timestamp: Date.now(),
+			},
+			...(appendMessages ?? []),
+		]);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	async #queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	async #queueFollowUp(text: string, images?: ImageContent[], appendMessages?: AgentMessage[]): Promise<void> {
 		const normalizedImages = await normalizeModelContextImages(images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#followUpMessages.push({ text: displayText });
@@ -4882,12 +4884,15 @@ export class AgentSession {
 		if (normalizedImages && normalizedImages.length > 0) {
 			content.push(...normalizedImages);
 		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		this.agent.followUp([
+			{
+				role: "user",
+				content,
+				attribution: "user",
+				timestamp: Date.now(),
+			},
+			...(appendMessages ?? []),
+		]);
 		// When fully idle AND the session is in a resumable assistant-ended state,
 		// schedule an immediate continue so the queued follow-up is delivered
 		// without waiting for the next user turn. We gate on isStreaming (model
