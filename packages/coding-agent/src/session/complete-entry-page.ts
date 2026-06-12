@@ -16,6 +16,27 @@ export interface CompleteEntryPageOptions {
 	maxEntries?: number;
 }
 
+const OVERSIZED_ENTRY_SCAN_BYTES = 64 * 1024;
+
+async function findNextLineByte(sessionFile: string, fromByte: number, size: number): Promise<number | undefined> {
+	const file = await fs.open(sessionFile, "r");
+	try {
+		const buffer = Buffer.allocUnsafe(Math.min(OVERSIZED_ENTRY_SCAN_BYTES, Math.max(1, size - fromByte)));
+		let cursor = fromByte;
+		while (cursor < size) {
+			const length = Math.min(buffer.length, size - cursor);
+			const { bytesRead } = await file.read(buffer, 0, length, cursor);
+			if (bytesRead === 0) return undefined;
+			const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+			if (newline >= 0) return cursor + newline + 1;
+			cursor += bytesRead;
+		}
+		return undefined;
+	} finally {
+		await file.close();
+	}
+}
+
 /** Read only newline-terminated JSONL entries, advancing a byte cursor over complete entries. */
 export async function readCompleteEntryPage(
 	sessionFile: string,
@@ -49,10 +70,14 @@ export async function readCompleteEntryPage(
 	const completeLineCount = text.endsWith("\n") ? lines.length - 1 : Math.max(0, lines.length - 1);
 	const selected = lines.slice(0, Math.min(completeLineCount, maxEntries));
 	const completeText = selected.length > 0 ? `${selected.join("\n")}\n` : "";
+	const nextByte =
+		completeText.length > 0
+			? startByte + Buffer.byteLength(completeText, "utf8")
+			: await findNextLineByte(sessionFile, Math.min(size, startByte + maxBytes + 1), size);
 	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];
 	return {
 		fromByte: startByte,
-		nextByte: startByte + Buffer.byteLength(completeText, "utf8"),
+		nextByte: nextByte ?? startByte,
 		reset,
 		entries,
 	};
