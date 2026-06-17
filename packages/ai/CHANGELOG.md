@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+
+### Fixed
+
+- Fixed Zhipu/BigModel GLM-5.2 chat-completions requests so the internal `xhigh` effort serializes as provider-native `reasoning_effort: "max"` and tool calls opt into `tool_stream`. ([#2833](https://github.com/can1357/oh-my-pi/issues/2833))
 ## [16.0.3] - 2026-06-16
 
 ### Added
