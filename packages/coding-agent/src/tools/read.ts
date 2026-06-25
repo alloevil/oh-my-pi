@@ -2083,6 +2083,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					`Invalid selector ':${internalTarget.sel}' on '${internalTarget.path}'. Use :N, :N-M, :N+K, :N- (open-ended), a comma-separated list of ranges, :raw, or a range combined with raw (e.g. :raw:50-100).`,
 				);
 			}
+			if (parsed.kind === "lines" && internalTarget.path.toLowerCase().startsWith("local://")) {
+				const localFile = await resolveLocalUrlToFile(internalTarget.path, {
+					cwd: this.session.cwd,
+					settings: this.session.settings,
+					signal,
+					localProtocolOptions: this.session.localProtocolOptions,
+					skills: this.session.skills,
+				});
+				if (localFile) {
+					return this.execute(_toolCallId, { path: `${localFile.path}:${internalTarget.sel}` }, signal, _onUpdate, _toolContext);
+				}
+			}
 			return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 		}
 
