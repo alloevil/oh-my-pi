@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Esc preserving typed TUI prompt drafts instead of clearing unrecoverable input. ([#3869](https://github.com/can1357/oh-my-pi/issues/3869))
+
 ## [16.2.7] - 2026-06-30
 
 ### Breaking Changes
