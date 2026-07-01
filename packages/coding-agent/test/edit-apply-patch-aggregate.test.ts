@@ -13,12 +13,16 @@
  * See can1357/oh-my-pi#4023 for the reported failure mode.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool, type EditToolDetails } from "@oh-my-pi/pi-coding-agent/edit";
+import { FileFormatResult } from "@oh-my-pi/pi-coding-agent/lsp";
+import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
+import type { ServerConfig } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -36,6 +40,20 @@ function makeSession(cwd: string): ToolSession {
 	} as unknown as ToolSession;
 }
 
+function makeFormatOnWriteSession(cwd: string): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		enableLsp: true,
+		settings: Settings.isolated({ "edit.mode": "apply_patch", "lsp.formatOnWrite": true }),
+		getArtifactsDir: () => null,
+		getSessionId: () => null,
+		getPlanModeState: () => undefined,
+	} as unknown as ToolSession;
+}
+
 let tempDir: string;
 
 beforeEach(async () => {
@@ -46,6 +64,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	resetSettingsForTest();
+	vi.restoreAllMocks();
 	await removeWithRetries(tempDir);
 });
 
@@ -102,6 +121,59 @@ describe("apply_patch mode — multi-file aggregate on failure", () => {
 		expect(perFile?.length).toBe(2); // stopped after the failing one
 		expect(perFile?.[0].isError).toBeFalsy();
 		expect(perFile?.[1].isError).toBe(true);
+	});
+
+	test("flushes the pending LSP batch before returning an aggregate failure", async () => {
+		await Bun.write(path.join(tempDir, "a.txt"), "a\n");
+
+		const server: ServerConfig = {
+			command: "test-linter",
+			fileTypes: ["txt"],
+			rootMarkers: [],
+			isLinter: true,
+			createClient: () => ({
+				format: async (_filePath, content) => content,
+				lint: async () => [],
+			}),
+		};
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+			servers: { "test-linter": server },
+			idleTimeoutMs: undefined,
+		});
+
+		const tool = new EditTool(makeFormatOnWriteSession(tempDir));
+
+		const patch = [
+			"*** Begin Patch",
+			"*** Update File: a.txt",
+			"@@",
+			"-a",
+			"+A",
+			"*** Update File: missing.txt",
+			"@@",
+			"-x",
+			"+y",
+			"*** End Patch",
+		].join("\n");
+
+		const context = {
+			toolCall: {
+				batchId: "batched-apply-patch",
+				index: 1,
+				total: 2,
+				toolCalls: [
+					{ id: "previous-write", name: "write" },
+					{ id: "call-batched-failure", name: "edit" },
+				],
+			},
+		} as unknown as AgentToolContext;
+
+		const result = await tool.execute("call-batched-failure", { input: patch }, undefined, undefined, context);
+
+		expect(result.isError).toBe(true);
+		const details = result.details as EditToolDetails;
+		expect(details.diagnostics?.summary).toBe("OK");
+		expect(details.diagnostics?.formatter).toBe(FileFormatResult.UNCHANGED);
 	});
 
 	test("all-success multi-file apply_patch has no top-level isError", async () => {

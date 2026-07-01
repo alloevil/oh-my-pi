@@ -7,6 +7,7 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import {
 	createLspWritethrough,
 	type FileDiagnosticsResult,
+	flushLspWritethroughBatch,
 	type WritethroughCallback,
 	type WritethroughDeferredHandle,
 	writethroughNoop,
@@ -129,6 +130,8 @@ async function executeApplyPatchPerFile(
 		run: (batchRequest: LspBatchRequest | undefined) => Promise<AgentToolResult<EditToolDetails>>;
 	}[],
 	outerBatchRequest: LspBatchRequest | undefined,
+	cwd: string,
+	signal: AbortSignal | undefined,
 	onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 ): Promise<AgentToolResult<EditToolDetails, TInput>> {
 	if (fileEntries.length === 1) {
@@ -139,6 +142,7 @@ async function executeApplyPatchPerFile(
 	const perFileResults: EditToolPerFileResult[] = [];
 	const contentTexts: string[] = [];
 	let failed = false;
+	let flushedDiagnostics: FileDiagnosticsResult | undefined;
 
 	for (let i = 0; i < fileEntries.length; i++) {
 		const { path, run } = fileEntries[i];
@@ -190,6 +194,9 @@ async function executeApplyPatchPerFile(
 					`${skippedPaths.length === 1 ? "Not applied" : "Not applied"}: ${skippedPaths.join(", ")}. Re-read the affected files and re-issue only the failed and unapplied entries.`,
 				);
 			}
+			if (outerBatchRequest?.flush) {
+				flushedDiagnostics = await flushLspWritethroughBatch(outerBatchRequest.id, cwd, signal);
+			}
 			break;
 		}
 
@@ -217,6 +224,7 @@ async function executeApplyPatchPerFile(
 				.filter(Boolean)
 				.join("\n"),
 			firstChangedLine: perFileResults.find(r => r.firstChangedLine)?.firstChangedLine,
+			diagnostics: flushedDiagnostics,
 			perFileResults,
 		}),
 		// Any per-file failure marks the aggregate as an error so the agent
@@ -568,7 +576,7 @@ export class EditTool implements AgentTool<TInput> {
 								}),
 						};
 					});
-					return executeApplyPatchPerFile(perFile, batchRequest, onUpdate);
+					return executeApplyPatchPerFile(perFile, batchRequest, tool.session.cwd, signal, onUpdate);
 				},
 			},
 			hashline: {
