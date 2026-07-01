@@ -149,7 +149,7 @@ function createCompleteSimpleHangingStub(): CompleteSimpleStub {
 			timestamp: Date.now(),
 			content: [],
 		};
-	}) as typeof completeSimple;
+	}) as unknown as typeof completeSimple;
 
 	return { calls, fn };
 }
