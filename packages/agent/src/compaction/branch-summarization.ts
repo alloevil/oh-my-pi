@@ -5,7 +5,16 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { Api, ApiKey, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	ApiKey,
+	AssistantMessage,
+	Context,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
@@ -29,6 +38,8 @@ import {
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 	stripReadSelector,
+	TOOL_RESULT_MAX_CHARS,
+	truncateForSummary,
 	upsertFileOperations,
 } from "./utils";
 
@@ -167,10 +178,9 @@ export function collectEntriesForBranchSummary(
  *
  * Tool-result messages are kept: the assistant's tool call captures the
  * request, but the observation from `read`/`grep`/`bash`/etc. lives in the
- * result. `serializeConversation` already truncates each result to
- * `TOOL_RESULT_MAX_CHARS` and drops entries flagged `useless`, so passing
- * them through preserves the actual facts the abandoned branch learned
- * without ballooning the summarizer prompt.
+ * result. Budgeting uses the same per-result truncation applied by
+ * `serializeConversation`, so a large observation is not dropped before it can
+ * be reduced to the prompt-safe form that the summarizer actually receives.
  */
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	switch (entry.type) {
@@ -205,6 +215,33 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		case "mode_change":
 			return undefined;
 	}
+}
+
+function isTextContent(block: ToolResultMessage["content"][number]): block is TextContent {
+	return block.type === "text";
+}
+
+function summaryBudgetToolResultText(message: ToolResultMessage): string {
+	const text = message.content
+		.filter(isTextContent)
+		.map(block => block.text)
+		.join("");
+	if (text) return truncateForSummary(text, TOOL_RESULT_MAX_CHARS);
+	if (message.prunedAt !== undefined) return "[Output truncated]";
+	return "";
+}
+
+function estimateBranchSummaryTokens(message: AgentMessage): number {
+	if (message.role !== "toolResult") return estimateTokens(message);
+	if (message.useless === true && message.isError !== true) return 0;
+
+	const text = summaryBudgetToolResultText(message);
+	if (!text) return 0;
+
+	return estimateTokens({
+		...message,
+		content: [{ type: "text", text }],
+	});
 }
 
 /**
@@ -252,7 +289,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		// Extract file ops from assistant messages (tool calls)
 		extractFileOpsFromMessage(message, fileOps);
 
-		const tokens = estimateTokens(message);
+		const tokens = estimateBranchSummaryTokens(message);
 
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {

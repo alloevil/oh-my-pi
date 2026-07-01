@@ -104,6 +104,35 @@ describe("prepareBranchEntries — tool result preservation", () => {
 		const toolCall = assistant.content.find(block => block.type === "toolCall");
 		expect(toolCall).toBeDefined();
 	});
+
+	test("budgets large tool results after summary truncation", () => {
+		const largeObservation = `${UNIQUE_FACT}\n${"large observation ".repeat(20_000)}`;
+		const entries: SessionEntry[] = [
+			messageEntry("e1", null, { role: "user", content: "read large output", timestamp: 0 }),
+			messageEntry(
+				"e2",
+				"e1",
+				assistantMsg(
+					[{ type: "toolCall", id: "call-large", name: "read", arguments: { path: "large.txt" } }],
+					"toolUse",
+				),
+			),
+			messageEntry("e3", "e2", {
+				role: "toolResult",
+				toolCallId: "call-large",
+				toolName: "read",
+				content: [{ type: "text", text: largeObservation }],
+				isError: false,
+				timestamp: 0,
+			}),
+		];
+
+		const { messages, totalTokens } = prepareBranchEntries(entries, 1_200);
+		const toolResult = messages.find(m => m.role === "toolResult");
+
+		expect(toolResult).toBeDefined();
+		expect(totalTokens).toBeLessThan(1_200);
+	});
 });
 
 describe("generateBranchSummary — tool observation content reaches the summarizer", () => {
