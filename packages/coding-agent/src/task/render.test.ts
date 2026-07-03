@@ -2,6 +2,7 @@ import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { Settings } from "../config/settings";
 import { getThemeByName, setThemeInstance, type Theme } from "../modes/theme/theme";
 import { renderResult } from "./render";
+import { taskToolRenderer } from "./renderer";
 import type { AgentProgress, TaskToolDetails } from "./types";
 
 const strip = (lines: readonly string[]): string =>
@@ -117,5 +118,29 @@ describe("task live progress rendering", () => {
 		const collapsedText = renderProgressText(progress, false, uiTheme);
 		expect(collapsedText).not.toContain("line 1");
 		expect(collapsedText).not.toContain("raw output:");
+	});
+
+	it("does not request spinner ticks for static partial progress", () => {
+		expect("animatedPartialResult" in taskToolRenderer).toBe(false);
+	});
+
+	it("renders running progress identically across spinner frames", () => {
+		const progress = makeProgress([]);
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 1,
+			progress: [progress],
+		};
+		const render = (spinnerFrame: number) =>
+			strip(
+				renderResult(
+					{ content: [{ type: "text", text: "Running 1 agent..." }], details },
+					{ expanded: false, isPartial: true, spinnerFrame },
+					uiTheme,
+				).render(120),
+			);
+
+		expect(render(0)).toBe(render(1));
 	});
 });
