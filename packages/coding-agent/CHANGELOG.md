@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed OverlayFS isolated subagents using the live writable repository as their lower layer by creating a detached dirty-state worktree snapshot before mounting the overlay ([#4621](https://github.com/can1357/oh-my-pi/issues/4621)).
+- Fixed OverlayFS isolated subagents using the live writable repository as their lower layer by creating a detached dirty-state worktree snapshot, including live ignored files and initialized submodule contents, before mounting the overlay ([#4621](https://github.com/can1357/oh-my-pi/issues/4621)).
 
 ## [16.3.8] - 2026-07-05
 

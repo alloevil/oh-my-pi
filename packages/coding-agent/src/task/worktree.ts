@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
-import { getWorktreeDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import * as git from "../utils/git";
 import * as jj from "../utils/jj";
 import { mapWithConcurrencyLimit } from "./parallel";
@@ -417,28 +417,30 @@ function getTaskIsolationSegment(repoRoot: string, id: string): string {
 	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
 }
 
-async function copyUntrackedEntries(
-	repoRoot: string,
-	snapshotDir: string,
-	untracked: readonly string[],
-): Promise<void> {
-	for (const entry of untracked) {
+async function copyLiveEntries(repoRoot: string, snapshotDir: string, entries: readonly string[]): Promise<void> {
+	for (const entry of new Set(entries)) {
 		const source = path.join(repoRoot, entry);
 		const destination = path.join(snapshotDir, entry);
 		await fs.mkdir(path.dirname(destination), { recursive: true });
-		await fs.cp(source, destination, {
-			force: true,
-			recursive: true,
-			verbatimSymlinks: true,
-		});
+		try {
+			await fs.cp(source, destination, {
+				force: true,
+				recursive: true,
+				verbatimSymlinks: true,
+			});
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+		}
 	}
 }
 
 async function seedOverlaySnapshotDirtyState(repoRoot: string, snapshotDir: string): Promise<void> {
-	const [staged, unstaged, untracked] = await Promise.all([
+	const [staged, unstaged, untracked, ignored, submodules] = await Promise.all([
 		git.diff(repoRoot, { binary: true, cached: true }),
 		git.diff(repoRoot, { binary: true }),
 		git.ls.untracked(repoRoot),
+		git.ls.ignored(repoRoot),
+		git.ls.submodules(repoRoot),
 	]);
 
 	if (staged.trim()) {
@@ -448,7 +450,7 @@ async function seedOverlaySnapshotDirtyState(repoRoot: string, snapshotDir: stri
 	if (unstaged.trim()) {
 		await git.patch.applyText(snapshotDir, unstaged);
 	}
-	await copyUntrackedEntries(repoRoot, snapshotDir, untracked);
+	await copyLiveEntries(repoRoot, snapshotDir, [...untracked, ...ignored, ...submodules]);
 }
 
 async function removeOverlaySnapshot(

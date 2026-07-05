@@ -121,6 +121,12 @@ describe("worktree isolation helpers", () => {
 			let handle: IsolationHandle | undefined;
 
 			try {
+				await fs.writeFile(path.join(repo, ".gitignore"), [".env", "ignored-dir/", ""].join("\n"));
+				await runGit(repo, ["add", ".gitignore"]);
+				await runGit(repo, ["commit", "-q", "-m", "ignore overlayfs fixtures"]);
+				await fs.writeFile(path.join(repo, ".env"), "ignored snapshot\n");
+				await fs.mkdir(path.join(repo, "ignored-dir"), { recursive: true });
+				await fs.writeFile(path.join(repo, "ignored-dir", "generated.txt"), "ignored generated snapshot\n");
 				await fs.writeFile(path.join(repo, "staged.txt"), "staged snapshot\n");
 				await runGit(repo, ["add", "staged.txt"]);
 				await fs.writeFile(path.join(repo, "merged.txt"), "unstaged snapshot\n");
@@ -146,15 +152,30 @@ describe("worktree isolation helpers", () => {
 				await expect(fs.readFile(path.join(lowerDir, "untracked.txt"), "utf8")).resolves.toBe(
 					"untracked snapshot\n",
 				);
+				await expect(fs.readFile(path.join(lowerDir, ".env"), "utf8")).resolves.toBe("ignored snapshot\n");
+				await expect(fs.readFile(path.join(lowerDir, "ignored-dir", "generated.txt"), "utf8")).resolves.toBe(
+					"ignored generated snapshot\n",
+				);
 
 				await fs.writeFile(path.join(repo, "merged.txt"), "parent edit after ensure\n");
 				await fs.writeFile(path.join(repo, "untracked.txt"), "parent untracked after ensure\n");
 				await fs.writeFile(path.join(repo, "late-parent.txt"), "late parent file\n");
+				await fs.writeFile(path.join(repo, ".env"), "parent ignored after ensure\n");
+				await fs.writeFile(
+					path.join(repo, "ignored-dir", "generated.txt"),
+					"parent ignored generated after ensure\n",
+				);
+				await fs.writeFile(path.join(repo, "ignored-dir", "late-generated.txt"), "late ignored parent file\n");
 
 				await expect(fs.readFile(path.join(lowerDir, "merged.txt"), "utf8")).resolves.toBe("unstaged snapshot\n");
 				await expect(fs.readFile(path.join(lowerDir, "untracked.txt"), "utf8")).resolves.toBe(
 					"untracked snapshot\n",
 				);
+				await expect(fs.readFile(path.join(lowerDir, ".env"), "utf8")).resolves.toBe("ignored snapshot\n");
+				await expect(fs.readFile(path.join(lowerDir, "ignored-dir", "generated.txt"), "utf8")).resolves.toBe(
+					"ignored generated snapshot\n",
+				);
+				expect(await Bun.file(path.join(lowerDir, "ignored-dir", "late-generated.txt")).exists()).toBe(false);
 				expect(await Bun.file(path.join(lowerDir, "late-parent.txt")).exists()).toBe(false);
 			} finally {
 				if (handle !== undefined) {

@@ -1926,17 +1926,23 @@ export const ls = {
 	/** List files tracked or untracked by git. */
 	async files(
 		cwd: string,
-		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
+		options: { others?: boolean; ignored?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
 	): Promise<string[]> {
 		const args = ["ls-files"];
 		if (options.others) args.push("--others");
+		if (options.ignored) args.push("--ignored");
 		if (options.excludeStandard) args.push("--exclude-standard");
 		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
 	},
 
-	/** List untracked files (excludes ignored). */
+	/** List untracked files that are not ignored. */
 	async untracked(cwd: string, signal?: AbortSignal): Promise<string[]> {
 		return ls.files(cwd, { others: true, excludeStandard: true, signal });
+	},
+
+	/** List ignored live files that are not tracked by git. */
+	async ignored(cwd: string, signal?: AbortSignal): Promise<string[]> {
+		return ls.files(cwd, { others: true, ignored: true, excludeStandard: true, signal });
 	},
 
 	/** List paths present in a ref, optionally filtered to specific paths. */
