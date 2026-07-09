@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed slash-command Tab completion opening file suggestions after completing a no-arg command such as `/settings` ([#4767](https://github.com/can1357/oh-my-pi/issues/4767)).
+
 ## [16.3.10] - 2026-07-06
 
 ### Fixed
