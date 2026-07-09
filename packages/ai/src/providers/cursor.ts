@@ -2798,10 +2798,11 @@ function buildGrpcRequest(
 		turns,
 	});
 
+	const wireModelId = model.requestModelId ?? model.id;
 	const maxMode = model.maxMode ?? false;
 	const modelDetails = create(ModelDetailsSchema, {
-		modelId: model.id,
-		displayModelId: model.id,
+		modelId: wireModelId,
+		displayModelId: wireModelId,
 		displayName: model.name,
 		maxMode,
 	});
@@ -2810,7 +2811,7 @@ function buildGrpcRequest(
 		conversationState,
 		action,
 		modelDetails,
-		requestedModel: create(RequestedModelSchema, { modelId: model.id, maxMode }),
+		requestedModel: create(RequestedModelSchema, { modelId: wireModelId, maxMode }),
 		conversationId: state.conversationId,
 	});
 

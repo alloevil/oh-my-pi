@@ -208,9 +208,10 @@ describe("Cursor request action encoding", () => {
 		expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(Buffer.from(imageData, "base64")));
 	});
 
-	it("serializes max-mode models in both Cursor model fields", async () => {
+	it("serializes max-mode wire model ids in both Cursor model fields", async () => {
 		const maxModeModel: Model<"cursor-agent"> = buildModel({
-			id: "cursor-claude-4.5-opus-high-max",
+			id: "local-cursor-claude-4.5-opus-high-max",
+			requestModelId: "cursor-claude-4.5-opus-high-max",
 			name: "Cursor Claude 4.5 Opus Max",
 			api: "cursor-agent",
 			provider: "cursor",
@@ -229,8 +230,10 @@ describe("Cursor request action encoding", () => {
 			maxModeModel,
 		);
 
+		expect(payload.modelDetails?.modelId).toBe(maxModeModel.requestModelId);
+		expect(payload.modelDetails?.displayModelId).toBe(maxModeModel.requestModelId);
 		expect(payload.modelDetails?.maxMode).toBe(true);
-		expect(payload.requestedModel?.modelId).toBe(maxModeModel.id);
+		expect(payload.requestedModel?.modelId).toBe(maxModeModel.requestModelId);
 		expect(payload.requestedModel?.maxMode).toBe(true);
 	});
 });
