@@ -8347,14 +8347,9 @@ export class AgentSession {
 			return;
 		}
 
-		if (this.isStreaming) {
-			await this.#queueUserMessage(text, images, "steer");
-			return;
-		}
-
 		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion.
-		// The default streaming behavior covers the narrow race where a stream starts before prompt()
-		// acquires the turn.
+		// `streamingBehavior: "steer"` preserves prompt-flow side effects during streaming while
+		// covering the narrow race where a stream starts before prompt() acquires the turn.
 		await this.prompt(text, {
 			expandPromptTemplates: false,
 			images,

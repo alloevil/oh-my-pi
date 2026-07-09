@@ -15,7 +15,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -68,7 +68,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	async function createSession() {
+	async function createSession(settingsOverrides?: Partial<Record<SettingPath, unknown>>) {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 
@@ -100,7 +100,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const sessionManager = SessionManager.inMemory();
-		const settings = Settings.isolated();
+		const settings = Settings.isolated(settingsOverrides);
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		authStorages.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
@@ -176,16 +176,20 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
-	it("sendUserMessage without deliverAs queues a steer while streaming", async () => {
-		await createSession();
+	it("sendUserMessage without deliverAs preserves prompt-flow keyword notices while streaming", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
 
 		const firstPrompt = session.prompt("First message");
 		await waitFor(() => session.isStreaming);
 
 		try {
-			await session.sendUserMessage("Steer via extension");
+			await session.sendUserMessage("ultrathink fix via extension");
+			const queuedShape = session.agent
+				.peekSteeringQueue()
+				.map(message => (message.role === "custom" ? message.customType : message.role));
+			expect(queuedShape).toEqual(["ultrathink-notice", "user"]);
 			expect(session.getQueuedMessages()).toEqual({
-				steering: ["Steer via extension"],
+				steering: ["ultrathink fix via extension"],
 				followUp: [],
 			});
 		} finally {
