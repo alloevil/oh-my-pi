@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Codex reasoning summary display so empty HTML comment separator lines are omitted from visible thinking blocks instead of rendering as `<!-- -->` markers ([#4936](https://github.com/can1357/oh-my-pi/issues/4936)).
+
 ## [16.3.12] - 2026-07-08
 
 ### Added
