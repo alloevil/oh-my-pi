@@ -13,7 +13,7 @@ set -e
 REPO="can1357/oh-my-pi"
 PACKAGE="@oh-my-pi/pi-coding-agent"
 INSTALL_DIR="${PI_INSTALL_DIR:-$HOME/.local/bin}"
-MIN_BUN_VERSION="1.3.14"
+MIN_BUN_VERSION="1.3.15"
 
 # Parse arguments
 MODE=""

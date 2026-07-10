@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed release, installer, and source runtime pins to require Bun 1.3.15 instead of 1.3.14 so compiled `omp` binaries avoid the upstream JSC GC crash on long closed `fetch()` calls. ([#5071](https://github.com/can1357/oh-my-pi/issues/5071))
+
 ## [16.4.0] - 2026-07-10
 
 ### Breaking Changes

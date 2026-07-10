@@ -38,7 +38,7 @@ runs:
         shell: bash
         run: |
            export BUN_INSTALL="${HOME}/.bun"
-           curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14"
+           curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.15"
            echo "${BUN_INSTALL}/bin" >> "$GITHUB_PATH"
 
       # Off-infra (GitHub-hosted): stock actions/cache for the bun store.
