@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test, vi } from "bun:test";
+import { beforeAll, describe, expect, type Mock, test, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -36,9 +36,12 @@ function installTestTheme(): void {
 	setThemeInstance(testTheme);
 }
 
+type RefreshProvider = ModelRegistry["refreshProvider"];
+
 interface SelectorHarness {
 	selector: ModelSelectorComponent;
 	backgroundRefresh: Promise<void>;
+	refreshProvider: Mock<RefreshProvider>;
 }
 
 type DiscoveryStatesByProvider = Partial<Record<string, ProviderDiscoveryState>>;
@@ -57,10 +60,11 @@ function createSelector(
 	// The constructor kicks off an offline refresh in the background. Drive it
 	// through an explicit gate so tests can await drain instead of sleeping.
 	const refreshGate = Promise.withResolvers<void>();
+	const refreshProvider = vi.fn<RefreshProvider>(async () => {});
 	const modelRegistry = {
 		getAll: () => models,
 		refresh: vi.fn(() => refreshGate.promise),
-		refreshProvider: vi.fn(async () => {}),
+		refreshProvider,
 		getError: () => undefined,
 		getAvailable: () => models,
 		getDiscoverableProviders: () => options.discoverableProviders ?? [],
@@ -88,7 +92,7 @@ function createSelector(
 		.then(() => Promise.resolve())
 		.then(() => Promise.resolve())
 		.then(() => Promise.resolve());
-	return { selector, backgroundRefresh };
+	return { selector, backgroundRefresh, refreshProvider };
 }
 
 describe("ModelSelector search stays inside the active provider tab (#4522)", () => {
@@ -214,12 +218,19 @@ describe("ModelSelector provider tabs hide optional empty local discovery provid
 			},
 		};
 
-		const { selector, backgroundRefresh } = createSelector([], () => {}, {
+		const { selector, backgroundRefresh, refreshProvider } = createSelector([], () => {}, {
 			discoverableProviders: providers,
 			discoveryStates,
 		});
 		await backgroundRefresh;
 		installTestTheme();
+
+		expect(refreshProvider).toHaveBeenCalledTimes(3);
+		expect(refreshProvider.mock.calls).toEqual([
+			["ollama", "online"],
+			["llama.cpp", "online"],
+			["lm-studio", "online"],
+		]);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("ALL");
@@ -231,7 +242,7 @@ describe("ModelSelector provider tabs hide optional empty local discovery provid
 	test("keeps non-optional discoverable providers visible even without models", async () => {
 		installTestTheme();
 		const provider = "vllm";
-		const { selector, backgroundRefresh } = createSelector([], () => {}, {
+		const { selector, backgroundRefresh, refreshProvider } = createSelector([], () => {}, {
 			discoverableProviders: [provider],
 			discoveryStates: {
 				[provider]: {
@@ -245,6 +256,7 @@ describe("ModelSelector provider tabs hide optional empty local discovery provid
 		});
 		await backgroundRefresh;
 		installTestTheme();
+		expect(refreshProvider).not.toHaveBeenCalled();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("VLLM");

@@ -166,6 +166,8 @@ export class ModelSelectorComponent extends Container {
 	#activeTabIndex: number = 0;
 	#refreshingProviders: Set<string> = new Set();
 	#scheduledProviderRefreshes: Map<string, Timer> = new Map();
+	#refreshingHiddenOptionalProviders: Set<string> = new Set();
+	#hiddenOptionalProviderRefreshAttempts: Set<string> = new Set();
 	#refreshSpinnerFrame: number = 0;
 	#refreshSpinnerInterval?: Timer;
 
@@ -271,6 +273,7 @@ export class ModelSelectorComponent extends Container {
 		// dropped while the offline refresh promise is still pending. This stays
 		// on the open path, so it must remain cheap.
 		this.#syncFromRegistryState();
+		this.#refreshHiddenOptionalProviders();
 
 		// Reconcile with cached discovery state in the background. A --models
 		// scope is registry-independent, so the offline reload would only repeat
@@ -278,7 +281,10 @@ export class ModelSelectorComponent extends Container {
 		if (this.#scopedModels.length === 0) {
 			this.#modelRegistry
 				.refresh("offline")
-				.then(() => this.#syncFromRegistryState())
+				.then(() => {
+					this.#syncFromRegistryState();
+					this.#refreshHiddenOptionalProviders();
+				})
 				.catch(error => {
 					this.#errorMessage = error instanceof Error ? error.message : String(error);
 					this.#updateList();
@@ -566,6 +572,47 @@ export class ModelSelectorComponent extends Container {
 			clearTimeout(timer);
 			this.#scheduledProviderRefreshes.delete(providerId);
 			this.#setProviderRefreshing(providerId, false);
+		}
+	}
+
+	#refreshHiddenOptionalProviders(): void {
+		if (this.#scopedModels.length > 0) {
+			return;
+		}
+		const visibleProviders = new Set(
+			this.#providers
+				.map(provider => provider.providerId)
+				.filter((providerId): providerId is string => providerId !== undefined),
+		);
+		for (const provider of this.#modelRegistry.getDiscoverableProviders()) {
+			if (visibleProviders.has(provider)) {
+				continue;
+			}
+			if (!this.#modelRegistry.getProviderDiscoveryState(provider)?.optional) {
+				continue;
+			}
+			if (
+				this.#hiddenOptionalProviderRefreshAttempts.has(provider) ||
+				this.#refreshingHiddenOptionalProviders.has(provider) ||
+				this.#refreshingProviders.has(provider)
+			) {
+				continue;
+			}
+			this.#hiddenOptionalProviderRefreshAttempts.add(provider);
+			this.#refreshingHiddenOptionalProviders.add(provider);
+			void this.#refreshHiddenOptionalProviderInBackground(provider);
+		}
+	}
+
+	async #refreshHiddenOptionalProviderInBackground(providerId: string): Promise<void> {
+		try {
+			await this.#modelRegistry.refreshProvider(providerId, "online");
+			this.#syncFromRegistryState();
+		} catch {
+			// Hidden optional providers are speculative local probes; failures must not replace visible results.
+		} finally {
+			this.#refreshingHiddenOptionalProviders.delete(providerId);
+			this.#tui.requestRender();
 		}
 	}
 
