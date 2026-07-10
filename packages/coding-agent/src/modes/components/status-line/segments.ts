@@ -391,16 +391,16 @@ const costSegment: StatusLineSegment = {
 		const { cost, premiumRequests } = ctx.usageStats;
 		const normalizedPremiumRequests = normalizePremiumRequests(premiumRequests);
 		const state = ctx.session.state;
-		const usingSubscription = state.model ? ctx.session.modelRegistry.isUsingOAuth(state.model) : false;
+		const usingOAuthBilling = state.model ? ctx.session.modelRegistry.isUsingOAuth(state.model) : false;
 
-		if (!cost && !usingSubscription && !normalizedPremiumRequests) {
+		if (!cost && !usingOAuthBilling && !normalizedPremiumRequests) {
 			return { content: "", visible: false };
 		}
 
 		const billingParts: string[] = [];
 		if (cost) billingParts.push(`$${cost.toFixed(2)}`);
 		if (normalizedPremiumRequests) billingParts.push(`★ ${formatNumber(normalizedPremiumRequests)}`);
-		if (usingSubscription) billingParts.push("(sub)");
+		if (usingOAuthBilling) billingParts.push("(oauth)");
 
 		return { content: theme.fg("statusLineCost", billingParts.join(" ")), visible: true };
 	},

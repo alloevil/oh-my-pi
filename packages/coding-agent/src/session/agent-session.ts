@@ -15195,6 +15195,37 @@ export class AgentSession {
 		return { cancelled: false, sessionFile: this.sessionFile };
 	}
 
+	async #reloadAgentStateFromCurrentBranch(): Promise<SessionContext> {
+		const stateContext = this.sessionManager.buildSessionContext();
+		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
+		await this.#restoreMCPSelectionsForSessionContext(displayContext);
+		this.agent.replaceMessages(displayContext.messages);
+		this.#rehydrateCheckpointRewindState();
+		this.#resetAdvisorSessionState();
+		this.#syncTodoPhasesFromBranch();
+		this.#closeCodexProviderSessionsForHistoryRewrite();
+		return stateContext;
+	}
+
+	/**
+	 * Restores the active leaf after an internal side-branch turn.
+	 *
+	 * Agent-initiated maintenance turns may append useful tool side effects to the
+	 * transcript tree, but they must not move the user's active conversation onto
+	 * that synthetic branch.
+	 */
+	async restoreLeafAfterInternalTurn(leafId: string | null): Promise<void> {
+		if (this.sessionManager.getLeafId() === leafId) return;
+		if (leafId === null) {
+			this.sessionManager.resetLeaf();
+		} else if (this.sessionManager.getEntry(leafId)) {
+			this.sessionManager.branch(leafId);
+		} else {
+			return;
+		}
+		await this.#reloadAgentStateFromCurrentBranch();
+	}
+
 	// =========================================================================
 	// Tree Navigation
 	// =========================================================================
@@ -15357,15 +15388,7 @@ export class AgentSession {
 			this.sessionManager.branch(newLeafId);
 		}
 
-		// Update agent state — build display context to populate agent messages.
-		const stateContext = this.sessionManager.buildSessionContext();
-		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
-		await this.#restoreMCPSelectionsForSessionContext(displayContext);
-		this.agent.replaceMessages(displayContext.messages);
-		this.#rehydrateCheckpointRewindState();
-		this.#resetAdvisorSessionState();
-		this.#syncTodoPhasesFromBranch();
-		this.#closeCodexProviderSessionsForHistoryRewrite();
+		const stateContext = await this.#reloadAgentStateFromCurrentBranch();
 
 		this.#branchSummaryAbortController = undefined;
 

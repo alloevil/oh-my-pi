@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed MCP OAuth dynamic client registration omitting discovered scopes on the RFC 7591 registration body. Providers such as Clerk bind DCR-created clients to only the scopes declared at registration, then reject the subsequent authorize request when it asks for `openid` (from `scopes_supported`). Registration now includes `config.scopes` when present, matching Claude Code and the scopes already sent on authorize.
+- Fixed OAuth-backed provider sessions rendering the billing marker as `(sub)` in the status line and footer, and kept auto-learn capture turns from moving the active `/tree` leaf onto the synthetic capture branch. ([#5112](https://github.com/can1357/oh-my-pi/issues/5112))
 
 ## [16.4.0] - 2026-07-10
 

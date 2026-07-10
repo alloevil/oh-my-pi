@@ -173,14 +173,14 @@ export class FooterComponent implements Component {
 		if (totalCacheRead) statsParts.push(`R${formatNumber(totalCacheRead)}`);
 		if (totalCacheWrite) statsParts.push(`W${formatNumber(totalCacheWrite)}`);
 
-		// Show billing summary with subscription and premium-request indicators
-		const usingSubscription = state.model ? this.session.modelRegistry.isUsingOAuth(state.model) : false;
+		// Show billing summary with OAuth and premium-request indicators.
+		const usingOAuthBilling = state.model ? this.session.modelRegistry.isUsingOAuth(state.model) : false;
 		const normalizedPremiumRequests = Math.round((totalPremiumRequests + Number.EPSILON) * 100) / 100;
-		if (totalCost || usingSubscription || normalizedPremiumRequests) {
+		if (totalCost || usingOAuthBilling || normalizedPremiumRequests) {
 			const billingParts: string[] = [];
 			if (totalCost) billingParts.push(`$${totalCost.toFixed(3)}`);
 			if (normalizedPremiumRequests) billingParts.push(`★ ${formatNumber(normalizedPremiumRequests)}`);
-			if (usingSubscription) billingParts.push("(sub)");
+			if (usingOAuthBilling) billingParts.push("(oauth)");
 			if (billingParts.length > 0) statsParts.push(billingParts.join(" "));
 		}
 

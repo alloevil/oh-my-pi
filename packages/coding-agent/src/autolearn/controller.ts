@@ -117,6 +117,7 @@ export class AutoLearnController {
 		if (!autoContinue) return;
 
 		const content = AUTOLEARN_NUDGE_AUTOCONTINUE;
+		const restoreLeafId = this.#session.sessionManager.getLeafId();
 		// Arm suppression synchronously: the synthetic capture turn's agent_end
 		// fires inside sendCustomMessage (before it resolves), so the flag must be
 		// set before then. Disarm when no turn actually started — a deferred/queued
@@ -134,8 +135,12 @@ export class AutoLearnController {
 				},
 				{ deliverAs: "nextTurn", triggerTurn: true },
 			)
-			.then(started => {
-				if (!started) this.#suppressNext = false;
+			.then(async started => {
+				if (!started) {
+					this.#suppressNext = false;
+					return;
+				}
+				await this.#session.restoreLeafAfterInternalTurn(restoreLeafId);
 			})
 			.catch(err => {
 				this.#suppressNext = false;

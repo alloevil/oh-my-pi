@@ -11,13 +11,18 @@ interface CapturedNudge {
 class FakeSession {
 	readonly listeners: Array<(event: AgentSessionEvent) => void> = [];
 	readonly sent: CapturedNudge[] = [];
+	readonly restoredLeafIds: Array<string | null> = [];
+	leafId: string | null = "leaf-before-autolearn";
+	internalTurnLeafId: string | null = "leaf-during-autolearn";
+	readonly sessionManager = {
+		getLeafId: (): string | null => this.leafId,
+	};
 	planEnabled = false;
 	goalEnabled = false;
 	/** Whether a triggerTurn dispatch actually starts a synthetic turn. */
 	turnStarts = true;
 	/** Force the dispatch to reject (models a failed send). */
 	failSend = false;
-
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
 		this.listeners.push(listener);
 		return () => {};
@@ -27,7 +32,14 @@ class FakeSession {
 		if (this.failSend) throw new Error("send failed");
 		this.sent.push({ message, options });
 		// Mirror AgentSession: a turn starts only when triggerTurn is honored.
-		return options?.triggerTurn === true && this.turnStarts;
+		const started = options?.triggerTurn === true && this.turnStarts;
+		if (started) this.leafId = this.internalTurnLeafId;
+		return started;
+	}
+
+	async restoreLeafAfterInternalTurn(leafId: string | null): Promise<void> {
+		this.restoredLeafIds.push(leafId);
+		this.leafId = leafId;
 	}
 
 	getPlanModeState(): { enabled: boolean } | undefined {
@@ -211,6 +223,22 @@ describe("AutoLearnController", () => {
 		expect(session.sent).toHaveLength(2);
 	});
 
+	it("restores the previous active leaf after a started auto-continue capture turn", async () => {
+		const session = new FakeSession();
+		session.leafId = "leaf-original";
+		session.internalTurnLeafId = "leaf-capture";
+		install(session, { "autolearn.autoContinue": true });
+
+		session.toolCalls(5);
+		session.agentEnd();
+		await Promise.resolve();
+
+		expect(session.sent).toHaveLength(1);
+		expect(session.sent[0]?.options?.triggerTurn).toBe(true);
+		expect(session.restoredLeafIds).toEqual(["leaf-original"]);
+		expect(session.leafId).toBe("leaf-original");
+	});
+
 	it("disarms suppression when the capture turn is deferred (not started)", async () => {
 		const session = new FakeSession();
 		// triggerTurn honored but downgraded to a queue: no synthetic agent_end.
@@ -221,6 +249,7 @@ describe("AutoLearnController", () => {
 		expect(session.sent).toHaveLength(1);
 		expect(session.sent[0]?.options?.triggerTurn).toBe(true);
 		await Bun.sleep(1); // flush the async disarm
+		expect(session.restoredLeafIds).toEqual([]);
 		// No turn ran, so the next real stop must still nudge.
 		session.toolCalls(5);
 		session.agentEnd();
@@ -235,6 +264,7 @@ describe("AutoLearnController", () => {
 		session.agentEnd(); // dispatch rejects: armed, then disarmed in .catch
 		expect(session.sent).toHaveLength(0);
 		await Bun.sleep(1); // flush the async disarm
+		expect(session.restoredLeafIds).toEqual([]);
 		session.failSend = false;
 		session.toolCalls(5);
 		session.agentEnd();
