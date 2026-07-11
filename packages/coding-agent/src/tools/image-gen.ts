@@ -552,27 +552,44 @@ async function findImageApiKey(
 	activeModel?: Model,
 	sessionId?: string,
 ): Promise<ImageApiKey | null> {
-	// If a specific provider is preferred, try it first.
+	// If a specific provider is preferred, try it — and fail loudly if unavailable
+	// so the user is never silently routed to a different provider.
 	if (preferredImageProvider === "openai") {
 		const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
 		if (openAI) return openAI;
-		// Fall through to auto-detect if preferred provider key not found.
+		throw new Error(
+			`providers.image is set to "openai" but no eligible OpenAI image model was found. ` +
+			`The active session model must be a GPT or o3 Responses model (e.g. gpt-4o, o3) with valid OpenAI credentials. ` +
+			`Switch to a compatible model, or change providers.image to "auto" to allow automatic provider selection.`,
+		);
 	} else if (preferredImageProvider === "antigravity" && modelRegistry) {
 		const antigravity = await findAntigravityCredentials(modelRegistry, sessionId);
 		if (antigravity) return antigravity;
-		// Fall through to auto-detect if preferred provider key not found.
+		throw new Error(
+			`providers.image is set to "antigravity" but no Antigravity credentials were found. ` +
+			`Log in with google-antigravity OAuth, or change providers.image to "auto" to allow automatic provider selection.`,
+		);
 	} else if (preferredImageProvider === "gemini") {
 		const gemini = await findGeminiImageCredentials(modelRegistry, sessionId);
 		if (gemini) return gemini;
-		// Fall through to auto-detect if preferred provider key not found.
+		throw new Error(
+			`providers.image is set to "gemini" but no Gemini/Google credentials were found. ` +
+			`Set GEMINI_API_KEY or GOOGLE_API_KEY, or change providers.image to "auto" to allow automatic provider selection.`,
+		);
 	} else if (preferredImageProvider === "openrouter") {
 		const openRouter = await findOpenRouterImageCredentials(modelRegistry, sessionId);
 		if (openRouter) return openRouter;
-		// Fall through to auto-detect if preferred provider key not found.
+		throw new Error(
+			`providers.image is set to "openrouter" but no OpenRouter credentials were found. ` +
+			`Set OPENROUTER_API_KEY, or change providers.image to "auto" to allow automatic provider selection.`,
+		);
 	} else if (preferredImageProvider === "xai") {
 		const xai = await findXAIImageCredentials(modelRegistry);
 		if (xai) return xai;
-		// Fall through to auto-detect if preferred provider key not found.
+		throw new Error(
+			`providers.image is set to "xai" but no xAI credentials were found. ` +
+			`Log in with xAI Grok OAuth or set XAI_API_KEY, or change providers.image to "auto" to allow automatic provider selection.`,
+		);
 	}
 
 	// Auto-detect: GPT hosted image generation, then Antigravity, xAI, OpenRouter, Gemini.
