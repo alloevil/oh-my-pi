@@ -115,14 +115,44 @@ function isFreeInGrid(grid: Map<string, AsciiNode>, c: GridCoord): boolean {
 }
 
 /**
+ * Compute the bounding box of all occupied cells in the grid,
+ * extended by `margin` cells in each direction.
+ */
+function getGridBounds(grid: Map<string, AsciiNode>, margin: number): { maxX: number; maxY: number } {
+  let maxX = 0
+  let maxY = 0
+  for (const key of grid.keys()) {
+    const [xStr, yStr] = key.split(',')
+    const x = Number(xStr)
+    const y = Number(yStr)
+    if (x > maxX) maxX = x
+    if (y > maxY) maxY = y
+  }
+  return { maxX: maxX + margin, maxY: maxY + margin }
+}
+
+/**
  * Find a path from `from` to `to` on the grid using A*.
  * Returns the path as an array of GridCoords, or null if no path exists.
+ *
+ * The search is bounded by:
+ * - Grid extents: coordinates beyond the occupied grid + margin are rejected.
+ * - Expansion budget: a hard cap on the number of dequeued nodes, proportional
+ *   to grid area, prevents runaway CPU/memory when the destination is unreachable.
  */
 export function getPath(
   grid: Map<string, AsciiNode>,
   from: GridCoord,
   to: GridCoord,
 ): GridCoord[] | null {
+  // Compute dynamic bounds from the grid
+  const { maxX, maxY } = getGridBounds(grid, 5)
+
+  // Expansion budget: at most the area of the bounding rectangle.
+  // For typical diagrams (~100x100) this is 10k — more than enough for any valid path.
+  // For unreachable destinations this caps the search before it causes harm.
+  const maxExpansions = (maxX + 1) * (maxY + 1)
+
   const pq = new MinHeap()
   pq.push({ coord: from, priority: 0 })
 
@@ -132,8 +162,16 @@ export function getPath(
   const cameFrom = new Map<string, GridCoord | null>()
   cameFrom.set(gridKey(from), null)
 
+  let expansions = 0
+
   while (pq.length > 0) {
+    // Guard: too many expansions means destination is likely unreachable
+    if (expansions >= maxExpansions) {
+      return null
+    }
+
     const current = pq.pop()!.coord
+    expansions++
 
     if (gridCoordEquals(current, to)) {
       // Reconstruct path by walking backwards through cameFrom
@@ -150,6 +188,11 @@ export function getPath(
 
     for (const dir of MOVE_DIRS) {
       const next: GridCoord = { x: current.x + dir.x, y: current.y + dir.y }
+
+      // Reject coordinates outside the bounded grid area
+      if (next.x > maxX || next.y > maxY) {
+        continue
+      }
 
       // Allow moving to the destination even if it's occupied (it's a node boundary)
       if (!isFreeInGrid(grid, next) && !gridCoordEquals(next, to)) {
@@ -193,17 +236,6 @@ export function mergePath(path: GridCoord[]): GridCoord[] {
 
     // Same direction — the middle point is redundant
     if (prevDx === dx && prevDy === dy) {
-      // In Go: indexToRemove = append(indexToRemove, idx+1) but idx is 0-based from path[2:]
-      // which corresponds to index idx in the full path. Go uses idx+1 because idx iterates
-      // from 0 in the [2:] slice, mapping to full-array index idx+1.
-      // Actually re-checking Go code: the loop is `for idx, step2 := range path[2:]`
-      // so idx=0 → path[2], and it removes idx+1 which is index 1 in the full array.
-      // Wait, that doesn't look right. Let me re-read:
-      //   step0 = path[0], step1 = path[1]
-      //   for idx, step2 := range path[2:] { ... indexToRemove = append(indexToRemove, idx+1) ... }
-      //   When idx=0, step2=path[2], and it removes index 1 (step1 = path[1]) if directions match
-      // So it removes the middle point (step1) which is at index idx+1 in the original array
-      // when counting from the 2-ahead loop. Let me just track which middle indices to remove.
       toRemove.add(idx - 1) // Remove the middle point (step1's position)
     }
 
