@@ -85,7 +85,8 @@ function quoteShellArg(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 function quoteCmdArg(value: string): string {
-	return `"${value.replaceAll('"', '""')}"`;
+	if (/[ \t"]/.test(value)) return `"${value.replaceAll('"', '""')}"`;
+	return value;
 }
 
 function terminalState(state: DaemonSnapshot["state"]): boolean {
