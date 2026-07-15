@@ -236,6 +236,10 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 			exit(value);
 		}
 	}
+	// Normalize JSON Schema draft 6+ boolean schemas to object equivalents.
+	// Providers like Google CCA reject bare booleans on the wire.
+	if (value === true) return {};
+	if (value === false) return { not: {} };
 	if (!isJsonObject(value)) {
 		return value;
 	}
