@@ -151,3 +151,14 @@ PR [#6798](https://github.com/can1357/oh-my-pi/pull/6798)
 5. 方法论修正：单跑不作数，每格 ≥3 跑；评测集需人工复核歧义标签；错例驱动补 summary 是收敛回路。
 
 当前共 5 条 summary（lark-base、lark-drive、lark-sheets、lark-slides、lark-workflow-meeting-summary），brief 列表 1900 字符 vs full 6041。
+
+## 决策记录：放弃 skill 描述预算功能（2026-07-27）
+
+**决定**：从 PR #6793 中移除 `skills.promptDescriptionMaxChars`、`skills.promptDescriptionMode`、frontmatter `summary` 及全部渲染路径；本地 26 个 skill 的实验性 summary 已回滚，配置已复位。
+
+**依据**（评测数据支撑）：
+1. 判别性与简洁互斥：给全部 26 个 skill 生成判别性 summary（含排除规则）后，brief prompt 从 16.2k 涨回 17.3k 字符，节省缩水到 -14%，逼近 cap 方案，收益天花板低。
+2. 质量维护成本按 skill 线性增长：弱模型评测每暴露一个近邻混淆就要手调一条 summary；这份元数据的正确归属是 skill 作者，不是 harness。
+3. 保留项：MCP 去重（#6786）和 `tools.xdevTopLevelDevices`（PR #6793，已改题）；路由评测方法论（弱模型探针 + 真实上下文 + 噪声对照）保留为通用工具，未来评估任何 prompt 变更可复用。
+
+**教训**：先测成本侧（-20.7% 很诱人）容易高估功能价值；质量侧代价（判别线索丢失）只有弱模型 + 真实上下文才暴露，而修复该代价的成本（按 skill 手工维护）正是功能不成立的原因。
