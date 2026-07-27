@@ -28,6 +28,16 @@ CJK 约 1 字符 ≈ 1 token，即每次请求省约 2-3k token；子代理各�
 
 > 把本地 HTML 文件或目录部署到飞书妙搭（Miaoda），生成一个公网可访问的应用及其链接（URL）。当用户要创建 HTML 或要把 HTML、静态网站或 Web demo 发布成公网可访问的链接 /…
 
+**追加（同日）— brief 模式**：新增 `skills.promptDescriptionMode: "brief"`（渲染 frontmatter `summary`，无则取描述首句）+ skill frontmatter `summary` 字段。同一环境对照：
+
+| 模式 | system prompt 字符 | 相对全文 |
+|---|---|---|
+| full / 不截断 | 20436 | — |
+| full / cap 120 | 17226 | -15.7% |
+| **brief** | **16203** | **-20.7%** |
+
+brief 优于纯 cap 且切割语义更干净（首句即作者的路由主句，无列举中断）。cap 可叠加在 brief 之上。
+
 ### 改动 1：MCP 去重
 
 - 设备清单减少 2 条重复路由（`mcp__context_context_query_docs` / `mcp__context_context_resolve_library_id`），实际会话对比确认消失。
@@ -77,11 +87,19 @@ cd packages/coding-agent && bun test test/mcp-mount-dedupe.test.ts test/prompt-b
 
 ## 待办优化池
 
+~~3. natives napi 构建封装吞 stderr~~ ✅ 已修：错误现带 exit code + stderr/stdout 截尾段。
+issue [#6796](https://github.com/can1357/oh-my-pi/issues/6796)、PR [#6797](https://github.com/can1357/oh-my-pi/pull/6797)
+
+~~4. `check:rs` 在干净 checkout 上即红~~ ✅ 已修：pinned rustfmt 重排 `crates/vendor/uu-sort`。
+PR [#6798](https://github.com/can1357/oh-my-pi/pull/6798)
+
+~~5. skill 语义路由（过渡态）~~ ✅ 已做 brief 模式 + `summary` frontmatter（并入 PR [#6793](https://github.com/can1357/oh-my-pi/pull/6793)）。完整语义路由（意图命中才展开）仍开放。
+
+仍开放：
+
 1. `sanitizeMCPToolNamePart` 剥数字（`context7`→`context`）— 有损折叠的另一半根源，改动需迁移考量
 2. `disabledServers` 缺 CLI（应有 `omp mcp list/disable/enable`）
-3. natives napi 构建封装吞 stderr（裸 cargo 成功、封装只报 "napi build failed"）
-4. `check:rs` 在干净 checkout 上即红（rustfmt 漂移进主干）
-5. skill 语义路由（一行摘要 + 意图命中才展开；字符 cap 是过渡态）
-6. 子代理并发编辑合并 diff 可见性
-7. 多文件事务性 edit（原子提交/回滚）
-8. verify 原语（把 smoke test 从纪律变机制）
+3. skill 完整语义路由（一行摘要常驻 + 意图匹配命中才展开全文）
+4. 子代理并发编辑合并 diff 可见性
+5. 多文件事务性 edit（原子提交/回滚）
+6. verify 原语（把 smoke test 从纪律变机制）
