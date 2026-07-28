@@ -1,0 +1,34 @@
+{
+	"status": "ok",
+	"model": "anthropic/claude-haiku-4-5",
+	"tasks": [
+		"access-remove-optional-chain-001",
+		"call-swap-call-args-001",
+		"duplicate-duplicate-line-flip-001",
+		"identifier-identifier-multi-edit-001",
+		"import-swap-named-imports-001",
+		"literal-flip-boolean-001",
+		"literal-off-by-one-001",
+		"operator-remove-negation-001",
+		"operator-swap-comparison-001",
+		"regex-swap-regex-quantifier-001",
+		"structural-swap-if-else-001",
+		"unicode-unicode-hyphen-001"
+	],
+	"passed": 12,
+	"perTask": {
+		"access-remove-optional-chain-001": true,
+		"call-swap-call-args-001": true,
+		"duplicate-duplicate-line-flip-001": true,
+		"identifier-identifier-multi-edit-001": true,
+		"import-swap-named-imports-001": true,
+		"literal-flip-boolean-001": true,
+		"literal-off-by-one-001": true,
+		"operator-remove-negation-001": true,
+		"operator-swap-comparison-001": true,
+		"regex-swap-regex-quantifier-001": true,
+		"structural-swap-if-else-001": true,
+		"unicode-unicode-hyphen-001": true
+	},
+	"generatedAt": "2026-07-28T07:04:43.187Z"
+}

@@ -4,7 +4,7 @@
  * deliberately weak router model on fixed synthetic fixtures.
  *
  * For each fixture query the router model receives the full system prompt
- * (built via buildSystemPrompt with the 12 synthetic skills under
+ * (built via buildSystemPrompt with the 16 synthetic skills under
  * fixtures/skills/) and is asked which skill it reads first. Top-1 accuracy
  * averaged over REPEATS runs is compared against baseline.json; a drop of
  * more than CANARY_TOLERANCE percentage points exits non-zero.
@@ -22,12 +22,12 @@
  */
 
 import * as path from "node:path";
-import { type Api, AuthStorage, completeSimple, type Model, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { type Api, completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { discoverAuthStorage, ModelRegistry } from "@oh-my-pi/pi-coding-agent";
 import { loadSkillsFromDir } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import type { WorkspaceTree } from "@oh-my-pi/pi-coding-agent/workspace-tree";
-import { getAgentDbPath } from "@oh-my-pi/pi-utils";
 
 const CANARY_DIR = path.dirname(Bun.fileURLToPath(import.meta.url));
 const FIXTURE_SKILLS_DIR = path.join(CANARY_DIR, "fixtures", "skills");
@@ -94,23 +94,28 @@ async function openRouter(spec: string): Promise<Router | undefined> {
 	if (slash <= 0) throw new Error(`CANARY_MODEL must be <provider>/<model-id>, got "${spec}"`);
 	const provider = spec.slice(0, slash);
 	const modelId = spec.slice(slash + 1);
-	const bundled = getBundledModel(provider as GeneratedProvider, modelId);
-	if (!bundled) throw new Error(`unknown model "${spec}" (not in the bundled catalog)`);
 	const baseUrl = Bun.env.CANARY_BASE_URL?.trim();
-	const model = baseUrl ? { ...bundled, baseUrl } : bundled;
-	let apiKey = Bun.env.CANARY_API_KEY?.trim();
-	if (!apiKey) {
-		try {
-			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
-			const storage = new AuthStorage(store);
-			await storage.reload();
-			apiKey = await storage.getApiKey(provider);
-		} catch {
-			apiKey = undefined;
-		}
+	const envKey = Bun.env.CANARY_API_KEY?.trim();
+	if (envKey) {
+		const bundled = getBundledModel(provider as GeneratedProvider, modelId);
+		if (!bundled) throw new Error(`unknown model "${spec}" (not in the bundled catalog)`);
+		return { spec, model: baseUrl ? { ...bundled, baseUrl } : bundled, apiKey: envKey };
 	}
-	if (!apiKey) return undefined;
-	return { spec, model, apiKey };
+	// Same resolution the interactive CLI uses: honors models.yml provider
+	// overrides (broker baseUrl + broker API key), OAuth credentials, and
+	// provider env vars — not just raw stored api_keys.
+	try {
+		const storage = await discoverAuthStorage();
+		const registry = new ModelRegistry(storage);
+		const available = await registry.getAvailable();
+		const model = available.find(entry => entry.provider === provider && entry.id === modelId);
+		if (!model) return undefined;
+		const apiKey = await registry.getApiKey(model);
+		if (!apiKey) return undefined;
+		return { spec, model: baseUrl ? { ...model, baseUrl } : model, apiKey };
+	} catch {
+		return undefined;
+	}
 }
 
 /** Earliest whole-match of any fixture skill name inside the model's reply. */
@@ -217,7 +222,7 @@ async function main(): Promise<number> {
 		totalLines: 0,
 		agentsMdFiles: [],
 	};
-	const { systemPrompt } = await buildSystemPrompt({
+	const { systemPrompt: renderedPrompt } = await buildSystemPrompt({
 		cwd: CANARY_DIR,
 		contextFiles: [],
 		skills,
@@ -226,6 +231,9 @@ async function main(): Promise<number> {
 		activeRepoContext: null,
 		model: modelSpec,
 	});
+	// Sanity switch: NULL_PROMPT=true guts the rendered prompt so a maximally
+	// degraded prompt provably scores ~0% and fails against the baseline.
+	const systemPrompt = Bun.env.NULL_PROMPT === "true" ? ["You are a helpful assistant."] : renderedPrompt;
 
 	console.log(`canary-eval: model=${modelSpec} queries=${queries.length} repeats=${repeats} tolerance=${tolerance}pp`);
 

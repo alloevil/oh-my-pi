@@ -1,11 +1,13 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
+	classifyProviderErrorTurn,
 	detectDuplicateDeviceRoutes,
 	detectPromptSizeJump,
 	detectSilentModelSwitch,
 	formatHealthBadge,
 	formatSessionEndHealthSummary,
 	HEALTH_RULES,
+	providerErrorSeverity,
 	recordHealthFinding,
 } from "@oh-my-pi/pi-coding-agent/health/guards";
 import { HealthLedger } from "@oh-my-pi/pi-coding-agent/health/ledger";
@@ -180,6 +182,45 @@ describe("recordHealthFinding deferred warn notice", () => {
 		});
 		expect(ledger.drainNotices()).toEqual([]);
 		expect(ledger.counts()).toEqual({ info: 1, warn: 0 });
+	});
+});
+
+describe("provider-error turn classification", () => {
+	it("counts an explicit error stop", () => {
+		expect(classifyProviderErrorTurn({ stopReason: "error" })).toBe(true);
+	});
+
+	it("counts any turn carrying an errorMessage", () => {
+		expect(
+			classifyProviderErrorTurn({
+				stopReason: "stop",
+				errorMessage: "Anthropic stream stalled while waiting for the next event",
+			}),
+		).toBe(true);
+		expect(classifyProviderErrorTurn({ errorMessage: "boom" })).toBe(true);
+	});
+
+	it("excludes user aborts even when they carry an errorMessage", () => {
+		expect(classifyProviderErrorTurn({ stopReason: "aborted", errorMessage: "Interrupted by user" })).toBe(false);
+		expect(classifyProviderErrorTurn({ stopReason: "aborted" })).toBe(false);
+	});
+
+	it("passes normal terminal turns", () => {
+		expect(classifyProviderErrorTurn({ stopReason: "stop" })).toBe(false);
+		expect(classifyProviderErrorTurn({ stopReason: "toolUse" })).toBe(false);
+		expect(classifyProviderErrorTurn({})).toBe(false);
+	});
+});
+
+describe("provider-error severity escalation", () => {
+	it("stays info for the first two errors in a session", () => {
+		expect(providerErrorSeverity(1)).toBe("info");
+		expect(providerErrorSeverity(2)).toBe("info");
+	});
+
+	it("escalates to warn from the third error onward", () => {
+		expect(providerErrorSeverity(3)).toBe("warn");
+		expect(providerErrorSeverity(4)).toBe("warn");
 	});
 });
 

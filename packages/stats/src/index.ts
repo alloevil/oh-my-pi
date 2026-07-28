@@ -25,6 +25,7 @@ export {
 	type HealthSignalStat,
 	hasNonEmptyIntent,
 	type IntentFill,
+	isProviderErrorTurn,
 	REPEAT_READ_THRESHOLD,
 	REPEAT_READ_WINDOW,
 	VALIDATION_FAILURE_PREFIX,

@@ -3790,6 +3790,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Diagnostics
+
+	// Per-request outbound payload summaries (system-prompt section sizes,
+	// message/tool counts) persisted to the session file for
+	// `omp doctor --outbound`. Pure string-length math on the request path —
+	// overhead is one regex scan of the system prompt plus length sums, so it
+	// defaults on. Config-file only (no UI).
+	"debug.outboundSummaries": {
+		type: "boolean",
+		default: true,
+	},
+
 	// Optional tools
 
 	"debug.enabled": {

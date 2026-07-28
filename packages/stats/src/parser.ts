@@ -16,6 +16,7 @@ import {
 	countRepeatReads,
 	type HealthSignalStat,
 	type IntentFill,
+	isProviderErrorTurn,
 	VALIDATION_FAILURE_PREFIX,
 } from "./health-signals";
 import type {
@@ -372,11 +373,17 @@ function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSig
 	let intentFill: IntentFill = { filled: 0, total: 0 };
 	let validationFailures = 0;
 	let editRejections = 0;
+	let providerErrorTurns = 0;
 	let timestamp = 0;
 
 	visitSessionEntriesLenient(bytes, entry => {
 		if (isAssistantMessage(entry)) {
 			const msg = entry.message as AssistantMessage;
+			if (isProviderErrorTurn(msg)) {
+				providerErrorTurns++;
+				const ts = coerceEntryTimestamp(msg.timestamp, entry);
+				if (ts > timestamp) timestamp = ts;
+			}
 			if (!Array.isArray(msg.content)) return;
 			for (const rawBlock of msg.content) {
 				if (!rawBlock || typeof rawBlock !== "object" || rawBlock.type !== "toolCall") continue;
@@ -424,13 +431,14 @@ function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSig
 		}
 	});
 
-	if (intentFill.total === 0) return [];
+	if (intentFill.total === 0 && providerErrorTurns === 0) return [];
 	return [
 		{ sessionFile, timestamp, signal: "tool_arg_validation_failures", value: validationFailures },
 		{ sessionFile, timestamp, signal: "edit_rejections", value: editRejections },
 		{ sessionFile, timestamp, signal: "repeat_reads", value: countRepeatReads(readKeys) },
 		{ sessionFile, timestamp, signal: "intent_filled_calls", value: intentFill.filled },
 		{ sessionFile, timestamp, signal: "intent_total_calls", value: intentFill.total },
+		{ sessionFile, timestamp, signal: "provider_error_turns", value: providerErrorTurns },
 	];
 }
 /**

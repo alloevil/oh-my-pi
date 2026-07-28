@@ -32,6 +32,8 @@ export interface InProcessClientOptions {
 	editFuzzyThreshold?: number | "auto";
 	/** Shared infra (pass to avoid re-discovery per task) */
 	shared?: SharedInfra;
+	/** Unique agent identity; concurrent sessions collide on the default "Main" registration */
+	agentId?: string;
 }
 
 /** Shared infrastructure that can be reused across tasks. */
@@ -93,6 +95,7 @@ export class InProcessClient {
 
 		const result = await createAgentSession({
 			cwd: this.#options.cwd,
+			agentId: this.#options.agentId,
 			modelPattern: this.#options.model,
 			authStorage: shared?.authStorage,
 			modelRegistry: shared?.modelRegistry,
