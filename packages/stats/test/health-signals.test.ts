@@ -92,6 +92,10 @@ function buildToolResultEntry(
 	};
 }
 
+function buildStageTimingEntry(entryId: string, timestamp: string, data: unknown) {
+	return { type: "custom", customType: "stage_timings", data, id: entryId, parentId: null, timestamp };
+}
+
 async function writeSessionFile(fileName: string, entries: unknown[]): Promise<string> {
 	const sessionDir = path.join(getSessionsDir(), FOLDER_SLUG);
 	await fs.mkdir(sessionDir, { recursive: true });
@@ -228,5 +232,65 @@ describe("health signals pipeline", () => {
 		const rows = await readHealthSignals(sessionFile);
 		expect(signalValue(rows, "provider_error_turns")).toBe(1);
 		expect(signalValue(rows, "intent_total_calls")).toBe(0);
+	});
+
+	it("folds stage_timings entries into per-session stage percentile signals", async () => {
+		const sessionFile = await writeSessionFile("session-stages.jsonl", [
+			buildAssistantEntry("asst-1", TS1, [
+				{ id: "call-1", name: "read", arguments: { i: "Reading foo", path: "src/foo.ts" } },
+			]),
+			buildToolResultEntry("tr-1", "asst-1", TS1, "call-1", "1:export const foo = 1;"),
+			buildStageTimingEntry("stage-1", TS1, {
+				ts: Date.parse(TS1),
+				turnMs: 1200,
+				context: { transformMs: 10, promptChars: 40_000 },
+				provider: { ttfbMs: 100, streamMs: 1000 },
+				tools: [{ name: "read", ms: 40 }],
+			}),
+			buildStageTimingEntry("stage-2", TS2, {
+				ts: Date.parse(TS2),
+				turnMs: 4300,
+				context: { transformMs: 30 },
+				provider: { ttfbMs: 300, streamMs: 3000 },
+				tools: [
+					{ name: "bash", ms: 900, error: true },
+					{ name: "edit", ms: 60, error: true },
+				],
+			}),
+			// Malformed payload must be skipped, not crash the fold.
+			buildStageTimingEntry("stage-bad", TS2, { nonsense: true }),
+		]);
+		await syncAllSessions({ workers: 1 });
+
+		const rows = await readHealthSignals(sessionFile);
+		// 6 behavioral counters (the read call fills intent) + 4 stage signals.
+		expect(rows).toHaveLength(10);
+		// Nearest-rank p95 over two samples is the larger one.
+		expect(signalValue(rows, "stage_context_transform_p95_ms")).toBe(30);
+		expect(signalValue(rows, "stage_provider_ttfb_p95_ms")).toBe(300);
+		expect(signalValue(rows, "stage_provider_stream_p95_ms")).toBe(3000);
+		// Two failed tool calls in one turn count that turn once.
+		expect(signalValue(rows, "stage_tool_error_turns")).toBe(1);
+		const stageRow = rows.find(r => r.signal === "stage_provider_ttfb_p95_ms");
+		expect(stageRow?.timestamp).toBe(Date.parse(TS2));
+	});
+
+	it("emits stage signals for a session with stage timings but no tool calls", async () => {
+		const sessionFile = await writeSessionFile("session-stages-only.jsonl", [
+			buildStageTimingEntry("stage-1", TS1, {
+				ts: Date.parse(TS1),
+				turnMs: 900,
+				provider: { ttfbMs: 250, streamMs: 600 },
+			}),
+		]);
+		await syncAllSessions({ workers: 1 });
+
+		const rows = await readHealthSignals(sessionFile);
+		expect(rows).toHaveLength(4);
+		expect(signalValue(rows, "stage_provider_ttfb_p95_ms")).toBe(250);
+		expect(signalValue(rows, "stage_provider_stream_p95_ms")).toBe(600);
+		// No context samples recorded → percentile collapses to 0.
+		expect(signalValue(rows, "stage_context_transform_p95_ms")).toBe(0);
+		expect(signalValue(rows, "stage_tool_error_turns")).toBe(0);
 	});
 });
