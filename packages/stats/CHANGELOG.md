@@ -6,6 +6,7 @@
 
 - Added a `health_signals` table plus `readHealthSignals(sessionFile)` recording per-session behavioral counters (tool-arg validation failures, edit rejections, sliding-window repeat reads, intent-fill numerator/denominator). Counters are recomputed as absolute totals from the full transcript on each sync pass and upserted per `(session_file, signal)`, keeping incremental re-syncs idempotent.
 - Added a `provider_error_turns` health signal counting assistant turns that failed on the provider side (`error` stop reason or a recorded `errorMessage`, excluding user aborts). Sessions with provider errors but no tool calls now emit health-signal rows too.
+- Added stage-timing aggregates to `health_signals`: sessions carrying the coding-agent's per-turn `stage_timings` entries now record `stage_context_transform_p95_ms`, `stage_provider_ttfb_p95_ms`, `stage_provider_stream_p95_ms` (nearest-rank p95, integer ms) and `stage_tool_error_turns` (turns with at least one failed tool call), computed in the same full-file fold as the behavioral counters and idempotent under incremental re-sync.
 
 ## [17.1.2] - 2026-07-24
 

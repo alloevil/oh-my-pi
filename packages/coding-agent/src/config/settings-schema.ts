@@ -3802,6 +3802,16 @@ export const SETTINGS_SCHEMA = {
 		default: true,
 	},
 
+	// Per-turn pipeline stage timings (context transform, provider ttfb/stream,
+	// per-tool execution) persisted to the session file for
+	// `omp doctor --stages`. Overhead is a handful of Date.now() reads and one
+	// ~200-byte custom entry per assistant turn, so it defaults on. Config-file
+	// only (no UI).
+	"debug.stageTimings": {
+		type: "boolean",
+		default: true,
+	},
+
 	// Optional tools
 
 	"debug.enabled": {

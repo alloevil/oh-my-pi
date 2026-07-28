@@ -21,11 +21,18 @@ export default class Doctor extends Command {
 			description:
 				"Show recent outbound provider-request summaries (what the model actually saw) with per-request diffs",
 		}),
+		stages: Flags.boolean({
+			description:
+				"Show per-turn pipeline stage timings (context transform, provider ttfb/stream, tool execution) with the slowest turns",
+		}),
 	};
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Doctor);
-		const cmd: DoctorCommandArgs = { session: args.session, flags: { json: flags.json, outbound: flags.outbound } };
+		const cmd: DoctorCommandArgs = {
+			session: args.session,
+			flags: { json: flags.json, outbound: flags.outbound, stages: flags.stages },
+		};
 		try {
 			await runDoctorCommand(cmd);
 		} catch (error) {

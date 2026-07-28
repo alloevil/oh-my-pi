@@ -13,10 +13,14 @@ import {
 import { getSessionsDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
 import {
 	accumulateIntentFill,
+	accumulateStageTimings,
 	countRepeatReads,
 	type HealthSignalStat,
 	type IntentFill,
 	isProviderErrorTurn,
+	nearestRankPercentile,
+	STAGE_TIMINGS_CUSTOM_TYPE,
+	type StageTimingSamples,
 	VALIDATION_FAILURE_PREFIX,
 } from "./health-signals";
 import type {
@@ -375,6 +379,14 @@ function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSig
 	let editRejections = 0;
 	let providerErrorTurns = 0;
 	let timestamp = 0;
+	const stage: StageTimingSamples = {
+		transformMs: [],
+		ttfbMs: [],
+		streamMs: [],
+		toolErrorTurns: 0,
+		rows: 0,
+		timestamp: 0,
+	};
 
 	visitSessionEntriesLenient(bytes, entry => {
 		if (isAssistantMessage(entry)) {
@@ -429,17 +441,52 @@ function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSig
 			if (text.startsWith(VALIDATION_FAILURE_PREFIX)) validationFailures++;
 			else if (editCallIds.has(msg.toolCallId)) editRejections++;
 		}
+		if (entry.type === "custom") {
+			const custom = entry as { customType?: unknown; data?: unknown };
+			if (custom.customType === STAGE_TIMINGS_CUSTOM_TYPE) accumulateStageTimings(stage, custom.data);
+		}
 	});
 
-	if (intentFill.total === 0 && providerErrorTurns === 0) return [];
-	return [
-		{ sessionFile, timestamp, signal: "tool_arg_validation_failures", value: validationFailures },
-		{ sessionFile, timestamp, signal: "edit_rejections", value: editRejections },
-		{ sessionFile, timestamp, signal: "repeat_reads", value: countRepeatReads(readKeys) },
-		{ sessionFile, timestamp, signal: "intent_filled_calls", value: intentFill.filled },
-		{ sessionFile, timestamp, signal: "intent_total_calls", value: intentFill.total },
-		{ sessionFile, timestamp, signal: "provider_error_turns", value: providerErrorTurns },
-	];
+	const signals: HealthSignalStat[] = [];
+	if (intentFill.total > 0 || providerErrorTurns > 0) {
+		signals.push(
+			{ sessionFile, timestamp, signal: "tool_arg_validation_failures", value: validationFailures },
+			{ sessionFile, timestamp, signal: "edit_rejections", value: editRejections },
+			{ sessionFile, timestamp, signal: "repeat_reads", value: countRepeatReads(readKeys) },
+			{ sessionFile, timestamp, signal: "intent_filled_calls", value: intentFill.filled },
+			{ sessionFile, timestamp, signal: "intent_total_calls", value: intentFill.total },
+			{ sessionFile, timestamp, signal: "provider_error_turns", value: providerErrorTurns },
+		);
+	}
+	if (stage.rows > 0) {
+		signals.push(
+			{
+				sessionFile,
+				timestamp: stage.timestamp,
+				signal: "stage_context_transform_p95_ms",
+				value: nearestRankPercentile(stage.transformMs, 95),
+			},
+			{
+				sessionFile,
+				timestamp: stage.timestamp,
+				signal: "stage_provider_ttfb_p95_ms",
+				value: nearestRankPercentile(stage.ttfbMs, 95),
+			},
+			{
+				sessionFile,
+				timestamp: stage.timestamp,
+				signal: "stage_provider_stream_p95_ms",
+				value: nearestRankPercentile(stage.streamMs, 95),
+			},
+			{
+				sessionFile,
+				timestamp: stage.timestamp,
+				signal: "stage_tool_error_turns",
+				value: stage.toolErrorTurns,
+			},
+		);
+	}
+	return signals;
 }
 /**
  * Parse a session file and extract all assistant message stats.

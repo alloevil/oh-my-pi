@@ -13,6 +13,7 @@ import {
 	OUTBOUND_SUMMARY_RING_SIZE,
 	type OutboundRequestSummary,
 } from "../health/outbound";
+import { collectStageTimings, renderStagesReport, type StageTimingsRow } from "../health/stages";
 import { findMostRecentSession, resolveResumableSession } from "../session/session-listing";
 import { loadEntriesFromFile } from "../session/session-loader";
 import { computeDefaultSessionDir } from "../session/session-paths";
@@ -25,6 +26,8 @@ export interface DoctorCommandFlags {
 	json?: boolean;
 	/** Show recent outbound provider-request summaries instead of findings. */
 	outbound?: boolean;
+	/** Show per-turn pipeline stage timings instead of findings. */
+	stages?: boolean;
 }
 
 export interface DoctorCommandArgs {
@@ -42,6 +45,8 @@ export interface DoctorReport {
 	findings: HealthFindingInput[];
 	/** Present only with `--outbound`. */
 	outbound?: OutboundRequestSummary[];
+	/** Present only with `--stages`. */
+	stages?: StageTimingsRow[];
 }
 
 /**
@@ -124,6 +129,14 @@ export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cw
 		report.outbound = collectOutboundSummaries(entries);
 		process.stdout.write(
 			args.flags.json ? `${JSON.stringify(report.outbound, null, 2)}\n` : renderOutboundReport(report),
+		);
+		return report;
+	}
+	if (args.flags.stages) {
+		report.stages = collectStageTimings(entries);
+		const id = report.sessionId ?? path.basename(sessionPath, ".jsonl");
+		process.stdout.write(
+			args.flags.json ? `${JSON.stringify(report.stages, null, 2)}\n` : renderStagesReport(id, report.stages),
 		);
 		return report;
 	}

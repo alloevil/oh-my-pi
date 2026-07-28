@@ -20,7 +20,11 @@ export type HealthSignalName =
 	| "repeat_reads"
 	| "intent_filled_calls"
 	| "intent_total_calls"
-	| "provider_error_turns";
+	| "provider_error_turns"
+	| "stage_context_transform_p95_ms"
+	| "stage_provider_ttfb_p95_ms"
+	| "stage_provider_stream_p95_ms"
+	| "stage_tool_error_turns";
 
 /** One per-session health counter row. */
 export interface HealthSignalStat {
@@ -79,6 +83,68 @@ export function accumulateIntentFill(acc: IntentFill, argsList: readonly unknown
 		if (hasNonEmptyIntent(args)) filled++;
 	}
 	return { filled, total: acc.total + argsList.length };
+}
+
+/** `customType` of the coding-agent's per-turn stage-timing entries. */
+export const STAGE_TIMINGS_CUSTOM_TYPE = "stage_timings";
+
+/**
+ * Duration samples folded from a session's `stage_timings` custom entries.
+ * Local twin of the row shape in coding-agent's src/health/stages.ts,
+ * duplicated (like {@link isProviderErrorTurn}) to keep stats free of a
+ * cross-package runtime dependency; every field is re-validated on read.
+ */
+export interface StageTimingSamples {
+	/** Context-transform durations, one per turn that recorded stage ①. */
+	transformMs: number[];
+	/** Provider ttfb durations (transform end → assistant message_start). */
+	ttfbMs: number[];
+	/** Provider stream durations (message_start → message_end). */
+	streamMs: number[];
+	/** Turns with at least one failed tool call. */
+	toolErrorTurns: number;
+	/** Rows folded (0 = session predates stage tracking). */
+	rows: number;
+	/** Unix ms of the newest contributing row (0 when unknown). */
+	timestamp: number;
+}
+
+/** Fold one `stage_timings` entry payload into the accumulator; malformed payloads are ignored. */
+export function accumulateStageTimings(acc: StageTimingSamples, data: unknown): void {
+	if (data === null || typeof data !== "object") return;
+	const row = data as Record<string, unknown>;
+	if (typeof row.ts !== "number" || !Number.isFinite(row.ts)) return;
+	acc.rows++;
+	if (row.ts > acc.timestamp) acc.timestamp = row.ts;
+	const context = row.context as Record<string, unknown> | undefined;
+	if (context && typeof context === "object" && typeof context.transformMs === "number") {
+		acc.transformMs.push(context.transformMs);
+	}
+	const provider = row.provider as Record<string, unknown> | undefined;
+	if (provider && typeof provider === "object") {
+		if (typeof provider.ttfbMs === "number") acc.ttfbMs.push(provider.ttfbMs);
+		if (typeof provider.streamMs === "number") acc.streamMs.push(provider.streamMs);
+	}
+	if (Array.isArray(row.tools)) {
+		for (const tool of row.tools) {
+			if (tool !== null && typeof tool === "object" && (tool as Record<string, unknown>).error === true) {
+				acc.toolErrorTurns++;
+				break;
+			}
+		}
+	}
+}
+
+/**
+ * Nearest-rank percentile over duration samples, rounded to integer ms —
+ * the smallest sample with at least `p`% of samples at or below it. 0 for
+ * an empty sample set.
+ */
+export function nearestRankPercentile(values: readonly number[], p: number): number {
+	if (values.length === 0) return 0;
+	const sorted = [...values].sort((a, b) => a - b);
+	const index = Math.max(0, Math.ceil((p / 100) * sorted.length) - 1);
+	return Math.round(sorted[Math.min(index, sorted.length - 1)]);
 }
 
 /**

@@ -95,6 +95,7 @@ import {
 } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import { OUTBOUND_SUMMARY_CUSTOM_TYPE, summarizeOutboundRequest } from "./health/outbound";
+import { STAGE_TIMINGS_CUSTOM_TYPE, StageTimingsRecorder } from "./health/stages";
 import type { HindsightSessionState } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
@@ -2970,6 +2971,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return transformed;
 				}
 			: transformProviderContext;
+		// Stage-timing tap for the main agent loop: bracketing the provider-context
+		// transform here supplies the stage-① clock points; the agent-event
+		// subscription installed after Agent construction supplies stage ②
+		// (message_start/message_end) and stage ④ (tool_execution_start/end), and
+		// flushes one compact `stage_timings` custom entry per assistant turn at
+		// turn_end — read back by `omp doctor --stages`. Date.now() deltas plus a
+		// system-prompt length sum only; never serializes payloads.
+		const stageTimings = settings.get("debug.stageTimings") ? new StageTimingsRecorder() : undefined;
+		const transformProviderContextWithStageTap = stageTimings
+			? async (context: Context, transformModel: Model): Promise<Context> => {
+					stageTimings.onTransformStart();
+					const transformed = await transformProviderContextWithOutboundTap(context, transformModel);
+					let promptChars = 0;
+					for (const part of transformed.systemPrompt ?? []) promptChars += part.length;
+					stageTimings.onTransformEnd(promptChars);
+					return transformed;
+				}
+			: transformProviderContextWithOutboundTap;
 		const onPayload = async (payload: unknown, model?: Model) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model);
 		};
@@ -3045,7 +3064,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			promptCacheKey: providerPromptCacheKey,
 			deadline: options.deadline,
 			transformContext,
-			transformProviderContext: transformProviderContextWithOutboundTap,
+			transformProviderContext: transformProviderContextWithStageTap,
 			steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
 			followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
 			interruptMode: settings.get("interruptMode") ?? "immediate",
@@ -3093,6 +3112,45 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		cursorEventEmitter = event => agent.emitExternalEvent(event);
+
+		// Stage-timing event tap (see the transform tap above). Subscribed before
+		// AgentSession attaches its own listener so the recorder's clock points
+		// never depend on session-side processing; failures degrade to a debug
+		// log, never a broken turn.
+		if (stageTimings) {
+			agent.subscribe(event => {
+				try {
+					switch (event.type) {
+						case "agent_start":
+							// A fresh run supersedes an unflushed turn (e.g. a thrown loop).
+							stageTimings.reset();
+							break;
+						case "message_start":
+							if (event.message.role === "assistant") stageTimings.onAssistantMessageStart();
+							break;
+						case "message_end":
+							if (event.message.role === "assistant") stageTimings.onAssistantMessageEnd();
+							break;
+						case "tool_execution_start":
+							stageTimings.onToolExecutionStart(event.toolCallId, event.toolName);
+							break;
+						case "tool_execution_end":
+							stageTimings.onToolExecutionEnd(event.toolCallId, event.isError === true);
+							break;
+						case "turn_end": {
+							const providerError = event.message.role === "assistant" && event.message.stopReason === "error";
+							const row = stageTimings.onTurnEnd(providerError);
+							if (row) sessionManager.appendCustomEntry(STAGE_TIMINGS_CUSTOM_TYPE, row);
+							break;
+						}
+					}
+				} catch (err) {
+					logger.debug("stage timings tap failed", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			});
+		}
 
 		// Restore messages if session has existing data
 		if (hasExistingSession) {
