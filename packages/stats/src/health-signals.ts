@@ -19,7 +19,8 @@ export type HealthSignalName =
 	| "edit_rejections"
 	| "repeat_reads"
 	| "intent_filled_calls"
-	| "intent_total_calls";
+	| "intent_total_calls"
+	| "provider_error_turns";
 
 /** One per-session health counter row. */
 export interface HealthSignalStat {
@@ -42,6 +43,19 @@ export const REPEAT_READ_THRESHOLD = 3;
  * tests, so matching on it is contract-stable.
  */
 export const VALIDATION_FAILURE_PREFIX = 'Validation failed for tool "';
+
+/**
+ * True when an assistant turn failed on the provider side: an explicit
+ * `error` stop or a recorded errorMessage. User aborts (ESC) persist
+ * `stopReason: "aborted"` plus an errorMessage like "Interrupted by user" —
+ * deliberate action, not degradation, so they never count. Local twin of
+ * `classifyProviderErrorTurn` in coding-agent's src/health/guards.ts,
+ * duplicated to keep stats free of a cross-package runtime dependency.
+ */
+export function isProviderErrorTurn(turn: { stopReason?: string; errorMessage?: string | null }): boolean {
+	if (turn.stopReason === "aborted") return false;
+	return turn.stopReason === "error" || turn.errorMessage != null;
+}
 
 /** Whether a call's arguments carry a non-empty harness intent (`i`) field. */
 export function hasNonEmptyIntent(args: unknown): boolean {

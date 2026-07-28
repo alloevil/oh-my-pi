@@ -17,11 +17,15 @@ export default class Doctor extends Command {
 
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
+		outbound: Flags.boolean({
+			description:
+				"Show recent outbound provider-request summaries (what the model actually saw) with per-request diffs",
+		}),
 	};
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Doctor);
-		const cmd: DoctorCommandArgs = { session: args.session, flags: { json: flags.json } };
+		const cmd: DoctorCommandArgs = { session: args.session, flags: { json: flags.json, outbound: flags.outbound } };
 		try {
 			await runDoctorCommand(cmd);
 		} catch (error) {

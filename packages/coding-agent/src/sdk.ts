@@ -94,6 +94,7 @@ import {
 	setActiveSkills,
 } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
+import { OUTBOUND_SUMMARY_CUSTOM_TYPE, summarizeOutboundRequest } from "./health/outbound";
 import type { HindsightSessionState } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
@@ -2942,6 +2943,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			return clampProviderContextImages(transformed, transformModel);
 		};
+		// Outbound-request tap for the main agent loop: summarize the FINAL
+		// provider context (post obfuscation/snapcompact/clamp — what actually
+		// goes on the wire) into a compact `outbound_summary` custom entry read
+		// back by `omp doctor --outbound`. Pure string-length math over the
+		// already-built context; never serializes message payloads.
+		const transformProviderContextWithOutboundTap = settings.get("debug.outboundSummaries")
+			? async (context: Context, transformModel: Model): Promise<Context> => {
+					const transformed = await transformProviderContext(context, transformModel);
+					try {
+						sessionManager.appendCustomEntry(
+							OUTBOUND_SUMMARY_CUSTOM_TYPE,
+							summarizeOutboundRequest({
+								model: transformModel.id,
+								systemPrompt: transformed.systemPrompt,
+								messages: transformed.messages,
+								tools: transformed.tools,
+								thinkingLevel: agent?.state.thinkingLevel,
+							}),
+						);
+					} catch (err) {
+						logger.debug("outbound summary tap failed", {
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+					return transformed;
+				}
+			: transformProviderContext;
 		const onPayload = async (payload: unknown, model?: Model) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model);
 		};
@@ -3017,7 +3045,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			promptCacheKey: providerPromptCacheKey,
 			deadline: options.deadline,
 			transformContext,
-			transformProviderContext,
+			transformProviderContext: transformProviderContextWithOutboundTap,
 			steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
 			followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
 			interruptMode: settings.get("interruptMode") ?? "immediate",

@@ -137,10 +137,12 @@ import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import { analyzeSession } from "../health/doctor";
 import {
+	classifyProviderErrorTurn,
 	detectSilentModelSwitch,
 	formatSessionEndHealthSummary,
 	HEALTH_RULES,
 	type ModelIdentity,
+	providerErrorSeverity,
 	recordHealthFinding,
 } from "../health/guards";
 import { HealthLedger } from "../health/ledger";
@@ -538,6 +540,8 @@ export class AgentSession {
 	readonly #healthLedger = new HealthLedger();
 	/** Configured model identity snapped at assistant `message_start`; drives the silent-model-switch guard. */
 	#healthTurnStartModel: ModelIdentity | undefined;
+	/** Provider-error assistant turns observed this session; drives the provider-errors guard escalation. */
+	#healthProviderErrorCount = 0;
 
 	/** One-shot flag for expected internal plan-mode aborts. Approval actions may
 	 *  abort the post-approval continuation before compaction, execution, or
@@ -1396,6 +1400,24 @@ export class AgentSession {
 		this.#handoff = new SessionHandoff(handoffHost);
 
 		this.#rehydrateCheckpointRewindState();
+		// Resume-time health rehydration: a resumed session's prior history
+		// (error turns, orphaned tool pairs, …) should show in the status badge
+		// and /health right away, not only at dispose. SessionManager.open /
+		// continueRecent await setSessionFile before this constructor runs, so
+		// persisted entries are already loaded here — same access pattern as the
+		// #doDispose sweep. Findings go through ledger.upsert directly, NOT
+		// recordHealthFinding, so historical findings never queue notices.
+		// Brand-new sessions have no message entries and skip the sweep.
+		const persistedEntries = this.sessionManager.getEntries();
+		if (persistedEntries.some(entry => entry.type === "message")) {
+			try {
+				for (const finding of analyzeSession(persistedEntries)) {
+					this.#healthLedger.upsert(finding);
+				}
+			} catch (error) {
+				logger.debug("Resume doctor sweep failed", { error: String(error) });
+			}
+		}
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
@@ -2174,6 +2196,30 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * provider-errors guard: count assistant turns that failed on the provider
+	 * side (`error` stop or a recorded errorMessage; user aborts excluded, see
+	 * classifyProviderErrorTurn). One or two failures in a session stay info;
+	 * the third escalates to warn — recordHealthFinding upgrades the existing
+	 * finding in place and queues the one-time status notice.
+	 */
+	#observeProviderErrorHealth(message: AssistantMessage): void {
+		if (!classifyProviderErrorTurn(message)) return;
+		const count = ++this.#healthProviderErrorCount;
+		// Excerpt cap keeps the one-line finding readable in notices/reports.
+		const collapsed = message.errorMessage?.replace(/\s+/g, " ").trim();
+		const excerpt =
+			collapsed !== undefined && collapsed !== ""
+				? `"${collapsed.length > 80 ? `${collapsed.slice(0, 79)}…` : collapsed}"`
+				: `stopReason=${message.stopReason}`;
+		recordHealthFinding(this.#healthLedger, {
+			rule: HEALTH_RULES.providerErrors,
+			severity: providerErrorSeverity(count),
+			message: `${count} provider error${count === 1 ? "" : "s"} this session (last: ${excerpt})`,
+			details: { count, lastStopReason: message.stopReason ?? null },
+		});
+	}
+
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
@@ -2221,6 +2267,7 @@ export class AgentSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#observeAssistantModelHealth(event.message);
+			this.#observeProviderErrorHealth(event.message);
 			for (const noticeMessage of this.#healthLedger.drainNotices()) {
 				this.emitNotice("warning", noticeMessage, "health");
 			}

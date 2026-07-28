@@ -10,13 +10,14 @@
  * something is a finding and how it renders.
  */
 
-import type { HealthCounts, HealthFinding, HealthFindingInput, HealthLedger } from "./ledger";
+import type { HealthCounts, HealthFinding, HealthFindingInput, HealthLedger, HealthSeverity } from "./ledger";
 
 /** Stable rule ids for the inline request-path guards. */
 export const HEALTH_RULES = {
 	promptSizeJump: "prompt-size-jump",
 	duplicateDeviceRoutes: "duplicate-device-routes",
 	silentModelSwitch: "silent-model-switch",
+	providerErrors: "provider-errors",
 } as const;
 
 /**
@@ -186,6 +187,37 @@ export function detectSilentModelSwitch(
 		return null;
 	}
 	return { configured: formatModelIdentity(configured), answered: formatModelIdentity(answered) };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// provider-errors
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Provider-error turns in one session at which the finding escalates to warn. */
+export const PROVIDER_ERROR_WARN_THRESHOLD = 3;
+
+/**
+ * True when a settled assistant turn failed on the provider side: an explicit
+ * `error` stop or a recorded `errorMessage`. A user pressing ESC aborts the
+ * in-flight turn (`stopReason: "aborted"`, errorMessage like "Interrupted by
+ * user") — deliberate action, not degradation, so aborts never count. Mirrors
+ * doctor's `evaluateErrorTurns` exclusion (doctor.ts); the stats package
+ * carries a local twin (`isProviderErrorTurn`, health-signals.ts) to avoid a
+ * cross-package runtime dependency.
+ */
+export function classifyProviderErrorTurn(message: { stopReason?: string; errorMessage?: string | null }): boolean {
+	if (message.stopReason === "aborted") return false;
+	return message.stopReason === "error" || message.errorMessage != null;
+}
+
+/**
+ * Severity for the provider-errors finding given the running per-session
+ * error count: one or two failures are informational (providers hiccup),
+ * the third means the session is degraded and warrants the status-bar warn
+ * (and, via {@link recordHealthFinding}, the one-time notice).
+ */
+export function providerErrorSeverity(count: number): HealthSeverity {
+	return count >= PROVIDER_ERROR_WARN_THRESHOLD ? "warn" : "info";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

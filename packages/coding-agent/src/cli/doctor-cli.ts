@@ -7,6 +7,12 @@
 import * as path from "node:path";
 import { evaluateScan, scanSession } from "../health/doctor";
 import type { HealthFindingInput, HealthSeverity } from "../health/ledger";
+import {
+	collectOutboundSummaries,
+	diffOutboundSummaries,
+	OUTBOUND_SUMMARY_RING_SIZE,
+	type OutboundRequestSummary,
+} from "../health/outbound";
 import { findMostRecentSession, resolveResumableSession } from "../session/session-listing";
 import { loadEntriesFromFile } from "../session/session-loader";
 import { computeDefaultSessionDir } from "../session/session-paths";
@@ -17,6 +23,8 @@ const SEVERITY_ORDER: Record<HealthSeverity, number> = { warn: 0, info: 1 };
 
 export interface DoctorCommandFlags {
 	json?: boolean;
+	/** Show recent outbound provider-request summaries instead of findings. */
+	outbound?: boolean;
 }
 
 export interface DoctorCommandArgs {
@@ -32,6 +40,8 @@ export interface DoctorReport {
 	messageCount: number;
 	models: string[];
 	findings: HealthFindingInput[];
+	/** Present only with `--outbound`. */
+	outbound?: OutboundRequestSummary[];
 }
 
 /**
@@ -68,6 +78,36 @@ function renderReport(report: DoctorReport): string {
 	return `${lines.join("\n")}\n`;
 }
 
+/**
+ * `--outbound` rendering: one row per recorded provider request, with a diff
+ * line between consecutive rows when the payload structure moved (sections
+ * added/removed/resized, tool-set changes, model changes).
+ */
+function renderOutboundReport(report: DoctorReport): string {
+	const id = report.sessionId ?? path.basename(report.sessionPath, ".jsonl");
+	const summaries = report.outbound ?? [];
+	if (summaries.length === 0) {
+		return `session ${id}: no outbound summaries recorded (session predates outbound tracking or debug.outboundSummaries is off)\n`;
+	}
+	const lines = [
+		`outbound requests for session ${id} (last ${summaries.length}, ring capped at ${OUTBOUND_SUMMARY_RING_SIZE})`,
+		"  #  time      model                              total-ch    msgs  tools",
+	];
+	for (let index = 0; index < summaries.length; index++) {
+		const summary = summaries[index];
+		if (index > 0) {
+			const diffs = diffOutboundSummaries(summaries[index - 1], summary);
+			if (diffs.length > 0) lines.push(`     Δ ${diffs.join("; ")}`);
+		}
+		const time = summary.timestamp > 0 ? new Date(summary.timestamp).toISOString().slice(11, 19) : "--:--:--";
+		const totalChars = summary.systemPromptChars + summary.messageChars;
+		lines.push(
+			`${String(index).padStart(3)}  ${time}  ${summary.model.padEnd(33).slice(0, 33)}  ${String(totalChars).padStart(10)}  ${String(summary.messageCount).padStart(4)}  ${String(summary.toolCount).padStart(5)}`,
+		);
+	}
+	return `${lines.join("\n")}\n`;
+}
+
 export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cwd()): Promise<DoctorReport> {
 	const sessionPath = await resolveDoctorSessionFile(args.session, cwd);
 	const entries = await loadEntriesFromFile(sessionPath);
@@ -80,6 +120,13 @@ export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cw
 		models: scan.models,
 		findings: evaluateScan(scan),
 	};
+	if (args.flags.outbound) {
+		report.outbound = collectOutboundSummaries(entries);
+		process.stdout.write(
+			args.flags.json ? `${JSON.stringify(report.outbound, null, 2)}\n` : renderOutboundReport(report),
+		);
+		return report;
+	}
 	process.stdout.write(args.flags.json ? `${JSON.stringify(report, null, 2)}\n` : renderReport(report));
 	return report;
 }

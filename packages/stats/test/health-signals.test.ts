@@ -32,7 +32,12 @@ interface ToolCallBlock {
 	arguments: Record<string, unknown>;
 }
 
-function buildAssistantEntry(entryId: string, timestamp: string, toolCalls: ToolCallBlock[]) {
+function buildAssistantEntry(
+	entryId: string,
+	timestamp: string,
+	toolCalls: ToolCallBlock[],
+	overrides?: { stopReason?: string; errorMessage?: string },
+) {
 	return {
 		type: "message",
 		id: entryId,
@@ -55,7 +60,8 @@ function buildAssistantEntry(entryId: string, timestamp: string, toolCalls: Tool
 				totalTokens: 15,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
 			},
-			stopReason: "toolUse",
+			stopReason: overrides?.stopReason ?? "toolUse",
+			...(overrides?.errorMessage !== undefined ? { errorMessage: overrides.errorMessage } : {}),
 			timestamp: Date.parse(timestamp),
 			duration: 10,
 			ttft: 5,
@@ -105,7 +111,9 @@ async function writeSessionFile(fileName: string, entries: unknown[]): Promise<s
 /**
  * Fixture: turn 1 reads src/foo.ts twice (both with intents), turn 2 reads it
  * a third time (repeat-read incident, no intent) and lands a rejected edit,
- * turn 3's grep call is rejected at arg validation.
+ * turn 3's grep call is rejected at arg validation, turn 4 fails on the
+ * provider side (error stop + errorMessage), turn 5 is a user abort that
+ * must NOT count as a provider error.
  */
 function buildStandardEntries(): unknown[] {
 	return [
@@ -130,6 +138,14 @@ function buildStandardEntries(): unknown[] {
 			`${VALIDATION_FAILURE_PREFIX}grep":\npattern must be a string`,
 			true,
 		),
+		buildAssistantEntry("asst-err", TS4, [], {
+			stopReason: "error",
+			errorMessage: "Anthropic stream stalled while waiting for the next event",
+		}),
+		buildAssistantEntry("asst-abort", TS4, [], {
+			stopReason: "aborted",
+			errorMessage: "Interrupted by user",
+		}),
 	];
 }
 
@@ -145,15 +161,17 @@ describe("health signals pipeline", () => {
 		await syncAllSessions({ workers: 1 });
 
 		const rows = await readHealthSignals(sessionFile);
-		expect(rows).toHaveLength(5);
+		expect(rows).toHaveLength(6);
 		expect(signalValue(rows, "tool_arg_validation_failures")).toBe(1);
 		expect(signalValue(rows, "edit_rejections")).toBe(1);
 		expect(signalValue(rows, "repeat_reads")).toBe(1);
 		expect(signalValue(rows, "intent_filled_calls")).toBe(3);
 		expect(signalValue(rows, "intent_total_calls")).toBe(5);
+		// asst-err counts; the user abort (asst-abort) must not.
+		expect(signalValue(rows, "provider_error_turns")).toBe(1);
 		for (const row of rows) {
 			expect(row.sessionFile).toBe(sessionFile);
-			expect(row.timestamp).toBe(Date.parse(TS3));
+			expect(row.timestamp).toBe(Date.parse(TS4));
 		}
 	});
 
@@ -186,15 +204,29 @@ describe("health signals pipeline", () => {
 		expect(signalValue(rows, "repeat_reads")).toBe(1);
 		expect(signalValue(rows, "intent_filled_calls")).toBe(3);
 		expect(signalValue(rows, "intent_total_calls")).toBe(7);
+		expect(signalValue(rows, "provider_error_turns")).toBe(1);
 
 		// A no-op sync leaves everything untouched.
 		await syncAllSessions({ workers: 1 });
 		expect(await readHealthSignals(sessionFile)).toEqual(rows);
 	});
 
-	it("emits no rows for sessions without tool calls", async () => {
+	it("emits no rows for sessions without tool calls or provider errors", async () => {
 		const sessionFile = await writeSessionFile("session-empty.jsonl", [buildAssistantEntry("asst-1", TS1, [])]);
 		await syncAllSessions({ workers: 1 });
 		expect(await readHealthSignals(sessionFile)).toEqual([]);
+	});
+
+	it("records provider errors even when the session made no tool calls", async () => {
+		const sessionFile = await writeSessionFile("session-error-only.jsonl", [
+			buildAssistantEntry("asst-err", TS1, [], {
+				stopReason: "error",
+				errorMessage: "Anthropic stream stalled while waiting for the next event",
+			}),
+		]);
+		await syncAllSessions({ workers: 1 });
+		const rows = await readHealthSignals(sessionFile);
+		expect(signalValue(rows, "provider_error_turns")).toBe(1);
+		expect(signalValue(rows, "intent_total_calls")).toBe(0);
 	});
 });

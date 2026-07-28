@@ -5,6 +5,7 @@
 ### Added
 
 - Added a `health_signals` table plus `readHealthSignals(sessionFile)` recording per-session behavioral counters (tool-arg validation failures, edit rejections, sliding-window repeat reads, intent-fill numerator/denominator). Counters are recomputed as absolute totals from the full transcript on each sync pass and upserted per `(session_file, signal)`, keeping incremental re-syncs idempotent.
+- Added a `provider_error_turns` health signal counting assistant turns that failed on the provider side (`error` stop reason or a recorded `errorMessage`, excluding user aborts). Sessions with provider errors but no tool calls now emit health-signal rows too.
 
 ## [17.1.2] - 2026-07-24
 
