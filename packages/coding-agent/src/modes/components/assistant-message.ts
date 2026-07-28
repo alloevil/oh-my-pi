@@ -18,6 +18,7 @@ import { expandKeyHint, getPreviewLines, resolveImageOptions, TRUNCATE_LENGTHS }
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "../../utils/thinking-display";
 import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
+import { ThinkingBlockComponent } from "./thinking-block";
 
 /**
  * Max lines of a turn-ending provider error rendered inline in the transcript.
@@ -892,13 +893,14 @@ export class AssistantMessageComponent extends Container {
 							(c.type === "thinking" && resolveThinkingDisplay(c, this.proseOnlyThinking).visible),
 					);
 
-				// Thinking traces in thinkingText color, italic
-				const md = new Markdown(thinkingText, 1, 0, getMarkdownTheme(), {
-					color: (text: string) => theme.fg("thinkingText", text),
-					italic: true,
-				});
+				// Thinking renders through the full markdown theme — headings, bullets,
+				// inline code and quotes keep their semantic colours — and is recessed
+				// as a whole by ThinkingBlockComponent (per-line foreground attenuation
+				// plus a muted rail). A flat `color` override would erase exactly the
+				// hierarchy the trace needs, and italics shear CJK glyphs.
+				const md = new Markdown(thinkingText, 0, 0, getMarkdownTheme());
 				md.transientRenderCache = this.#lastUpdateTransient;
-				this.#contentContainer.addChild(md);
+				this.#contentContainer.addChild(new ThinkingBlockComponent(md));
 				captureItems?.push({ md, contentIndex: i, blockType: "thinking", lastText: thinkingText });
 				this.#appendThinkingExtensions(i, thinkingIndex, thinkingText);
 				hasRenderedContent = true;

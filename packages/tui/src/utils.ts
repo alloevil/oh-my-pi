@@ -596,6 +596,52 @@ export function applyBackgroundToLine(line: string, width: number, bgFn: (text: 
 }
 
 /**
+ * Rewrite every truecolor foreground in an already-rendered line.
+ *
+ * Recessing a styled block (a thinking trace, a replayed transcript) and
+ * keeping its semantic colours are only compatible under a colour *transform*:
+ * overriding the foreground with one recess colour erases the hierarchy the
+ * markdown theme just encoded. This maps each `CSI 38;2;r;g;b m` run through
+ * `transform`, so an amber heading can stay a recessed amber heading while body
+ * prose stays body prose, one step further back.
+ *
+ * The colour policy belongs to the caller: only it knows the surface being
+ * recessed toward (a dark theme fades to black, a light one to white, and a
+ * pure-black foreground cannot be attenuated multiplicatively at all).
+ * `transform` receives and returns `#rrggbb`; returning the input is a no-op.
+ *
+ * Indexed (`38;5;N`) and legacy 30-37/90-97 foregrounds carry no RGB to
+ * rewrite and are left untouched — callers targeting a 256-colour terminal
+ * should recess with SGR 2 (faint) instead. Backgrounds, decorations and the
+ * text itself are never modified.
+ *
+ * @param line - Rendered line, ANSI included
+ * @param transform - `#rrggbb` → `#rrggbb`; called once per foreground run
+ */
+export function shadeAnsiForegrounds(line: string, transform: (hex: string) => string): string {
+	if (!line.includes("38;2;")) return line;
+	// Scoped to SGR sequences: a thinking trace may legitimately contain the text
+	// `38;2;7;7;7` (a model reasoning about ANSI), and rewriting prose would both
+	// corrupt it and mislead anyone reading the transcript.
+	return line.replace(SGR_RE, (sequence, params: string) => {
+		if (!params.includes("38;2;")) return sequence;
+		return `\x1b[${params.replace(TRUECOLOR_FG_RE, (match, r: string, g: string, b: string) => {
+			const rgb = [Number(r), Number(g), Number(b)];
+			if (rgb.some(channel => channel > 255)) return match;
+			const hex = `#${((1 << 24) | (rgb[0]! << 16) | (rgb[1]! << 8) | rgb[2]!).toString(16).slice(1)}`;
+			const shaded = transform(hex);
+			if (shaded === hex || !/^#[0-9a-fA-F]{6}$/.test(shaded)) return match;
+			return `38;2;${Number.parseInt(shaded.slice(1, 3), 16)};${Number.parseInt(shaded.slice(3, 5), 16)};${Number.parseInt(shaded.slice(5, 7), 16)}`;
+		})}m`;
+	});
+}
+
+/** A complete SGR sequence — `ESC [ <params> m` — with its parameter list captured. */
+const SGR_RE = /\x1b\[([\d;:]*)m/g;
+/** `38;2;R;G;B` inside an SGR parameter list — not anchored, a list may carry several. */
+const TRUECOLOR_FG_RE = /38;2;(\d{1,3});(\d{1,3});(\d{1,3})/g;
+
+/**
  * Extract a range of visible columns from a line. Handles ANSI codes and wide chars.
  *
  * @param strict - If true, exclude wide chars at boundary that would extend past the range
