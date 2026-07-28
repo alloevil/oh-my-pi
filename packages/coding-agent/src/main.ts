@@ -111,6 +111,13 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
 	if (!settings.get("startup.checkUpdate")) {
 		return;
 	}
+	// A source checkout runs the TypeScript entry directly (`bun src/cli.ts`);
+	// `omp update` cannot upgrade a git worktree, so the newer-version banner
+	// is pure noise there — updates arrive via `git pull`. Published installs
+	// (dist/cli.js, compiled binary) keep the check.
+	if (Bun.main.endsWith(".ts")) {
+		return;
+	}
 	try {
 		const response = await fetch("https://registry.npmjs.org/@oh-my-pi/pi-coding-agent/latest", {
 			signal: withTimeoutSignal(5_000),
