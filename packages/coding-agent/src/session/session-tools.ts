@@ -694,16 +694,12 @@ export class SessionTools {
 		this.#promptRebuildChars = currentChars;
 		const jump = detectPromptSizeJump(previousChars, currentChars);
 		if (!jump) return;
-		recordHealthFinding(
-			this.#host.healthLedger(),
-			{
-				rule: HEALTH_RULES.promptSizeJump,
-				severity: "warn",
-				message: `system prompt ${jump.direction} ${Math.round(jump.ratio * 100)}% between rebuilds (${jump.previousChars} → ${jump.currentChars} chars)`,
-				details: { ...jump },
-			},
-			message => this.#host.emitNotice("warning", message, "health"),
-		);
+		recordHealthFinding(this.#host.healthLedger(), {
+			rule: HEALTH_RULES.promptSizeJump,
+			severity: "warn",
+			message: `system prompt ${jump.direction} ${Math.round(jump.ratio * 100)}% between rebuilds (${jump.previousChars} → ${jump.currentChars} chars)`,
+			details: { ...jump },
+		});
 	}
 
 	/**
@@ -717,16 +713,12 @@ export class SessionTools {
 		const first = duplicates[0];
 		const phrasing = first.kind === "identity" ? "alias the same MCP tool" : "share the original MCP tool name";
 		const suffix = duplicates.length > 1 ? ` (+${duplicates.length - 1} more)` : "";
-		recordHealthFinding(
-			this.#host.healthLedger(),
-			{
-				rule: HEALTH_RULES.duplicateDeviceRoutes,
-				severity: "warn",
-				message: `xd:// routes ${first.names.join(", ")} ${phrasing} ${first.key}${suffix}`,
-				details: { duplicates },
-			},
-			message => this.#host.emitNotice("warning", message, "health"),
-		);
+		recordHealthFinding(this.#host.healthLedger(), {
+			rule: HEALTH_RULES.duplicateDeviceRoutes,
+			severity: "warn",
+			message: `xd:// routes ${first.names.join(", ")} ${phrasing} ${first.key}${suffix}`,
+			details: { duplicates },
+		});
 	}
 
 	/** Consumes the hidden notice for unannounced `xd://` mount changes. */

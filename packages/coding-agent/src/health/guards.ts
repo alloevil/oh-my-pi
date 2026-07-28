@@ -20,20 +20,18 @@ export const HEALTH_RULES = {
 } as const;
 
 /**
- * Record `input` on the ledger and emit a one-time notice the first time the
- * rule reaches warn severity. Later refreshes of the same rule (including
- * warn-severity repeats) stay silent — the finding itself keeps accumulating
- * occurrences via `upsert`.
+ * Record `input` on the ledger. The first time a rule reaches warn severity
+ * its message is queued on the ledger for deferred notice delivery (the
+ * session drains the queue at the next turn boundary, so the notice lands
+ * beside the latest message instead of wherever the guard happened to fire).
+ * Later refreshes of the same rule stay silent — the finding keeps
+ * accumulating occurrences via `upsert`.
  */
-export function recordHealthFinding(
-	ledger: HealthLedger,
-	input: HealthFindingInput,
-	noticeOnFirstWarn: (message: string) => void,
-): HealthFinding {
+export function recordHealthFinding(ledger: HealthLedger, input: HealthFindingInput): HealthFinding {
 	const previous = ledger.findings().find(finding => finding.rule === input.rule);
 	const wasWarn = previous?.severity === "warn";
 	const finding = ledger.upsert(input);
-	if (!wasWarn && finding.severity === "warn") noticeOnFirstWarn(finding.message);
+	if (!wasWarn && finding.severity === "warn") ledger.queueNotice(finding.message);
 	return finding;
 }
 

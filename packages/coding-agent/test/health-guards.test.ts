@@ -154,31 +154,31 @@ describe("health badge formatting", () => {
 	});
 });
 
-describe("recordHealthFinding one-time warn notice", () => {
-	it("notifies once when a rule first reaches warn, then stays silent", () => {
+describe("recordHealthFinding deferred warn notice", () => {
+	it("queues one notice when a rule first reaches warn, then stays silent", () => {
 		const ledger = new HealthLedger();
-		const notices: string[] = [];
 		const input = {
 			rule: HEALTH_RULES.promptSizeJump,
 			severity: "warn",
 			message: "system prompt shrank 40% between rebuilds",
 		} as const;
-		recordHealthFinding(ledger, input, message => notices.push(message));
-		recordHealthFinding(ledger, input, message => notices.push(message));
-		expect(notices).toEqual(["system prompt shrank 40% between rebuilds"]);
+		recordHealthFinding(ledger, input);
+		recordHealthFinding(ledger, input);
+		expect(ledger.drainNotices()).toEqual(["system prompt shrank 40% between rebuilds"]);
+		// Draining empties the queue; the findings keep accumulating.
+		expect(ledger.drainNotices()).toEqual([]);
 		expect(ledger.findings()).toHaveLength(1);
 		expect(ledger.findings()[0].occurrences).toBe(2);
 	});
 
-	it("never notifies for info findings", () => {
+	it("queues nothing for info findings", () => {
 		const ledger = new HealthLedger();
-		const notices: string[] = [];
-		recordHealthFinding(
-			ledger,
-			{ rule: HEALTH_RULES.silentModelSwitch, severity: "info", message: "answered by another model" },
-			message => notices.push(message),
-		);
-		expect(notices).toEqual([]);
+		recordHealthFinding(ledger, {
+			rule: HEALTH_RULES.silentModelSwitch,
+			severity: "info",
+			message: "answered by another model",
+		});
+		expect(ledger.drainNotices()).toEqual([]);
 		expect(ledger.counts()).toEqual({ info: 1, warn: 0 });
 	});
 });
