@@ -128,6 +128,35 @@ export function sortMCPToolsByName<T extends { name: string }>(tools: T[]): T[] 
 	return tools;
 }
 
+/**
+ * Drop tools whose final minted name collides with an earlier tool. Name
+ * sanitization is lossy (`createMCPToolName`), so distinct servers — or two
+ * tools on one server — can fold into one `mcp__` name; downstream the tool
+ * registry is keyed by that name and would silently overwrite one of them.
+ * Callers pass name-sorted input so the survivor is deterministic across
+ * reconnect order.
+ */
+export function dedupeMCPToolsByName<T extends { name: string; mcpServerName?: string; mcpToolName?: string }>(
+	tools: T[],
+): T[] {
+	const keptBy = new Map<string, T>();
+	const out: T[] = [];
+	for (const tool of tools) {
+		const kept = keptBy.get(tool.name);
+		if (kept === undefined) {
+			keptBy.set(tool.name, tool);
+			out.push(tool);
+			continue;
+		}
+		logger.warn("MCP tool name collision; keeping first registration", {
+			name: tool.name,
+			kept: `${kept.mcpServerName ?? "?"}/${kept.mcpToolName ?? "?"}`,
+			dropped: `${tool.mcpServerName ?? "?"}/${tool.mcpToolName ?? "?"}`,
+		});
+	}
+	return out;
+}
+
 export function resolveSubscriptionPostAction(
 	notificationsEnabled: boolean,
 	currentEpoch: number,
@@ -568,15 +597,16 @@ export class MCPManager {
 		}
 
 		// Stable sort by name so the order is independent of connection completion.
-		// See `sortMCPToolsByName` for the cache-stability rationale.
-		sortMCPToolsByName(allTools);
+		// See `sortMCPToolsByName` for the cache-stability rationale. Collisions
+		// from lossy name sanitization are dropped deterministically after the sort.
+		const dedupedTools = dedupeMCPToolsByName(sortMCPToolsByName(allTools));
 
 		// Update cached tools
-		this.#tools = allTools;
+		this.#tools = dedupedTools;
 		allowBackgroundLogging = true;
 
 		return {
-			tools: allTools,
+			tools: dedupedTools,
 			errors,
 			connectedServers: Array.from(connectedServers),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
@@ -593,8 +623,9 @@ export class MCPManager {
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
 		this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
-		// See `sortMCPToolsByName` for the cache-stability rationale.
-		sortMCPToolsByName(this.#tools);
+		// See `sortMCPToolsByName` for the cache-stability rationale. Collisions
+		// from lossy name sanitization are dropped deterministically after the sort.
+		this.#tools = dedupeMCPToolsByName(sortMCPToolsByName(this.#tools));
 	}
 
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): void {

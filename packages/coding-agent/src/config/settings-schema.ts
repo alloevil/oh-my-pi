@@ -4225,6 +4225,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.xdevTopLevelDevices": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "xd:// Top-Level Devices",
+			description:
+				"Keep discoverable tools whose names match these glob patterns top-level (schema shipped with every request, called directly) instead of mounting them behind xd:// dispatch. Spends prompt tokens to remove the docs-read/write round-trip for hot devices (for example lsp or mcp__linear_*).",
+		},
+	},
+
 	// MCP
 	"mcp.enableProjectConfig": {
 		type: "boolean",

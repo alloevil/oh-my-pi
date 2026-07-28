@@ -175,6 +175,7 @@ import {
 import {
 	BashTool,
 	BUILTIN_TOOLS,
+	compileXdevDeviceGlobs,
 	createTools,
 	createVibeTools,
 	type DeferredDiagnosticsEntry,
@@ -2855,10 +2856,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (toolSession.xdevRegistry) {
 			const topLevelToolNames: string[] = [];
 			const mountedTools: Tool[] = [];
+			const pinnedTopLevelGlobs = compileXdevDeviceGlobs(settings.get("tools.xdevTopLevelDevices"));
 			for (const name of initialToolNames) {
 				const tool = toolRegistry.get(name);
 				const explicitlyRequested = explicitlyRequestedToolNameSet?.has(name) === true;
-				if (tool && xdevReadAvailable && !explicitlyRequested && isMountableUnderXdev(tool))
+				if (tool && xdevReadAvailable && !explicitlyRequested && isMountableUnderXdev(tool, pinnedTopLevelGlobs))
 					mountedTools.push(tool);
 				else topLevelToolNames.push(name);
 			}

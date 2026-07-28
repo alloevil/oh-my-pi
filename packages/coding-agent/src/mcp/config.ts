@@ -4,7 +4,7 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath } from "@oh-my-pi/pi-utils";
+import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
@@ -86,6 +86,69 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 }
 
 /**
+ * Connection identity for duplicate detection: everything that determines
+ * which process gets spawned or which endpoint gets dialed. Two enabled
+ * configs with the same identity are one server registered under two names —
+ * typically a plugin-namespaced alias (`context7:context7`) next to a direct
+ * entry (`context7`). Registering both would mount every tool twice under two
+ * `mcp__` prefixes.
+ */
+function serverConnectionIdentity(config: MCPServerConfig): string {
+	if (config.type === "http" || config.type === "sse") {
+		return JSON.stringify([config.type, config.url, config.headers ?? {}]);
+	}
+	// `type` may be omitted — stdio is the default transport.
+	return JSON.stringify(["stdio", config.command, config.args ?? [], config.cwd ?? "", config.env ?? {}]);
+}
+
+/** Result of identity-deduplicating server configs. */
+export interface DedupedServerConfigs {
+	configs: Record<string, MCPServerConfig>;
+	sources: Record<string, SourceMeta>;
+}
+
+/**
+ * Drop server configs whose connection identity duplicates an earlier entry.
+ * Entry order carries provider priority, so the first registration wins —
+ * unless the kept name is plugin-namespaced (contains `:`) and the duplicate
+ * is plain, in which case the plain name replaces it so minted tool names
+ * don't stutter (`mcp__context_context_*`).
+ */
+export function dedupeServerConfigsByIdentity(
+	configs: Record<string, MCPServerConfig>,
+	sources: Record<string, SourceMeta>,
+): DedupedServerConfigs {
+	const keptByIdentity = new Map<string, string>();
+	const outConfigs: Record<string, MCPServerConfig> = {};
+	const outSources: Record<string, SourceMeta> = {};
+
+	for (const [name, config] of Object.entries(configs)) {
+		const identity = serverConnectionIdentity(config);
+		const keptName = keptByIdentity.get(identity);
+		if (keptName === undefined) {
+			keptByIdentity.set(identity, name);
+			outConfigs[name] = config;
+			if (sources[name]) outSources[name] = sources[name];
+			continue;
+		}
+		const preferDuplicate = keptName.includes(":") && !name.includes(":");
+		logger.info("Skipping duplicate MCP server registration", {
+			duplicate: preferDuplicate ? keptName : name,
+			keptAs: preferDuplicate ? name : keptName,
+		});
+		if (preferDuplicate) {
+			delete outConfigs[keptName];
+			delete outSources[keptName];
+			keptByIdentity.set(identity, name);
+			outConfigs[name] = config;
+			if (sources[name]) outSources[name] = sources[name];
+		}
+	}
+
+	return { configs: outConfigs, sources: outSources };
+}
+
+/**
  * Load all MCP server configs from standard locations.
  * Uses the capability system for multi-source discovery.
  *
@@ -122,6 +185,10 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		configs[server.name] = config;
 		sources[server.name] = server._source;
 	}
+
+	// One server registered under two names (e.g. a plugin-shipped alias next
+	// to the user's own entry) must connect and mount only once.
+	({ configs, sources } = dedupeServerConfigsByIdentity(configs, sources));
 
 	let exaApiKeys: string[] = [];
 
