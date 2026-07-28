@@ -194,11 +194,13 @@ describe("health doctor rules", () => {
 		expect(finding?.message).toContain("Connection error.");
 	});
 
-	test("aborted stop reason counts as an error turn", () => {
-		const findings = analyzeSession([header(), user(), assistant({ stopReason: "aborted" })]);
-		const finding = findByRule(findings, "error-turns");
-		expect(finding?.severity).toBe("warn");
-		expect(finding?.message).toContain("stopReason=aborted");
+	test("user-aborted turns are not error turns (deliberate interruption)", () => {
+		const findings = analyzeSession([
+			header(),
+			user(),
+			assistant({ stopReason: "aborted", errorMessage: "Interrupted by user" }),
+		]);
+		expect(findByRule(findings, "error-turns")).toBeUndefined();
 	});
 
 	test("injection-volume reports TTSR and custom message counts as info", () => {
