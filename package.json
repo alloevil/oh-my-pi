@@ -114,6 +114,7 @@
     "meta": "bun --cwd=packages/metaharness run dev",
     "claude:trace": "bun scripts/claude-trace.ts",
     "canary:eval": "bun scripts/canary-eval/run.ts && bun scripts/canary-eval/edit-gate.ts",
+    "manifest:verify": "bun scripts/harness-evolve/verify.ts",
     "build": "bun run --workspaces --if-present build",
     "build:native": "bun --cwd=packages/natives run build",
     "test": "bun scripts/ci-test-ts.ts local",
