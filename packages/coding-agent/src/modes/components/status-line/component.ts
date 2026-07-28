@@ -5,6 +5,7 @@ import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai"
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { settings } from "../../../config/settings";
+import type { HealthLedger } from "../../../health/ledger";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
 import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
@@ -252,6 +253,7 @@ export class StatusLineComponent implements Component {
 	#cachedBranchCwd: string | undefined = undefined;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
+	#healthLedgerUnsubscribe: (() => void) | null = null;
 	#disposed = false;
 	#autoCompactEnabled: boolean = true;
 	#hookStatuses: Map<string, string> = new Map();
@@ -349,6 +351,7 @@ export class StatusLineComponent implements Component {
 			transparent: settings.get("statusLine.transparent"),
 			compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 		};
+		this.#subscribeHealthLedger(session);
 	}
 	#gitEnabled(): boolean {
 		return settings.get("git.enabled");
@@ -387,6 +390,7 @@ export class StatusLineComponent implements Component {
 		if (sessionChanged) {
 			this.#invalidateSessionCaches();
 			this.#closeStaleActiveWindow();
+			this.#subscribeHealthLedger(session);
 		}
 		this.invalidate();
 	}
@@ -561,6 +565,22 @@ export class StatusLineComponent implements Component {
 		this.#setupGitWatcher();
 	}
 
+	/**
+	 * Repaint on health-ledger changes: guards fire on the request path, but a
+	 * finding must also surface when the UI is otherwise idle. Reuses the
+	 * watchBranch render-request hook; segments read live counts at render time.
+	 */
+	#subscribeHealthLedger(session: AgentSession): void {
+		this.#healthLedgerUnsubscribe?.();
+		this.#healthLedgerUnsubscribe = null;
+		// Partial test doubles cast to AgentSession may lack the ledger getter.
+		const ledger = session.healthLedger as HealthLedger | undefined;
+		if (!ledger) return;
+		this.#healthLedgerUnsubscribe = ledger.onChange(() => {
+			if (!this.#disposed && this.#onBranchChange) this.#onBranchChange();
+		});
+	}
+
 	#setupGitWatcher(): void {
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
@@ -596,6 +616,8 @@ export class StatusLineComponent implements Component {
 	dispose(): void {
 		this.#disposed = true;
 		this.#onBranchChange = null;
+		this.#healthLedgerUnsubscribe?.();
+		this.#healthLedgerUnsubscribe = null;
 		this.#clearUsageStartTimer();
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();

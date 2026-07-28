@@ -45,6 +45,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 			"context_pct",
 			"time_spent",
 			"time",
+			"health",
 		],
 		separator: "powerline",
 		segmentOptions: {
@@ -70,6 +71,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 			"context_total",
 			"time_spent",
 			"time",
+			"health",
 		],
 		separator: "powerline",
 		segmentOptions: {

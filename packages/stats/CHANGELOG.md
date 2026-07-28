@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `health_signals` table plus `readHealthSignals(sessionFile)` recording per-session behavioral counters (tool-arg validation failures, edit rejections, sliding-window repeat reads, intent-fill numerator/denominator). Counters are recomputed as absolute totals from the full transcript on each sync pass and upserted per `(session_file, signal)`, keeping incremental re-syncs idempotent.
+
 ## [17.1.2] - 2026-07-24
 
 ### Added

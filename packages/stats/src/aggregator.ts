@@ -3,6 +3,7 @@ import { workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
 	getRecentErrors as dbGetRecentErrors,
 	getRecentRequests as dbGetRecentRequests,
+	readHealthSignals as dbReadHealthSignals,
 	getBehaviorByModel,
 	getBehaviorOverall,
 	getBehaviorTimeSeries,
@@ -24,6 +25,7 @@ import {
 	getToolStatsByModel,
 	getToolTimeSeries,
 	initDb,
+	insertHealthSignals,
 	insertMessageStats,
 	insertToolCalls,
 	insertUserMessageStats,
@@ -32,6 +34,7 @@ import {
 	updateToolResults,
 	updateUserMessageLinks,
 } from "./db";
+import type { HealthSignalStat } from "./health-signals";
 import { getSessionEntry, listAllSessionFiles, type ParseSessionResult, parseSessionFile } from "./parser";
 import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
@@ -58,6 +61,7 @@ function applyParseResult(sessionFile: string, lastModified: number, result: Par
 	if (result.userLinks.length > 0) updateUserMessageLinks(result.userLinks);
 	if (result.toolCalls.length > 0) insertToolCalls(result.toolCalls);
 	if (result.toolResults.length > 0) updateToolResults(result.toolResults);
+	if (result.healthSignals.length > 0) insertHealthSignals(result.healthSignals);
 	setFileOffset(sessionFile, result.newOffset, lastModified);
 	return result.stats.length + result.userStats.length;
 }
@@ -457,6 +461,15 @@ export async function getCostDashboardStats(range?: string | null): Promise<Pick
 export async function getRecentRequests(limit?: number): Promise<MessageStats[]> {
 	await initDb();
 	return dbGetRecentRequests(limit);
+}
+
+/**
+ * Read the per-session behavioral health counters recorded for one session
+ * file. Dumb SELECT wrapper for health/doctor consumers.
+ */
+export async function readHealthSignals(sessionFile: string): Promise<HealthSignalStat[]> {
+	await initDb();
+	return dbReadHealthSignals(sessionFile);
 }
 
 export async function getRecentErrors(range?: string | null, limit?: number): Promise<MessageStats[]> {

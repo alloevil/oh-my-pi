@@ -1,0 +1,29 @@
+{
+	"$comment": "Canary routing queries. Each entry pairs a colloquial user request with the fixture skill a well-routed agent should read first. 2 per skill, Chinese/English mixed. Deliberately vague and boundary-adjacent to the near-neighbor pairs — do not copy wording from skill descriptions.",
+	"queries": [
+		{ "query": "帮我把这份月度开销整理成表，每类加个小计，最后用公式算总和", "expected": "grid-sheets" },
+		{ "query": "highlight any cell in the revenue column that dropped more than 10% from the month before", "expected": "grid-sheets" },
+		{ "query": "我们要收集大家的设备申请，每条申请要能按审批状态分组查看", "expected": "record-tables" },
+		{ "query": "track our job candidates through hiring stages — each applicant is one entry I can filter by interviewer", "expected": "record-tables" },
+		{ "query": "那篇周报开头太啰嗦了，帮我把第一段精简掉一半", "expected": "docs-editor" },
+		{ "query": "the API guide still says v2 everywhere — sweep through the text and bump every reference to v3", "expected": "docs-editor" },
+		{ "query": "老板在需求文档里圈了几处问题，帮我看看他都说了啥，一条条回掉", "expected": "docs-feedback" },
+		{ "query": "mark all the review threads on the launch plan as done, except the open question about pricing", "expected": "docs-feedback" },
+		{ "query": "下周找个大家都有空的时间，把项目复盘排上", "expected": "agenda-planner" },
+		{ "query": "push my 1:1 with Sarah back an hour, she's stuck in traffic", "expected": "agenda-planner" },
+		{ "query": "明天上午的评审会来的人多，得换个大点的地方，看看几楼还有空的", "expected": "room-reserve" },
+		{ "query": "we need somewhere with a whiteboard and a video setup for Thursday's design jam", "expected": "room-reserve" },
+		{ "query": "把刚才那张报错截图转发到运营群，提醒值班同学看一下", "expected": "chat-relay" },
+		{ "query": "ping the on-call folks that the deploy is done, and check if anyone reacted to my last message", "expected": "chat-relay" },
+		{ "query": "把合同扫描件发给法务那边，正式一点，标题里写清楚合同编号", "expected": "mail-station" },
+		{ "query": "did the vendor ever answer my quote request from last week? check my inbox and nudge them again", "expected": "mail-station" },
+		{ "query": "共享盘里那个演示视频太大了，先挪到备份文件夹，再把外部链接权限收紧", "expected": "drive-depot" },
+		{ "query": "grab the latest contract template from the shared folder and give finance edit access to it", "expected": "drive-depot" },
+		{ "query": "咱们组的踩坑记录太散了，建个专门的空间，按模块把它们归置起来", "expected": "wiki-atlas" },
+		{ "query": "the onboarding page should live under Engineering, not HR — move it and everything nested inside", "expected": "wiki-atlas" },
+		{ "query": "上周五那个客户电话我没参加，谁说了什么有没有留下记录？", "expected": "meet-recorder" },
+		{ "query": "pull up what we decided in the sprint retro — pretty sure there's a recording of it", "expected": "meet-recorder" },
+		{ "query": "我手机上录了两个小时的现场讨论，帮我弄成能看的文字稿", "expected": "minute-scribe" },
+		{ "query": "this podcast episode has our CEO's interview — get me a transcript with the speakers labeled", "expected": "minute-scribe" }
+	]
+}

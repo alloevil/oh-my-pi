@@ -11,6 +11,13 @@ import {
 	type Usage,
 } from "@oh-my-pi/pi-ai";
 import { getSessionsDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
+import {
+	accumulateIntentFill,
+	countRepeatReads,
+	type HealthSignalStat,
+	type IntentFill,
+	VALIDATION_FAILURE_PREFIX,
+} from "./health-signals";
 import type {
 	AgentType,
 	MessageStats,
@@ -344,6 +351,88 @@ function scanLastServiceTier(bytes: Uint8Array): ServiceTierByFamily | undefined
 	});
 	return currentServiceTier;
 }
+
+/**
+ * Compute the per-session behavioral health counters from the FULL byte
+ * range of a session file.
+ *
+ * Deliberately not incremental: the repeat-read sliding window and the
+ * call-id → tool-name links needed to classify edit rejections cross
+ * incremental-sync chunk boundaries, so per-chunk deltas would silently
+ * undercount. Recomputing absolute totals over all bytes (the same
+ * full-prefix rescan precedent as {@link scanLastServiceTier}) and letting
+ * `insertHealthSignals` REPLACE per (session_file, signal) keeps every
+ * re-sync idempotent. The counters ride the existing offline sync path —
+ * the session process itself never opens stats.db, so disabled/never-run
+ * stats means none of this executes.
+ */
+function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSignalStat[] {
+	const readKeys: (string | null)[] = [];
+	const editCallIds = new Set<string>();
+	let intentFill: IntentFill = { filled: 0, total: 0 };
+	let validationFailures = 0;
+	let editRejections = 0;
+	let timestamp = 0;
+
+	visitSessionEntriesLenient(bytes, entry => {
+		if (isAssistantMessage(entry)) {
+			const msg = entry.message as AssistantMessage;
+			if (!Array.isArray(msg.content)) return;
+			for (const rawBlock of msg.content) {
+				if (!rawBlock || typeof rawBlock !== "object" || rawBlock.type !== "toolCall") continue;
+				const block = rawBlock as ToolCall;
+				if (typeof block.name !== "string") continue;
+				intentFill = accumulateIntentFill(intentFill, [block.arguments]);
+				const ts = coerceEntryTimestamp(msg.timestamp, entry);
+				if (ts > timestamp) timestamp = ts;
+				if (block.name === "edit" && typeof block.id === "string") editCallIds.add(block.id);
+				let readKey: string | null = null;
+				if (block.name === "read") {
+					const args = block.arguments as Record<string, unknown> | undefined;
+					// Inline selectors (`:50-200`) are part of the `path` string, so
+					// the key already dedups by path+selector.
+					if (typeof args?.path === "string") readKey = args.path;
+				}
+				readKeys.push(readKey);
+			}
+			return;
+		}
+		if (isToolResultMessage(entry)) {
+			const msg = entry.message as ToolResultMessage;
+			if (msg.isError !== true || typeof msg.toolCallId !== "string") return;
+			const ts = coerceEntryTimestamp(msg.timestamp, entry);
+			if (ts > timestamp) timestamp = ts;
+			let text = "";
+			if (Array.isArray(msg.content)) {
+				for (const resultBlock of msg.content) {
+					if (
+						resultBlock &&
+						typeof resultBlock === "object" &&
+						resultBlock.type === "text" &&
+						typeof resultBlock.text === "string"
+					) {
+						text = resultBlock.text;
+						break;
+					}
+				}
+			}
+			// Pre-execution arg-schema rejections carry the pi-ai validation
+			// header regardless of tool; every other error on an `edit` call is
+			// a patch rejection (stale hash, failed hunk, ...).
+			if (text.startsWith(VALIDATION_FAILURE_PREFIX)) validationFailures++;
+			else if (editCallIds.has(msg.toolCallId)) editRejections++;
+		}
+	});
+
+	if (intentFill.total === 0) return [];
+	return [
+		{ sessionFile, timestamp, signal: "tool_arg_validation_failures", value: validationFailures },
+		{ sessionFile, timestamp, signal: "edit_rejections", value: editRejections },
+		{ sessionFile, timestamp, signal: "repeat_reads", value: countRepeatReads(readKeys) },
+		{ sessionFile, timestamp, signal: "intent_filled_calls", value: intentFill.filled },
+		{ sessionFile, timestamp, signal: "intent_total_calls", value: intentFill.total },
+	];
+}
 /**
  * Parse a session file and extract all assistant message stats.
  * Uses incremental reading with offset tracking.
@@ -366,6 +455,7 @@ export interface ParseSessionResult {
 	userLinks: UserMessageLink[];
 	toolCalls: ToolCallStats[];
 	toolResults: ToolResultLink[];
+	healthSignals: HealthSignalStat[];
 	newOffset: number;
 }
 export async function parseSessionFile(sessionPath: string, fromOffset = 0): Promise<ParseSessionResult> {
@@ -374,7 +464,15 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 		bytes = await Bun.file(sessionPath).bytes();
 	} catch (err) {
 		if (isEnoent(err))
-			return { stats: [], userStats: [], userLinks: [], toolCalls: [], toolResults: [], newOffset: fromOffset };
+			return {
+				stats: [],
+				userStats: [],
+				userLinks: [],
+				toolCalls: [],
+				toolResults: [],
+				healthSignals: [],
+				newOffset: fromOffset,
+			};
 		throw err;
 	}
 
@@ -437,7 +535,15 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 		}
 	}
 
-	return { stats, userStats, userLinks, toolCalls, toolResults, newOffset: start + read };
+	return {
+		stats,
+		userStats,
+		userLinks,
+		toolCalls,
+		toolResults,
+		healthSignals: computeHealthSignals(bytes, sessionPath),
+		newOffset: start + read,
+	};
 }
 
 /**

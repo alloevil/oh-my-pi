@@ -1,0 +1,21 @@
+{
+	"status": "ok",
+	"model": "anthropic/claude-haiku-4-5",
+	"repeats": 3,
+	"accuracyPct": 100,
+	"perSkillPct": {
+		"agenda-planner": 100,
+		"chat-relay": 100,
+		"docs-editor": 100,
+		"docs-feedback": 100,
+		"drive-depot": 100,
+		"grid-sheets": 100,
+		"mail-station": 100,
+		"meet-recorder": 100,
+		"minute-scribe": 100,
+		"record-tables": 100,
+		"room-reserve": 100,
+		"wiki-atlas": 100
+	},
+	"generatedAt": "2026-07-28T02:50:56.466Z"
+}

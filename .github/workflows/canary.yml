@@ -1,0 +1,35 @@
+name: Canary Eval
+
+# Manual-only: every run costs real model tokens, so this never triggers on
+# push/PR. Dispatch it before a release to catch prompt-pipeline regressions.
+on:
+   workflow_dispatch:
+      inputs:
+         model:
+            description: "Router model (provider/model-id)"
+            type: string
+            default: "anthropic/claude-haiku-4-5"
+         repeats:
+            description: "Runs to average"
+            type: string
+            default: "3"
+
+permissions:
+   contents: read
+
+jobs:
+   canary:
+      name: Skill-routing canary
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/bun-install
+         - name: Run canary eval
+           env:
+              # run.ts exits 0 with a SKIPPED message when no credentials
+              # resolve, so missing secrets do not fail the workflow.
+              GEMINI_API_KEY: ${{ secrets.CANARY_GEMINI_API_KEY }}
+              ANTHROPIC_API_KEY: ${{ secrets.CANARY_ANTHROPIC_API_KEY }}
+              CANARY_MODEL: ${{ inputs.model }}
+              REPEATS: ${{ inputs.repeats }}
+           run: bun scripts/canary-eval/run.ts

@@ -135,6 +135,15 @@ import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
+import { analyzeSession } from "../health/doctor";
+import {
+	detectSilentModelSwitch,
+	formatSessionEndHealthSummary,
+	HEALTH_RULES,
+	type ModelIdentity,
+	recordHealthFinding,
+} from "../health/guards";
+import { HealthLedger } from "../health/ledger";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
@@ -525,6 +534,10 @@ export class AgentSession {
 
 	readonly #ttsr: TtsrCoordinator;
 	readonly #stats: SessionStatsTracker;
+	/** Session-scoped degradation findings; guards write, status line / doctor / sentinel read. */
+	readonly #healthLedger = new HealthLedger();
+	/** Configured model identity snapped at assistant `message_start`; drives the silent-model-switch guard. */
+	#healthTurnStartModel: ModelIdentity | undefined;
 
 	/** One-shot flag for expected internal plan-mode aborts. Approval actions may
 	 *  abort the post-approval continuation before compaction, execution, or
@@ -1077,6 +1090,7 @@ export class AgentSession {
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
+			healthLedger: () => this.#healthLedger,
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
 		};
@@ -1393,6 +1407,11 @@ export class AgentSession {
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this.#modelRegistry;
+	}
+
+	/** Session-scoped health ledger: request-path guards record findings here; the status-line `health` segment and the session-end sentinel consume it. */
+	get healthLedger(): HealthLedger {
+		return this.#healthLedger;
 	}
 
 	get asyncJobManager(): AsyncJobManager | undefined {
@@ -2131,6 +2150,34 @@ export class AgentSession {
 		return true;
 	}
 
+	/**
+	 * silent-model-switch guard: flag a settled assistant message answered by a
+	 * model other than the session's configured one when no visible model
+	 * change landed during the turn. Info severity — retry fallbacks and user
+	 * switches record a `model_change` entry and move the configured model, so
+	 * they never trip this; what remains is provider-side silent routing.
+	 */
+	#observeAssistantModelHealth(message: AssistantMessage): void {
+		if (message.stopReason === "aborted" || message.stopReason === "error") return;
+		const configuredModel = this.model;
+		const detected = detectSilentModelSwitch(
+			this.#healthTurnStartModel,
+			configuredModel ? { provider: configuredModel.provider, id: configuredModel.id } : undefined,
+			message.model ? { provider: message.provider, id: message.model } : undefined,
+		);
+		if (!detected) return;
+		recordHealthFinding(
+			this.#healthLedger,
+			{
+				rule: HEALTH_RULES.silentModelSwitch,
+				severity: "info",
+				message: `assistant answered with ${detected.answered} while ${detected.configured} is configured`,
+				details: { ...detected },
+			},
+			noticeMessage => this.emitNotice("warning", noticeMessage, "health"),
+		);
+	}
+
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
@@ -2156,8 +2203,18 @@ export class AgentSession {
 		// land in one tick its handler can run before this handler's post-emit
 		// bookkeeping — leaving maintenance looking at the previous (e.g.
 		// toolUse) assistant message and skipping settle-only work.
+		// Silent-model-switch guard bookkeeping: snap the configured model when
+		// an assistant message starts streaming so its message_end can tell a
+		// provider-side switch apart from a visible mid-turn model change.
+		if (event.type === "message_start" && event.message.role === "assistant") {
+			const configuredModel = this.model;
+			this.#healthTurnStartModel = configuredModel
+				? { provider: configuredModel.provider, id: configuredModel.id }
+				: undefined;
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			this.#observeAssistantModelHealth(event.message);
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -3467,6 +3524,19 @@ export class AgentSession {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
+		// Session-end health sentinel: fold the offline doctor sweep (pure, no
+		// I/O) over the already-loaded entries, then emit one summary line while
+		// event listeners are still attached (they are cleared at the end of
+		// teardown). Zero warn findings → zero output.
+		try {
+			for (const finding of analyzeSession(this.sessionManager.getEntries())) {
+				this.#healthLedger.upsert(finding);
+			}
+		} catch (error) {
+			logger.debug("Session-end doctor sweep failed", { error: String(error) });
+		}
+		const healthSummary = formatSessionEndHealthSummary(this.#healthLedger.counts());
+		if (healthSummary) this.emitNotice("warning", healthSummary, "health");
 		this.beginDispose();
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();

@@ -4,6 +4,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getConfigRootDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
+import type { HealthSignalName, HealthSignalStat } from "./health-signals";
 import { classifyAgentType } from "./parser";
 import type {
 	AgentType,
@@ -172,6 +173,17 @@ export async function initDb(): Promise<Database> {
 
 		CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp ON tool_calls(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_timestamp ON tool_calls(tool_name, timestamp);
+
+		CREATE TABLE IF NOT EXISTS health_signals (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_file TEXT NOT NULL,
+			ts INTEGER NOT NULL,
+			signal TEXT NOT NULL,
+			value INTEGER NOT NULL,
+			UNIQUE(session_file, signal)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_health_signals_ts ON health_signals(ts);
 
 		CREATE TABLE IF NOT EXISTS meta (
 			key TEXT PRIMARY KEY,
@@ -1576,6 +1588,53 @@ export function updateToolResults(links: ToolResultLink[]): number {
 	});
 	apply();
 	return updated;
+}
+
+/**
+ * Upsert per-session behavioral health counters. The parser recomputes
+ * absolute per-session totals from the full transcript on every pass that
+ * touches the file, so REPLACE semantics on (session_file, signal) keep
+ * incremental re-syncs idempotent.
+ */
+export function insertHealthSignals(signals: HealthSignalStat[]): number {
+	if (!db || signals.length === 0) return 0;
+
+	const stmt = db.prepare(`
+		INSERT INTO health_signals (session_file, ts, signal, value)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(session_file, signal) DO UPDATE SET
+			ts = excluded.ts,
+			value = excluded.value
+	`);
+
+	let written = 0;
+	const apply = db.transaction(() => {
+		for (const signal of signals) {
+			const result = stmt.run(signal.sessionFile, signal.timestamp, signal.signal, signal.value);
+			written += result.changes;
+		}
+	});
+	apply();
+	return written;
+}
+
+/**
+ * Dumb SELECT wrapper over `health_signals` for one session file — the read
+ * API for future health/doctor consumers. Interpretation (rates, thresholds)
+ * stays with the caller.
+ */
+export function readHealthSignals(sessionFile: string): HealthSignalStat[] {
+	if (!db) return [];
+
+	const rows = db
+		.prepare("SELECT session_file, ts, signal, value FROM health_signals WHERE session_file = ? ORDER BY signal")
+		.all(sessionFile) as { session_file: string; ts: number; signal: HealthSignalName; value: number }[];
+	return rows.map(row => ({
+		sessionFile: row.session_file,
+		timestamp: row.ts,
+		signal: row.signal,
+		value: row.value,
+	}));
 }
 
 /**

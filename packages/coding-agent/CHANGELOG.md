@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added behavioral degradation telemetry to the local stats pipeline: per-session `health_signals` counters (tool-arg validation failures, edit/hashline rejections, repeated reads of the same path+selector within a 20-tool-call sliding window, and intent-field (`i`) fill rate as running numerator/denominator) are derived from session transcripts during the existing `omp stats` sync — the session process never opens a second stats.db connection, and sessions that never sync stats are untouched. A `readHealthSignals(sessionFile)` API in `@oh-my-pi/omp-stats` exposes the counters for health/doctor consumers.
+
+- Added a repeatable canary-eval harness (`scripts/canary-eval/`, `bun run canary:eval`) that scores the real system prompt's skill-routing accuracy on fixed synthetic fixtures with a weak router model, comparing repeat-averaged top-1 accuracy against a committed baseline to catch prompt-pipeline regressions before release; runnable manually or via the dispatch-only `canary.yml` workflow, and skips cleanly when no model credentials resolve.
+
+- Added `omp doctor [session]` — offline session health analysis that reports degradation findings for a session transcript: mid-session model switches (with the model sequence), orphaned tool call/result pairs (excluding the trailing in-flight turn), failed assistant turns (non-null `errorMessage` or abnormal stop reason), TTSR/custom-message injection volume, the largest messages by serialized content size (>64 KiB escalates to warn), and thinking-block collapse. Targets a session file path, a session id prefix, or the most recent session for the current directory by default; `--json` emits machine-readable findings. The rule engine is exported as `analyzeSession()` (`health/doctor`) for in-process doctor-lite checks such as the session-end sentinel.
+
+- Added live session health guards and a status-line `health` segment. Every `AgentSession` owns a `healthLedger` fed by three deterministic request-path guards: `prompt-size-jump` (warn when the system prompt's total size moves >25% between consecutive rebuilds), `duplicate-device-routes` (warn when mounted `xd://` device names alias the same MCP tool identity or collide on original tool names across servers), and `silent-model-switch` (info when an assistant turn is answered by a model other than the configured one with no visible model change that turn). Warn-severity rules emit a one-time session notice on first fire. The new `health` status-line segment (registered in `full`/`nerd` presets, opt-in elsewhere) renders nothing while the ledger is empty and a compact `⚠N`/`·N` badge once findings exist, repainting via ledger subscription. At session teardown a doctor-lite sweep (`analyzeSession` over the in-memory entries) folds offline findings into the ledger and, when warn findings exist, emits a single `health: N warnings — run omp doctor for details` notice.
+
 ## [17.1.5] - 2026-07-27
 
 ### Added

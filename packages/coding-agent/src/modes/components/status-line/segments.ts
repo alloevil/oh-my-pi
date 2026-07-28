@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
+import { formatHealthBadge } from "../../../health/guards";
+import type { HealthLedger } from "../../../health/ledger";
 import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
@@ -666,6 +668,26 @@ const usageSegment: StatusLineSegment = {
 	},
 };
 
+/**
+ * Session health badge. Zero-noise contract: renders nothing while the
+ * session's {@link HealthLedger} is empty; otherwise a compact count badge
+ * (`⚠2` when warn findings exist, `·3` for info-only). The status-line
+ * component subscribes to ledger changes to repaint; this render reads the
+ * live counts each pass.
+ */
+const healthSegment: StatusLineSegment = {
+	id: "health",
+	render(ctx) {
+		// Partial test doubles cast to AgentSession may lack the ledger getter.
+		const ledger = ctx.session.healthLedger as HealthLedger | undefined;
+		if (!ledger) return { content: "", visible: false };
+		const counts = ledger.counts();
+		const badge = formatHealthBadge(counts);
+		if (!badge) return { content: "", visible: false };
+		return { content: theme.fg(counts.warn > 0 ? "warning" : "muted", badge), visible: true };
+	},
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Segment Registry
 // ═══════════════════════════════════════════════════════════════════════════
@@ -695,6 +717,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	session_name: sessionNameSegment,
 	usage: usageSegment,
 	collab: collabSegment,
+	health: healthSegment,
 };
 
 export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {

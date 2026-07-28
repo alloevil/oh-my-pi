@@ -10,6 +10,7 @@ export {
 	getDashboardStats,
 	getToolDashboardStats,
 	getTotalMessageCount,
+	readHealthSignals,
 	type SyncOptions,
 	type SyncProgress,
 	smokeTestSyncWorker,
@@ -17,6 +18,17 @@ export {
 } from "./aggregator";
 export { closeDb } from "./db";
 export { getGainDashboardStats } from "./gain-aggregator";
+export {
+	accumulateIntentFill,
+	countRepeatReads,
+	type HealthSignalName,
+	type HealthSignalStat,
+	hasNonEmptyIntent,
+	type IntentFill,
+	REPEAT_READ_THRESHOLD,
+	REPEAT_READ_WINDOW,
+	VALIDATION_FAILURE_PREFIX,
+} from "./health-signals";
 export { startServer } from "./server";
 export type {
 	GainDashboardStats,

@@ -10,6 +10,8 @@ import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import type { ExtensionRunner } from "../extensibility/extensions";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
+import { detectDuplicateDeviceRoutes, detectPromptSizeJump, HEALTH_RULES, recordHealthFinding } from "../health/guards";
+import type { HealthLedger } from "../health/ledger";
 import { type LocalProtocolOptions, XD_URL_PREFIX } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
@@ -53,6 +55,7 @@ export interface SessionToolsHost {
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
+	healthLedger(): HealthLedger;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
 }
@@ -169,6 +172,8 @@ export class SessionTools {
 	#presentationPinnedToolNames: ReadonlySet<string> | undefined;
 	#runtimeSelectedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
+	/** Total chars of the last committed prompt rebuild; baseline for the prompt-size-jump guard. */
+	#promptRebuildChars: number | undefined;
 	#lastAppliedToolSignature: string | undefined;
 	#mcpRefreshTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
@@ -199,6 +204,9 @@ export class SessionTools {
 		this.#mountedXdevToolNames = new Set(options.initialMountedXdevToolNames ?? []);
 		this.#setActiveToolNames = options.setActiveToolNames;
 		this.#baseSystemPrompt = options.baseSystemPrompt;
+		// Seed the prompt-size baseline from the construction-time prompt (the
+		// initial build); the first observation never fires the guard.
+		this.#observePromptRebuild(options.baseSystemPrompt);
 		this.#skills = options.skills ?? [];
 		this.#skillWarnings = options.skillWarnings ?? [];
 		this.#skillsSettings = options.skillsSettings;
@@ -625,10 +633,12 @@ export class SessionTools {
 		}
 
 		this.#notifyXdevMountDelta(previousMounted);
+		this.#observeMountedDeviceRoutes();
 		this.#host.agent.setTools(tools);
 		if (rebuiltSystemPrompt && rebuiltSignature) {
 			if (this.#lastAppliedToolSignature !== undefined) this.#host.clearInheritedProviderPromptCacheKey();
 			this.#baseSystemPrompt = rebuiltSystemPrompt;
+			this.#observePromptRebuild(rebuiltSystemPrompt);
 			this.#host.clearMemoryPromotionSnapshot();
 			this.#host.agent.setSystemPrompt(this.#baseSystemPrompt);
 			this.#lastAppliedToolSignature = rebuiltSignature;
@@ -670,6 +680,53 @@ export class SessionTools {
 		if (addedNames.length > 0) parts.push(`mounted ${addedNames.join(", ")}`);
 		if (removedNames.length > 0) parts.push(`unmounted ${removedNames.join(", ")}`);
 		this.#host.emitNotice("info", `xd://: ${parts.join("; ")}`, "xdev");
+	}
+
+	/**
+	 * prompt-size-jump guard: observe a committed system prompt rebuild and
+	 * flag a total-size move beyond the 25% threshold relative to the previous
+	 * rebuild. Pure in-memory accounting on the rebuild path.
+	 */
+	#observePromptRebuild(promptParts: readonly string[]): void {
+		const previousChars = this.#promptRebuildChars;
+		let currentChars = 0;
+		for (const part of promptParts) currentChars += part.length;
+		this.#promptRebuildChars = currentChars;
+		const jump = detectPromptSizeJump(previousChars, currentChars);
+		if (!jump) return;
+		recordHealthFinding(
+			this.#host.healthLedger(),
+			{
+				rule: HEALTH_RULES.promptSizeJump,
+				severity: "warn",
+				message: `system prompt ${jump.direction} ${Math.round(jump.ratio * 100)}% between rebuilds (${jump.previousChars} → ${jump.currentChars} chars)`,
+				details: { ...jump },
+			},
+			message => this.#host.emitNotice("warning", message, "health"),
+		);
+	}
+
+	/**
+	 * duplicate-device-routes guard: flag mounted `xd://` device names that
+	 * alias one MCP tool identity or collide on the original tool name across
+	 * servers. Runs after each committed tool repartition.
+	 */
+	#observeMountedDeviceRoutes(): void {
+		const duplicates = detectDuplicateDeviceRoutes(collectMountedMCPToolRoutes(this.#xdevRegistry?.list() ?? []));
+		if (duplicates.length === 0) return;
+		const first = duplicates[0];
+		const phrasing = first.kind === "identity" ? "alias the same MCP tool" : "share the original MCP tool name";
+		const suffix = duplicates.length > 1 ? ` (+${duplicates.length - 1} more)` : "";
+		recordHealthFinding(
+			this.#host.healthLedger(),
+			{
+				rule: HEALTH_RULES.duplicateDeviceRoutes,
+				severity: "warn",
+				message: `xd:// routes ${first.names.join(", ")} ${phrasing} ${first.key}${suffix}`,
+				details: { duplicates },
+			},
+			message => this.#host.emitNotice("warning", message, "health"),
+		);
 	}
 
 	/** Consumes the hidden notice for unannounced `xd://` mount changes. */
@@ -857,6 +914,7 @@ export class SessionTools {
 		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
 		if (this.#host.isDisposed()) return;
 		this.#baseSystemPrompt = built.systemPrompt;
+		this.#observePromptRebuild(built.systemPrompt);
 		this.#host.clearMemoryPromotionSnapshot();
 		if (
 			previousBaseSystemPrompt.length !== this.#baseSystemPrompt.length ||
