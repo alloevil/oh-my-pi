@@ -319,7 +319,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.context": "◫",
 	"icon.cost": "💲",
 	"icon.time": "⏱",
-	"icon.health": "🛡",
+	"icon.health": "✓",
 	"icon.pi": "π",
 	"icon.ghost": "👻",
 	"icon.agents": "👥",
@@ -596,8 +596,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.cost": "\uf155",
 	// pick:  | alt: ◷ ◴
 	"icon.time": "\uf017",
-	// pick:  (nf-fa-shield) | alt: 󰒃 (nf-md-shield) ✓
-	"icon.health": "\uf132",
+	// pick: ✓ | alt:  (nf-fa-shield) 󰒃 (nf-md-shield)
+	"icon.health": "✓",
 	// pick:  | alt: π ∏ ∑
 	"icon.pi": "\ue22c",
 	// pick: 󰊠 (nf-md-ghost) | alt: 👻
