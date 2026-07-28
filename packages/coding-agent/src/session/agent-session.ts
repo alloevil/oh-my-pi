@@ -2208,12 +2208,19 @@ export class AgentSession {
 				? { provider: configuredModel.provider, id: configuredModel.id }
 				: undefined;
 		}
+		// Deferred health-guard notices drain at the nearest turn boundary — a
+		// user message starting (covers resumes and startup mounts where the
+		// user would otherwise stare at a badge with no explanation until the
+		// assistant finished a reply) and every assistant message ending. Both
+		// land beside the newest message instead of wherever the guard fired.
+		if (event.type === "message_start" && event.message.role === "user") {
+			for (const noticeMessage of this.#healthLedger.drainNotices()) {
+				this.emitNotice("warning", noticeMessage, "health");
+			}
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#observeAssistantModelHealth(event.message);
-			// Deferred health-guard notices land here — right after the newest
-			// assistant message — instead of wherever the guard fired (startup
-			// mounts and mid-turn rebuilds sit far above the user's viewport).
 			for (const noticeMessage of this.#healthLedger.drainNotices()) {
 				this.emitNotice("warning", noticeMessage, "health");
 			}
