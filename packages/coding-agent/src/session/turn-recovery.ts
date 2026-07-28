@@ -11,6 +11,7 @@ import type {
 	AssistantRetryRecovery,
 	AssistantRetryRecoveryKind,
 	CodexCompactionContext,
+	Effort,
 	Model,
 	TextContent,
 	ToolChoice,
@@ -27,7 +28,12 @@ import type { RecoveredRetryError } from "../extensibility/shared-events";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
 import thinkingLoopRedirectTemplate from "../prompts/system/thinking-loop-redirect.md" with { type: "text" };
 import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
-import type { ConfiguredThinkingLevel } from "../thinking";
+import {
+	AUTO_THINKING,
+	type ConfiguredThinkingLevel,
+	clampThinkingLevelToCeiling,
+	modelSupportsEffortCeiling,
+} from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { InitialRetryFallbackState } from "./agent-session-types";
 import { isEmptyErrorTurn } from "./messages";
@@ -98,6 +104,8 @@ export interface TurnRecoveryHost {
 	thinkingLevel(): ThinkingLevel | undefined;
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined;
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined): void;
+	/** Hard per-session effort ceiling; fallback recovery must never raise thinking above it. */
+	thinkingLevelCeiling(): Effort | undefined;
 	isDisposed(): boolean;
 	isStreaming(): boolean;
 	isCompacting(): boolean;
@@ -110,7 +118,7 @@ export interface TurnRecoveryHost {
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
 	sessionMessageAlreadyPersisted(message: AssistantMessage): boolean;
-	setModelWithProviderSessionReset(model: Model): void;
+	setModelWithProviderSessionReset(model: Model): Promise<void>;
 	resetCurrentResponsesProviderSession(reason: string): void;
 	maybeAutoRedeemCodexReset(): Promise<boolean>;
 	runAutoCompaction(
@@ -1011,9 +1019,16 @@ export class TurnRecovery {
 		// Capture the configured selector (auto-aware) so a fallback chain preserves
 		// `auto` instead of collapsing it to the level it resolved to this turn.
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
-		const nextThinkingLevel = selector.thinkingLevel ?? currentThinkingLevel;
+		const requestedThinkingLevel = selector.thinkingLevel ?? currentThinkingLevel;
+		// A fallback selector's explicit level (or the carried level after the
+		// replacement model's floor clamp) must never exceed the session's
+		// per-spawn effort ceiling.
+		const nextThinkingLevel =
+			requestedThinkingLevel === AUTO_THINKING
+				? requestedThinkingLevel
+				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
 		const candidateSelector = formatModelStringWithRouting(candidate);
-		this.#host.setModelWithProviderSessionReset(candidate);
+		await this.#host.setModelWithProviderSessionReset(candidate);
 		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
@@ -1041,11 +1056,15 @@ export class TurnRecovery {
 		const role = this.#activeRetryFallback?.role ?? this.resolveRetryFallbackRole(currentSelector);
 		if (!role) return false;
 
+		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const selector of this.findRetryFallbackCandidates(role, currentSelector)) {
 			if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
 			const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 			const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 			if (!candidate) continue;
+			// A candidate whose effort floor exceeds the per-spawn ceiling would be
+			// clamped UP past the cap by its model floor — skip it entirely.
+			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) continue;
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 			if (!apiKey) continue;
 			await this.applyRetryFallbackCandidate(role, selector, currentSelector, options);
@@ -1128,7 +1147,7 @@ export class TurnRecovery {
 		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
-		this.#host.setModelWithProviderSessionReset(baseModel);
+		await this.#host.setModelWithProviderSessionReset(baseModel);
 		this.#host.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(baseSelector);
 		await this.#host.emitSessionEvent({
@@ -1182,7 +1201,7 @@ export class TurnRecovery {
 		const thinkingToApply =
 			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
 		const primarySelector = formatModelStringWithRouting(primaryModel);
-		this.#host.setModelWithProviderSessionReset(primaryModel);
+		await this.#host.setModelWithProviderSessionReset(primaryModel);
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);
 		this.#host.setThinkingLevel(thinkingToApply);

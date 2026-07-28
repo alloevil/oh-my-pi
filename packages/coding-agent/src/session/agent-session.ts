@@ -35,6 +35,8 @@ import {
 	type AgentTurnEndContext,
 	AppendOnlyContextManager,
 	type AsideMessage,
+	type BeforeToolCallContext,
+	type BeforeToolCallResult,
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
@@ -70,6 +72,7 @@ import type {
 	ToolChoice,
 	ToolResultMessage,
 	UsageReport,
+	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -133,6 +136,7 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import { analyzeSession } from "../health/doctor";
@@ -185,6 +189,7 @@ import {
 	toReasoningEffort,
 } from "../thinking";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
+import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails, type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
@@ -205,6 +210,7 @@ import type { EditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { normalizeModelContextImages } from "../utils/image-loading";
+import type { InspectImageMode } from "../utils/inspect-image-mode";
 import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
 import type { VibeModeState } from "../vibe/state";
@@ -438,6 +444,8 @@ export class AgentSession {
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
+	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
+	#inspectImageModeOverride: InspectImageMode | undefined;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
@@ -924,6 +932,7 @@ export class AgentSession {
 		this.#models = new ModelControls(modelControlsHost, {
 			scopedModels: config.scopedModels,
 			thinkingLevel: config.thinkingLevel,
+			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
 
@@ -941,6 +950,7 @@ export class AgentSession {
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
 			setThinkingLevel: level => this.setThinkingLevel(level),
+			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
 			isCompacting: () => this.isCompacting,
@@ -1093,20 +1103,24 @@ export class AgentSession {
 			healthLedger: () => this.#healthLedger,
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
+			getInspectImageModeOverride: () => this.#inspectImageModeOverride,
+			setInspectImageModeOverride: mode => {
+				this.#inspectImageModeOverride = mode;
+			},
 		};
 		this.#tools = new SessionTools(sessionToolsHost, {
 			autoApprove: config.autoApprove,
 			toolRegistry: config.toolRegistry,
 			createVibeTools: config.createVibeTools,
 			createComputerTool: config.createComputerTool,
+			createInspectImageTool: config.createInspectImageTool,
 			builtInToolNames: config.builtInToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
 			getLocalCalendarDate: config.getLocalCalendarDate,
 			getMcpServerInstructions: config.getMcpServerInstructions,
-			xdevRegistry: config.xdevRegistry,
-			initialMountedXdevToolNames: config.initialMountedXdevToolNames,
+			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
 			skills: config.skills,
@@ -1189,6 +1203,10 @@ export class AgentSession {
 		});
 		// Tool-result hook owns synchronous post-tool actions that must affect the current loop.
 		this.agent.afterToolCall = ctx => this.#afterToolCall(ctx);
+		// Pre-scheduling tool_call wiring: extension handlers run at arg-prep
+		// time so a block/revision lands before concurrency resolution,
+		// tool_execution_start, and the wrapper's approval gate.
+		this.agent.beforeToolCall = ctx => this.#beforeToolCall(ctx);
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#todo.syncFromBranch();
@@ -1490,7 +1508,7 @@ export class AgentSession {
 
 		this.#toolChoiceQueue.pushSequence([forced, "none"], {
 			label: "user-force",
-			onRejected: () => "requeue",
+			onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
 		});
 	}
 
@@ -3025,6 +3043,50 @@ export class AgentSession {
 		}
 		return this.#ttsr.afterToolCall(ctx);
 	}
+	/**
+	 * Emits the extension `tool_call` event for a loop-dispatched call at
+	 * arg-prep time — before concurrency scheduling, `tool_execution_start`,
+	 * and the wrapper's approval gate. A handler block becomes a blocked tool
+	 * result; a handler `input` revision becomes the arguments the loop
+	 * schedules, displays, persists, and executes, so approval resolves against
+	 * what actually runs. Marks the dispatch so `ExtensionToolWrapper` does not
+	 * emit a second event (nested xd:// device dispatches and direct non-loop
+	 * execution still emit there).
+	 */
+	async #beforeToolCall(ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> {
+		const runner = this.#extensionRunner;
+		if (!runner?.hasHandlers("tool_call")) return undefined;
+		const metadata = ctx.toolCall.providerMetadata;
+		const computer = metadata?.type === "computer" ? metadata : undefined;
+		// Parity with the wrapper's pre-emit short-circuit: an already-denied
+		// call never reaches extensions. Deny is mode-independent (tool decision
+		// or user policy), so resolving under the most permissive mode is exact;
+		// the wrapper still enforces the mode-accurate gate before execution.
+		const userPolicies = (this.settings.get("tools.approval") ?? {}) as Record<string, unknown>;
+		const approvalArgs = computer ? { actions: computer.actions } : ctx.args;
+		if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies).policy === "deny") {
+			return undefined;
+		}
+		const eventArgs = computer
+			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
+			: ctx.args;
+		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
+		const callResult = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: ctx.tool.name,
+			toolCallId: ctx.toolCall.id,
+			input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
+		});
+		if (callResult?.block) {
+			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
+		}
+		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
+		// view, not the execution params — a revision cannot map back onto them.
+		if (callResult?.input !== undefined && !computer) {
+			return { args: callResult.input };
+		}
+		return undefined;
+	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
 	#findLastAssistantMessage(): AssistantMessage | undefined {
@@ -4031,6 +4093,34 @@ export class AgentSession {
 		return this.#tools.setComputerToolEnabled(enabled);
 	}
 
+	/**
+	 * Session-scoped inspect_image mode (`/vision`). `auto` clears the override
+	 * and returns to the persisted `inspect_image.mode` setting; `on`/`off`
+	 * force the tool for this session only. See {@link SessionTools.setInspectImageMode}.
+	 */
+	setInspectImageMode(mode: InspectImageMode): Promise<boolean> {
+		return this.#tools.setInspectImageMode(mode);
+	}
+
+	/** Effective inspect_image state for `/vision status`. */
+	inspectImageState(): { mode: InspectImageMode; active: boolean; model: string | undefined } {
+		return this.#tools.inspectImageState();
+	}
+
+	/** Session-scoped `/vision` override; undefined means "follow the persisted setting". */
+	getInspectImageModeOverride(): InspectImageMode | undefined {
+		return this.#inspectImageModeOverride;
+	}
+
+	/**
+	 * Reconciles the inspect_image tool set after the persisted
+	 * `inspect_image.mode` setting changed (e.g. via the settings selector), so
+	 * the new value takes effect immediately instead of on the next model switch.
+	 */
+	applyInspectImageModeChange(): Promise<boolean> {
+		return this.#tools.reconcileInspectImageTool();
+	}
+
 	/** Cancels the local rollout-memory startup owned by this session. */
 	cancelLocalMemoryStartup(): void {
 		this.#memory.cancelLocalMemoryStartup();
@@ -4305,6 +4395,7 @@ export class AgentSession {
 
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
+		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
 	}
@@ -5984,6 +6075,10 @@ export class AgentSession {
 				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 			});
 			this.#bash.markSessionTransition(bashTransition);
+			// The new session owns the transcript from here, so the previous
+			// conversation's advisor spend is retired with it. Clearing at the commit
+			// point keeps the status line honest even if a later step below throws.
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -6406,7 +6501,7 @@ export class AgentSession {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
 		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
-		this.#advisors.resetSessionState();
+		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
@@ -6481,7 +6576,7 @@ export class AgentSession {
 		return true;
 	}
 
-	#setModelWithProviderSessionReset(model: Model): void {
+	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
@@ -6493,6 +6588,16 @@ export class AgentSession {
 
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
+
+		// inspect_image auto mode keys off model image capability. Reconcile
+		// centrally here so retry-fallback model changes (turn-recovery.ts),
+		// which bypass syncAfterModelChange, cannot leave the tool set stale —
+		// callers await, so a scheduled retry never races the reconciled slate.
+		try {
+			await this.#tools.reconcileInspectImageAfterModelChange();
+		} catch (error) {
+			logger.warn("inspect_image reconcile after model change failed", { error: String(error) });
+		}
 	}
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {
@@ -7024,7 +7129,7 @@ export class AgentSession {
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);
-			this.#advisors.resetSessionState();
+			this.#advisors.resetSessionState({ preserveCost: true });
 			this.#todo.syncFromBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
@@ -7057,7 +7162,7 @@ export class AgentSession {
 								currentModel.id !== match.id ||
 								currentModel.api !== match.api));
 					if (shouldResetProviderState) {
-						this.#setModelWithProviderSessionReset(match);
+						await this.#setModelWithProviderSessionReset(match);
 					} else {
 						this.agent.setModel(match);
 					}
@@ -7133,6 +7238,9 @@ export class AgentSession {
 					error: String(refreshErr),
 				});
 			}
+			// Only a committed switch retires the previous conversation's advisor spend:
+			// an earlier clear would be lost work if any step above rolled the switch back.
+			if (switchingToDifferentSession) this.#advisors.clearCost();
 			this.#bash.finishSessionTransition(bashTransition, true);
 			return true;
 		} catch (error) {
@@ -7181,10 +7289,12 @@ export class AgentSession {
 	 * @param entryId ID of the entry to branch from
 	 * @returns Object with:
 	 *   - selectedText: The text of the selected user message (for editor pre-fill)
+	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
 	async branch(entryId: string): Promise<{
 		selectedText: string;
+		selectedImages: ImageContent[];
 		cancelled: boolean;
 	}> {
 		const previousSessionFile = this.sessionFile;
@@ -7195,6 +7305,7 @@ export class AgentSession {
 		}
 
 		const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+		const selectedImages = this.#extractUserMessageImages(selectedEntry.message.content);
 
 		let skipConversationRestore = false;
 
@@ -7206,7 +7317,7 @@ export class AgentSession {
 			})) as SessionBeforeBranchResult | undefined;
 
 			if (result?.cancel) {
-				return { selectedText, cancelled: true };
+				return { selectedText, selectedImages, cancelled: true };
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
@@ -7231,6 +7342,7 @@ export class AgentSession {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
 			this.#bash.markSessionTransition(bashTransition);
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -7261,7 +7373,7 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
-		return { selectedText, cancelled: false };
+		return { selectedText, selectedImages, cancelled: false };
 	}
 
 	async branchFromBtw(
@@ -7328,6 +7440,7 @@ export class AgentSession {
 		try {
 			this.sessionManager.createBranchedSession(leafId);
 			this.#bash.markSessionTransition(bashTransition);
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -7375,7 +7488,7 @@ export class AgentSession {
 	 * @param targetId The entry ID to navigate to
 	 * @param options.summarize Whether user wants to summarize abandoned branch
 	 * @param options.customInstructions Custom instructions for summarizer
-	 * @returns Result with editorText (if user message) and cancelled status
+	 * @returns Result with editorText/editorImages (if user message) and cancelled status
 	 */
 	async navigateTree(
 		targetId: string,
@@ -7405,6 +7518,8 @@ export class AgentSession {
 		} = {},
 	): Promise<{
 		editorText?: string;
+		/** Image attachments of the target user message, parallel to the positional `[Image #N]` markers in {@link editorText}. */
+		editorImages?: ImageContent[];
 		cancelled: boolean;
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
@@ -7577,6 +7692,7 @@ export class AgentSession {
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;
 		let editorText: string | undefined;
+		let editorImages: ImageContent[] | undefined;
 		// Set when the second-pass `ask` re-answer branch below actually commits a
 		// new sibling answer — the trigger for resuming the agent afterwards so the
 		// model consumes it, mirroring a live `ask` completion (issue #6483).
@@ -7586,6 +7702,8 @@ export class AgentSession {
 			// User message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText = this.#extractUserMessageText(targetEntry.message.content);
+			const targetImages = this.#extractUserMessageImages(targetEntry.message.content);
+			if (targetImages.length > 0) editorImages = targetImages;
 		} else if (targetEntry.type === "custom_message" && targetEntry.customType !== SKILL_PROMPT_MESSAGE_TYPE) {
 			// Custom message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
@@ -7657,7 +7775,7 @@ export class AgentSession {
 		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
 		this.agent.replaceMessages(displayContext.messages);
 		this.#rehydrateCheckpointRewindState();
-		this.#advisors.resetSessionState();
+		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
@@ -7685,6 +7803,7 @@ export class AgentSession {
 			const rawContext = this.sessionManager.buildSessionContext();
 			return {
 				editorText,
+				editorImages,
 				cancelled: false,
 				summaryEntry,
 				sessionContext: rawContext,
@@ -7693,6 +7812,7 @@ export class AgentSession {
 		}
 		return {
 			editorText,
+			editorImages,
 			cancelled: false,
 			summaryEntry,
 			sessionContext: stateContext,
@@ -7809,6 +7929,14 @@ export class AgentSession {
 				.join("");
 		}
 		return "";
+	}
+
+	/** Image parts of a stored user message, in submission order — index N-1 backs the
+	 *  `[Image #N]` marker in the message text, so restoring them alongside the text keeps
+	 *  positional markers resolvable on resubmit. */
+	#extractUserMessageImages(content: UserMessage["content"]): ImageContent[] {
+		if (!Array.isArray(content)) return [];
+		return content.filter((c): c is ImageContent => c.type === "image");
 	}
 
 	/**
@@ -8287,6 +8415,11 @@ export class AgentSession {
 	 */
 	getAdvisorStatusOverview(): { configured: boolean; advisors: { name: string; status: AdvisorRuntimeStatus }[] } {
 		return this.#advisors.getAdvisorStatusOverview();
+	}
+
+	/** Return cumulative cost recorded for the current session's advisor activity. */
+	getAdvisorCost(): number {
+		return this.#advisors.getAdvisorCost();
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.

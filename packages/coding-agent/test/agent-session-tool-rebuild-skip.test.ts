@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
@@ -12,7 +12,8 @@ import {
 	collectMountedMCPToolRoutes,
 	projectMountedMCPXdevGuidance,
 } from "@oh-my-pi/pi-coding-agent/session/session-tools";
-import { XdevRegistry } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import { listXdevTools, XDEV_EXTERNAL_DESCRIPTION_CAP, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import { logger } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
@@ -75,6 +76,15 @@ function mountNoticesIn(messages: Message[]): string[] {
 	});
 }
 
+function createTestXdevState(): XdevState {
+	return {
+		tools: new Map(),
+		mountedNames: new Set(),
+		builtInNames: new Set(["read", "write"]),
+		isActive: () => true,
+	};
+}
+
 describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	const sessions: AgentSession[] = [];
 
@@ -82,12 +92,13 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		vi.restoreAllMocks();
 	});
 
 	interface NewSessionOptions {
 		getMcpServerInstructions?: () => Map<string, string> | undefined;
 		getLocalCalendarDate?: () => string;
-		xdevRegistry?: XdevRegistry;
+		xdev?: XdevState;
 		lazyWrite?: boolean;
 		/** Scripted mock model responses; enables driving `session.prompt()`. */
 		responses?: MockResponseSource;
@@ -106,11 +117,10 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		const readTool = createBasicTool("read", "Read");
 		const initialMcp = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		const writeTool = createBasicTool("write", "Write");
-		const toolRegistry = new Map<string, AgentTool>([
-			[readTool.name, readTool],
-			[initialMcp.name, initialMcp as unknown as AgentTool],
-		]);
-		if (options.xdevRegistry && !options.lazyWrite) toolRegistry.set(writeTool.name, writeTool);
+		const toolRegistry = options.xdev?.tools ?? new Map<string, AgentTool>();
+		toolRegistry.set(readTool.name, readTool);
+		toolRegistry.set(initialMcp.name, initialMcp as unknown as AgentTool);
+		if (options.xdev && !options.lazyWrite) toolRegistry.set(writeTool.name, writeTool);
 		const mock = options.responses ? createMockModel({ responses: options.responses }) : undefined;
 		const contexts: Message[][] = [];
 		const agent = new Agent({
@@ -118,7 +128,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			initialState: {
 				model: createModel(),
 				systemPrompt: ["initial"],
-				tools: options.xdevRegistry
+				tools: options.xdev
 					? options.lazyWrite
 						? [readTool, initialMcp as unknown as AgentTool]
 						: [readTool, writeTool, initialMcp as unknown as AgentTool]
@@ -139,9 +149,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
 			toolRegistry,
-			builtInToolNames: options.xdevRegistry && !options.lazyWrite ? ["read", "write"] : ["read"],
+			builtInToolNames: options.xdev && !options.lazyWrite ? ["read", "write"] : ["read"],
 			ensureWriteRegistered: async () => {
-				if (!options.xdevRegistry) return false;
+				if (!options.xdev) return false;
 				if (!toolRegistry.has("write")) toolRegistry.set("write", writeTool);
 				return true;
 			},
@@ -150,7 +160,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			}),
 			getMcpServerInstructions: options.getMcpServerInstructions,
 			getLocalCalendarDate: options.getLocalCalendarDate,
-			xdevRegistry: options.xdevRegistry,
+			xdev: options.xdev,
 		});
 		sessions.push(session);
 		return { session, contexts, toolRegistry };
@@ -179,6 +189,24 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		await session.refreshMCPTools([initialMcp]);
 		expect(rebuildCount).toBe(1);
+	});
+
+	it("warns and keeps the stable winner when distinct MCP tools mint the same name", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const { session, toolRegistry } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const dotted = createMcpCustomTool("mcp__foo_bar_lookup", "foo.bar", "lookup", "Lookup from dotted");
+		const underscored = createMcpCustomTool("mcp__foo_bar_lookup", "foo_bar", "lookup", "Lookup from underscored");
+
+		await session.refreshMCPTools([dotted, underscored]);
+
+		expect(toolRegistry.get("mcp__foo_bar_lookup")?.label).toBe("foo.bar/lookup");
+		expect(warn).toHaveBeenCalledWith("MCP tool name collision; keeping stable winner", {
+			name: "mcp__foo_bar_lookup",
+			keptServer: "foo.bar",
+			keptTool: "lookup",
+			ignoredServer: "foo_bar",
+			ignoredTool: "lookup",
+		});
 	});
 
 	it("serializes concurrent MCP refreshes before committing rebuilt prompts", async () => {
@@ -245,7 +273,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	});
 
 	it("rebuilds generated guidance when its ordered mounted MCP route projection changes", async () => {
-		const xdevRegistry = new XdevRegistry([]);
+		const xdevState = createTestXdevState();
 		const serverInstructions = new Map([
 			["archive", "Archive instructions"],
 			["nucleus", "Nucleus instructions"],
@@ -255,14 +283,14 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		const { session } = newSession(
 			async () => {
 				rebuildCount++;
-				const projection = projectMountedMCPXdevGuidance(collectMountedMCPToolRoutes(xdevRegistry.list()));
+				const projection = projectMountedMCPXdevGuidance(collectMountedMCPToolRoutes(listXdevTools(xdevState)));
 				const generatedPrompt = `mounted:${projection.mappings
 					.map(mapping => `${mapping.label}=${mapping.path}`)
 					.join(",")}`;
 				renderedPrompts.push(generatedPrompt);
 				return generatedPrompt;
 			},
-			{ xdevRegistry, getMcpServerInstructions: () => serverInstructions },
+			{ xdev: xdevState, getMcpServerInstructions: () => serverInstructions },
 		);
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
@@ -359,14 +387,14 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	});
 
 	it("skips rebuild when only an omitted mounted MCP mapping changes", async () => {
-		const xdevRegistry = new XdevRegistry([]);
+		const xdevState = createTestXdevState();
 		let rebuildCount = 0;
 		const { session } = newSession(
 			async () => {
 				rebuildCount++;
 				return "bounded mounted MCP guidance";
 			},
-			{ xdevRegistry },
+			{ xdev: xdevState },
 		);
 		const tools = Array.from({ length: 65 }, (_, index) =>
 			createMcpCustomTool(`mcp__archive_tool_${index}`, "archive", `tool_${index}`, "Archive tool"),
@@ -384,14 +412,14 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	});
 
 	it("skips rebuild when only non-MCP xd mounts change", async () => {
-		const xdevRegistry = new XdevRegistry([]);
+		const xdevState = createTestXdevState();
 		let rebuildCount = 0;
 		const { session, toolRegistry } = newSession(
 			async toolNames => {
 				rebuildCount++;
 				return `tools:${toolNames.join(",")}`;
 			},
-			{ xdevRegistry },
+			{ xdev: xdevState },
 		);
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		const catalog = {
@@ -792,7 +820,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 				return `tools:${toolNames.join(",")}`;
 			},
 			{
-				xdevRegistry: new XdevRegistry([]),
+				xdev: createTestXdevState(),
 				responses: [
 					async () => {
 						firstCallStarted.resolve();
@@ -843,10 +871,10 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 	it("caps dynamic xd:// mount-notice summaries", async () => {
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdevRegistry: new XdevRegistry([]),
+			xdev: createTestXdevState(),
 			responses: [{ content: ["ok"] }],
 		});
-		const description = `Search ${"x".repeat(XdevRegistry.EXTERNAL_DESCRIPTION_CAP * 3)} TAIL`;
+		const description = `Search ${"x".repeat(XDEV_EXTERNAL_DESCRIPTION_CAP * 3)} TAIL`;
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", description);
 
 		await session.refreshMCPTools([search]);
@@ -860,7 +888,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 	it("inlines configured late xd:// device docs in mount notices", async () => {
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdevRegistry: new XdevRegistry([]),
+			xdev: createTestXdevState(),
 			responses: [{ content: ["ok"] }],
 		});
 		session.settings.set("tools.xdevDocs", "builtins");
@@ -878,7 +906,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 	it("drops a mount delta that cancels out before the next prompt", async () => {
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdevRegistry: new XdevRegistry([]),
+			xdev: createTestXdevState(),
 			responses: [{ content: ["ok"] }],
 		});
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
@@ -900,7 +928,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {
 		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdevRegistry: new XdevRegistry([]),
+			xdev: createTestXdevState(),
 			responses: [{ content: ["ok"] }],
 		});
 		session.settings.set("startup.quiet", true);
@@ -921,13 +949,13 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 	it("keeps lazy write registration while rolling back applied state on rebuild failure", async () => {
 		let failRebuild = true;
-		const xdevRegistry = new XdevRegistry([]);
+		const xdevState = createTestXdevState();
 		const { session } = newSession(
 			async toolNames => {
 				if (failRebuild) throw new Error("rebuild failed");
 				return `tools:${toolNames.join(",")}`;
 			},
-			{ xdevRegistry, lazyWrite: true },
+			{ xdev: xdevState, lazyWrite: true },
 		);
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		const activeBefore = session.getActiveToolNames();
@@ -949,13 +977,13 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	it("rolls back MCP catalog replacement when prompt rebuild fails", async () => {
 		let failRebuild = false;
 		let date = "2026-07-16";
-		const xdevRegistry = new XdevRegistry([]);
+		const xdevState = createTestXdevState();
 		const { session } = newSession(
 			async toolNames => {
 				if (failRebuild) throw new Error("rebuild failed");
 				return `tools:${toolNames.join(",")}`;
 			},
-			{ xdevRegistry, getLocalCalendarDate: () => date },
+			{ xdev: xdevState, getLocalCalendarDate: () => date },
 		);
 		const oldTool = createMcpCustomTool("mcp__nucleus_old", "nucleus", "old", "Old tool");
 		const newTool = createMcpCustomTool("mcp__nucleus_new", "nucleus", "new", "New tool");
@@ -978,13 +1006,13 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	it("rolls back RPC catalog replacement when prompt rebuild fails", async () => {
 		let failRebuild = false;
 		let date = "2026-07-16";
-		const xdevRegistry = new XdevRegistry([]);
+		const xdevState = createTestXdevState();
 		const { session } = newSession(
 			async toolNames => {
 				if (failRebuild) throw new Error("rebuild failed");
 				return `tools:${toolNames.join(",")}`;
 			},
-			{ xdevRegistry, getLocalCalendarDate: () => date },
+			{ xdev: xdevState, getLocalCalendarDate: () => date },
 		);
 		const oldTool = { ...createBasicTool("rpc_old", "RPC Old"), loadMode: "discoverable" as const };
 		const newTool = { ...createBasicTool("rpc_new", "RPC New"), loadMode: "discoverable" as const };
