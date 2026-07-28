@@ -177,7 +177,7 @@ export function detectSilentModelSwitch(
 	configured: ModelIdentity | undefined,
 	answered: ModelIdentity | undefined,
 ): SilentModelSwitch | null {
-	if (!configuredAtTurnStart || !configured || !answered || !answered.id) return null;
+	if (!configuredAtTurnStart || !configured || !answered?.id) return null;
 	// The configured model moved mid-turn — that change was user-visible
 	// (recorded as a model_change entry), so the mismatch is not silent.
 	if (formatModelIdentity(configuredAtTurnStart) !== formatModelIdentity(configured)) return null;
@@ -211,4 +211,24 @@ export function formatSessionEndHealthSummary(counts: HealthCounts): string | nu
 	if (counts.warn === 0) return null;
 	const noun = counts.warn === 1 ? "warning" : "warnings";
 	return `health: ${counts.warn} ${noun} — run omp doctor for details`;
+}
+
+/**
+ * Full findings report for the `/health` command: one line per finding
+ * (warn first, then by recency), with occurrence counts and structured
+ * details rendered compactly. Empty ledger reports the healthy heartbeat.
+ */
+export function formatHealthFindingsReport(findings: readonly HealthFinding[]): string {
+	if (findings.length === 0) return "✓ no health findings this session";
+	const ordered = [...findings].sort((a, b) =>
+		a.severity === b.severity ? b.timestamp - a.timestamp : a.severity === "warn" ? -1 : 1,
+	);
+	const lines = ordered.map(finding => {
+		const glyph = finding.severity === "warn" ? "⚠" : "·";
+		const times = finding.occurrences > 1 ? ` ×${finding.occurrences}` : "";
+		const details =
+			finding.details && Object.keys(finding.details).length > 0 ? `\n    ${JSON.stringify(finding.details)}` : "";
+		return `${glyph} ${finding.rule}${times} — ${finding.message}${details}`;
+	});
+	return lines.join("\n");
 }

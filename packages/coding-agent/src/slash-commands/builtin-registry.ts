@@ -31,6 +31,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
+import { formatHealthBadge, formatHealthFindingsReport } from "../health/guards";
 import { resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -1391,6 +1392,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.handleToolsCommand();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "health",
+		description: "Show session health findings (live degradation guards)",
+		acpDescription: "Show session health findings",
+		getTuiAutocompleteDescription: runtime => {
+			const ledger = runtime.ctx.session.healthLedger;
+			return ledger ? `Health: ${formatHealthBadge(ledger.counts())}` : "Health: unavailable";
+		},
+		handle: async (_command, runtime) => {
+			const ledger = runtime.session.healthLedger;
+			await runtime.output(
+				ledger ? formatHealthFindingsReport(ledger.findings()) : "health ledger unavailable in this session",
+			);
+			return commandConsumed();
 		},
 	},
 	{
