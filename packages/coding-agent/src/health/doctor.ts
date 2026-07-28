@@ -29,7 +29,8 @@ import type { HealthFindingInput } from "./ledger";
  * `"aborted"`/`"error"` as invalid turns (`invalidStopReason` in
  * `packages/ai/src/providers/transform-messages.ts`); `"length"` means the
  * reply was truncated by the output-token budget. Everything outside this set
- * is treated as an abnormal turn by the `error-turns` rule.
+ * is treated as an abnormal turn by the `error-turns` rule, except
+ * `"aborted"`, which the rule skips as deliberate user interruption.
  */
 const NORMAL_STOP_REASONS: Partial<Record<StopReason, true>> = { stop: true, toolUse: true };
 
@@ -287,9 +288,14 @@ function evaluateOrphanToolPairs(scan: SessionScan): HealthFindingInput[] {
 }
 
 function evaluateErrorTurns(scan: SessionScan): HealthFindingInput[] {
-	const failed = scan.assistantTurns.filter(
-		turn => turn.errorMessage != null || (turn.stopReason !== undefined && !NORMAL_STOP_REASONS[turn.stopReason]),
-	);
+	const failed = scan.assistantTurns.filter(turn => {
+		// A user pressing ESC aborts the in-flight turn (`stopReason: "aborted"`,
+		// errorMessage like "Interrupted by user"). That is deliberate user
+		// action, not a degradation signal — counting it made real sessions warn
+		// on every interruption. Provider errors and truncation still count.
+		if (turn.stopReason === "aborted") return false;
+		return turn.errorMessage != null || (turn.stopReason !== undefined && !NORMAL_STOP_REASONS[turn.stopReason]);
+	});
 	if (failed.length === 0) return [];
 	const first = failed[0];
 	let example: string;
