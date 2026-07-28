@@ -682,16 +682,26 @@ export class SessionTools {
 		this.#host.emitNotice("info", `xd://: ${parts.join("; ")}`, "xdev");
 	}
 
+	/** Rebuilds caused by an MCP tool refresh only re-baseline the guard (see below). */
+	#mcpToolRefreshInProgress = false;
+
 	/**
 	 * prompt-size-jump guard: observe a committed system prompt rebuild and
 	 * flag a total-size move beyond the 25% threshold relative to the previous
 	 * rebuild. Pure in-memory accounting on the rebuild path.
+	 *
+	 * Rebuilds driven by an MCP tool refresh update the baseline WITHOUT
+	 * firing: mounting a server's tools grows the prompt by definition
+	 * (startup and resume both do this), which made the guard's first real
+	 * catch a false positive. Anomalous MCP mounts are the
+	 * duplicate-device-routes guard's job.
 	 */
 	#observePromptRebuild(promptParts: readonly string[]): void {
 		const previousChars = this.#promptRebuildChars;
 		let currentChars = 0;
 		for (const part of promptParts) currentChars += part.length;
 		this.#promptRebuildChars = currentChars;
+		if (this.#mcpToolRefreshInProgress) return;
 		const jump = detectPromptSizeJump(previousChars, currentChars);
 		if (!jump) return;
 		recordHealthFinding(this.#host.healthLedger(), {
@@ -1101,12 +1111,15 @@ export class SessionTools {
 		// Every connected MCP tool is selected; centralized repartitioning owns
 		// presentation pins and write-transport activation/removal.
 		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...mcpTools.map(tool => tool.name)])];
+		this.#mcpToolRefreshInProgress = true;
 		try {
 			await this.applyActiveToolsByName(nextActive);
 			if (this.#host.isDisposed()) restorePreviousMcpTools();
 		} catch (error) {
 			restorePreviousMcpTools();
 			throw error;
+		} finally {
+			this.#mcpToolRefreshInProgress = false;
 		}
 	}
 
