@@ -8,7 +8,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
-import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { getProjectDir, isEnoent, logger, pluralize, prompt } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
@@ -1477,14 +1477,71 @@ export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, strin
 	return args.env ?? partialEnv;
 }
 
+/** Heredoc bodies shorter than this stay verbatim — the summary line would cost as much. */
+const HEREDOC_COLLAPSE_MIN_LINES = 4;
+/** `<< delim`, `<<-delim`, `<<"delim"`, `<<'delim'` — the redirect that opens a body. */
+const HEREDOC_OPEN_RE = /<<(-?)\s*(["']?)([A-Za-z_][\w-]*)\2/g;
+
+/**
+ * Replace each long heredoc body with a one-line summary, keeping the redirect
+ * line, the closing delimiter, and everything after it.
+ *
+ * A heredoc body is data the command carries, not command structure. Rendered as
+ * command lines it takes the same visual weight as the pipeline it belongs to and
+ * spends the whole preview budget (`previewWindowRows()`, i.e. the viewport) on
+ * the least informative part — a 60-line PR body burying the `gh pr create` that
+ * follows it.
+ *
+ * `raw` and `highlighted` are the same lines pre- and post-highlighting, so body
+ * runs are located on `raw` and spliced out of `highlighted` by index.
+ */
+function collapseHeredocBodies(raw: readonly string[], highlighted: readonly string[], uiTheme: Theme): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < raw.length; i++) {
+		const line = raw[i]!;
+		out.push(highlighted[i] ?? line);
+		HEREDOC_OPEN_RE.lastIndex = 0;
+		// The last redirect on the line owns the body that starts first; nested
+		// heredocs on one line are rare enough that collapsing to the first
+		// terminator is the honest approximation.
+		const opens = [...line.matchAll(HEREDOC_OPEN_RE)];
+		const open = opens[0];
+		if (!open) continue;
+		// `<<-` lets the terminator be tab-indented. The display pipeline has already
+		// expanded tabs to spaces by this point, so leading whitespace — not tabs
+		// specifically — is what has to be ignored here.
+		const indentedTerminator = open[1] === "-";
+		const delimiter = open[3]!;
+		let end = i + 1;
+		while (end < raw.length && (indentedTerminator ? raw[end]!.trimStart() : raw[end]!) !== delimiter) end++;
+		const bodyLength = end - (i + 1);
+		if (bodyLength < HEREDOC_COLLAPSE_MIN_LINES) continue;
+		const terminated = end < raw.length;
+		const suffix = terminated ? "" : ", still streaming";
+		out.push(
+			uiTheme.fg("dim", `… ${bodyLength} ${pluralize("line", bodyLength)} of heredoc body (${delimiter}${suffix})`),
+		);
+		// Skip the body; the terminator line itself stays visible.
+		i = end - 1;
+	}
+	return out;
+}
+
 /**
  * Returns the bash command formatted for the result body: the dim `$ cd … &&`
  * prefix joined with syntax-highlighted command lines. The prefix is applied
  * only to the first line so multi-line commands display cleanly — terminals
  * reset SGR state at line boundaries, which made the previous single-string
  * `theme.fg("dim", ...)` form render only the first line as dim.
+ *
+ * Collapsed (the default), long heredoc bodies fold into a summary line; the
+ * expanded view (`ctrl+o`) shows the payload verbatim.
  */
-export function formatBashCommandLines(args: BashRenderArgs, uiTheme: Theme): string[] {
+export function formatBashCommandLines(
+	args: BashRenderArgs,
+	uiTheme: Theme,
+	options: { expanded?: boolean } = {},
+): string[] {
 	const command = replaceTabs(args.command || "…");
 	const cwd = getProjectDir();
 	const displayWorkdir = formatToolWorkingDirectory(args.cwd, cwd);
@@ -1495,7 +1552,10 @@ export function formatBashCommandLines(args: BashRenderArgs, uiTheme: Theme): st
 	const prefix = uiTheme.fg("dim", `${prefixParts.join(" ")} `);
 	const highlightedLines = highlightCode(command, "bash");
 	if (highlightedLines.length === 0) return [prefix.trimEnd()];
-	return highlightedLines.map((line, i) => (i === 0 ? `${prefix}${line}` : line));
+	const lines = options.expanded
+		? [...highlightedLines]
+		: collapseHeredocBodies(command.split("\n"), highlightedLines, uiTheme);
+	return lines.map((line, i) => (i === 0 ? `${prefix}${line}` : line));
 }
 
 function toBashRenderArgs<TArgs>(args: TArgs | undefined, config: ShellRendererConfig<TArgs>): BashRenderArgs {
@@ -1511,7 +1571,10 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 	return {
 		renderCall(args: TArgs, options: RenderResultOptions, uiTheme: Theme): Component {
 			const renderArgs = toBashRenderArgs(args, config);
+			// Both variants are built once; `expanded` is read at render time (ctrl+o
+			// toggles it without rebuilding the component).
 			const cmdLines = formatBashCommandLines(renderArgs, uiTheme);
+			const cmdLinesExpanded = formatBashCommandLines(renderArgs, uiTheme, { expanded: true });
 			const outputBlock = new CachedOutputBlock();
 			return markFramedBlockComponent({
 				render: (width: number): readonly string[] => {
@@ -1530,7 +1593,13 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 						{
 							header,
 							state: options.spinnerFrame !== undefined ? "running" : "pending",
-							sections: [{ lines: capPreviewLines(cmdLines, uiTheme, { expanded: options.expanded }) }],
+							sections: [
+								{
+									lines: capPreviewLines(options.expanded ? cmdLinesExpanded : cmdLines, uiTheme, {
+										expanded: options.expanded,
+									}),
+								},
+							],
 							width,
 						},
 						uiTheme,
@@ -1554,6 +1623,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 		): Component {
 			const renderArgs = toBashRenderArgs(args, config);
 			const cmdLines = args ? formatBashCommandLines(renderArgs, uiTheme) : undefined;
+			const cmdLinesExpanded = args ? formatBashCommandLines(renderArgs, uiTheme, { expanded: true }) : undefined;
 			const isError = result.isError === true;
 			const isPartial = options.isPartial === true;
 			const success = !isPartial && !isError;
@@ -1718,7 +1788,9 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 								{
 									// Viewport-sized tail window in every state — streaming and final
 									// render identically; only ctrl+o uncaps.
-									lines: capPreviewLines(cmdLines ?? [], uiTheme, { expanded }),
+									lines: capPreviewLines((expanded ? cmdLinesExpanded : cmdLines) ?? [], uiTheme, {
+										expanded,
+									}),
 								},
 								{ label: uiTheme.fg("toolTitle", "Output"), lines: outputLines },
 							],
