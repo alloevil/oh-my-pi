@@ -4,7 +4,7 @@
  * deliberately weak router model on fixed synthetic fixtures.
  *
  * For each fixture query the router model receives the full system prompt
- * (built via buildSystemPrompt with the 16 synthetic skills under
+ * (built via buildSystemPrompt with the 24 synthetic skills under
  * fixtures/skills/) and is asked which skill it reads first. Top-1 accuracy
  * averaged over REPEATS runs is compared against baseline.json; a drop of
  * more than CANARY_TOLERANCE percentage points exits non-zero.
@@ -37,7 +37,7 @@ const BASELINE_PATH = path.join(CANARY_DIR, "baseline.json");
 const DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
 const DEFAULT_REPEATS = 3;
 const DEFAULT_TOLERANCE_PCT_PTS = 5;
-const CONCURRENCY = 3;
+const CONCURRENCY = 6;
 const ATTEMPTS_PER_QUERY = 6;
 
 /** Standard tool set for the rendered prompt; `read` is required for the skills listing. */

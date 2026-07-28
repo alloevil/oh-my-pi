@@ -6,8 +6,11 @@
  *
  * Each pinned task is a single-file bug fix: the agent gets the task prompt
  * in a temp workdir seeded with the mutated input file and must produce an
- * exact (whitespace-tolerant) match against the expected fixture. Pass rate
- * is compared against edit-baseline.json; a drop of more than
+ * exact (whitespace-tolerant) match against the expected fixture. Sessions
+ * sample at temperature 0 (parity with the routing probe). A task that hits
+ * the per-task timeout is retried once in a fresh workdir (transient
+ * provider stalls are not capability signal); mismatches never retry. Pass
+ * rate is compared against edit-baseline.json; a drop of more than
  * CANARY_EDIT_TOLERANCE tasks exits non-zero.
  *
  * Env:
@@ -15,7 +18,9 @@
  *   CANARY_SKIP_EDIT=1     skip the gate entirely (exit 0)
  *   CANARY_EDIT_TOLERANCE  allowed drop in passed tasks (default 1)
  * Flags:
- *   --write-baseline  overwrite edit-baseline.json with this run's scores
+ *   --write-baseline  re-record edit-baseline.json as the median passed
+ *                     count of BASELINE_RECORD_RUNS full runs (single-run
+ *                     recording of a noisy count is a lottery ticket)
  *
  * CI-safe: with no resolvable credentials it prints SKIPPED and exits 0.
  */
@@ -23,7 +28,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { discoverAuthStorage, ModelRegistry } from "@oh-my-pi/pi-coding-agent";
+import { discoverAuthStorage, ModelRegistry, Settings } from "@oh-my-pi/pi-coding-agent";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	discoverSharedInfra,
@@ -38,27 +43,52 @@ const BASELINE_PATH = path.join(CANARY_DIR, "edit-baseline.json");
 const FIXTURES_ARCHIVE = path.join(CANARY_DIR, "..", "..", "packages", "typescript-edit-benchmark", "fixtures.tar.gz");
 
 const DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
-const CONCURRENCY = 4;
-const TASK_TIMEOUT_MS = 150_000;
+const CONCURRENCY = 6;
+const TASK_TIMEOUT_MS = 240_000;
+const BASELINE_RECORD_RUNS = 3;
 
 /**
- * Pinned task slice: one per mutation family, first seed of each. Pinning by
- * id (instead of stride-sampling) makes fixture regeneration fail loudly here
- * instead of silently invalidating the baseline.
+ * Pinned task slice: all 20 mutation families in fixtures.tar.gz, plus a
+ * second seed for 10 families spread across the category prefixes. Seeds are
+ * chosen so the fix is inferable from surrounding context (seeds whose
+ * deleted content must be synthesized byte-exact from nothing — e.g.
+ * structural-delete-statement-001, structural-remove-early-return-001 — fail
+ * deterministically for any model and would be dead weight). Pinning by id
+ * (instead of stride-sampling) makes fixture regeneration fail loudly here
+ * instead of silently invalidating the baseline. One comment per task names
+ * its mutation family.
  */
 const PINNED_TASK_IDS = [
-	"access-remove-optional-chain-001",
-	"call-swap-call-args-001",
-	"duplicate-duplicate-line-flip-001",
-	"identifier-identifier-multi-edit-001",
-	"import-swap-named-imports-001",
-	"literal-flip-boolean-001",
-	"literal-off-by-one-001",
-	"operator-remove-negation-001",
-	"operator-swap-comparison-001",
-	"regex-swap-regex-quantifier-001",
-	"structural-swap-if-else-001",
-	"unicode-unicode-hyphen-001",
+	"access-remove-optional-chain-001", // remove-optional-chain
+	"access-remove-optional-chain-003", // remove-optional-chain (second seed)
+	"call-swap-call-args-001", // swap-call-args
+	"call-swap-call-args-002", // swap-call-args (second seed)
+	"duplicate-duplicate-line-flip-001", // duplicate-line-flip
+	"duplicate-duplicate-line-flip-002", // duplicate-line-flip (second seed)
+	"identifier-identifier-multi-edit-001", // identifier-multi-edit
+	"identifier-identifier-multi-edit-002", // identifier-multi-edit (second seed)
+	"import-swap-named-imports-001", // swap-named-imports
+	"import-swap-named-imports-002", // swap-named-imports (second seed)
+	"literal-flip-boolean-001", // flip-boolean
+	"literal-off-by-one-001", // off-by-one
+	"literal-off-by-one-002", // off-by-one (second seed)
+	"operator-remove-negation-001", // remove-negation
+	"operator-swap-arithmetic-001", // swap-arithmetic
+	"operator-swap-comparison-001", // swap-comparison
+	"operator-swap-equality-001", // swap-equality
+	"operator-swap-increment-decrement-001", // swap-increment-decrement
+	"operator-swap-logical-001", // swap-logical
+	"operator-swap-logical-002", // swap-logical (second seed)
+	"operator-swap-nullish-001", // swap-nullish
+	"regex-swap-regex-quantifier-001", // swap-regex-quantifier
+	"regex-swap-regex-quantifier-002", // swap-regex-quantifier (second seed)
+	"structural-delete-statement-004", // delete-statement
+	"structural-remove-early-return-004", // remove-early-return
+	"structural-swap-adjacent-lines-001", // swap-adjacent-lines
+	"structural-swap-if-else-001", // swap-if-else
+	"structural-swap-if-else-002", // swap-if-else (second seed)
+	"unicode-unicode-hyphen-001", // unicode-hyphen
+	"unicode-unicode-hyphen-002", // unicode-hyphen (second seed)
 ];
 
 const SYSTEM_PROMPT = `You are participating in a code-edit benchmark scored by exact text diff.
@@ -121,9 +151,8 @@ async function extractFixtures(): Promise<{ dir: string; temp: TempDir }> {
 	return { dir, temp };
 }
 
-async function runTask(task: EditTask, modelSpec: string, shared: SharedInfra, workRoot: string): Promise<TaskVerdict> {
+async function attemptTask(task: EditTask, modelSpec: string, shared: SharedInfra, cwd: string): Promise<TaskVerdict> {
 	const started = Date.now();
-	const cwd = path.join(workRoot, task.id);
 	await fs.mkdir(cwd, { recursive: true });
 	for (const file of task.files) {
 		await Bun.write(path.join(cwd, file), Bun.file(path.join(task.inputDir, file)));
@@ -171,6 +200,18 @@ async function runTask(task: EditTask, modelSpec: string, shared: SharedInfra, w
 	};
 }
 
+/**
+ * A transient provider stall can push a legitimately slow task past the
+ * deadline, so a timeout gets exactly one retry in a fresh workdir. Mismatches
+ * are capability signal and are never retried.
+ */
+async function runTask(task: EditTask, modelSpec: string, shared: SharedInfra, workRoot: string): Promise<TaskVerdict> {
+	const verdict = await attemptTask(task, modelSpec, shared, path.join(workRoot, task.id));
+	if (verdict.passed || !/timed out/.test(verdict.detail)) return verdict;
+	const retry = await attemptTask(task, modelSpec, shared, path.join(workRoot, `${task.id}-retry`));
+	return { ...retry, durationMs: verdict.durationMs + retry.durationMs };
+}
+
 async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
 	const results: R[] = new Array(items.length);
 	let next = 0;
@@ -182,6 +223,26 @@ async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) 
 	});
 	await Promise.all(workers);
 	return results;
+}
+
+interface RunResult {
+	passed: number;
+	perTask: Record<string, boolean>;
+}
+
+/** One full pass over the pinned tasks, each in its own workdir under runRoot. */
+async function runAll(tasks: EditTask[], modelSpec: string, shared: SharedInfra, runRoot: string): Promise<RunResult> {
+	const verdicts = await mapLimit(tasks, CONCURRENCY, task => runTask(task, modelSpec, shared, runRoot));
+	const passed = verdicts.filter(verdict => verdict.passed).length;
+	const perTask: Record<string, boolean> = {};
+	for (const verdict of verdicts) {
+		perTask[verdict.task.id] = verdict.passed;
+		const mark = verdict.passed ? "pass" : "FAIL";
+		console.log(`  ${mark}  ${verdict.task.id} (${Math.round(verdict.durationMs / 1000)}s)`);
+		if (!verdict.passed) console.log(`        ${verdict.detail}`);
+	}
+	console.log(`\ncanary-edit-gate: ${passed}/${tasks.length} tasks passed`);
+	return { passed, perTask };
 }
 
 async function main(): Promise<number> {
@@ -217,31 +278,35 @@ async function main(): Promise<number> {
 
 		console.log(`canary-edit-gate: model=${modelSpec} tasks=${tasks.length} tolerance=${tolerance} task(s)`);
 		const shared = await discoverSharedInfra({ cwd: workRoot.path() });
-		const verdicts = await mapLimit(tasks, CONCURRENCY, task => runTask(task, modelSpec, shared, workRoot.path()));
-
-		const passed = verdicts.filter(verdict => verdict.passed).length;
-		const perTask: Record<string, boolean> = {};
-		for (const verdict of verdicts) {
-			perTask[verdict.task.id] = verdict.passed;
-			const mark = verdict.passed ? "pass" : "FAIL";
-			console.log(`  ${mark}  ${verdict.task.id} (${Math.round(verdict.durationMs / 1000)}s)`);
-			if (!verdict.passed) console.log(`        ${verdict.detail}`);
-		}
-		console.log(`\ncanary-edit-gate: ${passed}/${tasks.length} tasks passed`);
-
+		// Parity with the routing probe: sample at temperature 0. Settings.init is
+		// first-wins, so this re-init returns the instance discoverSharedInfra
+		// created; the override is runtime-only (never persisted).
+		(await Settings.init()).override("temperature", 0);
 		if (writeBaseline) {
+			// A single run of a run-to-run-noisy pass count makes the recorded
+			// baseline a lottery ticket; record the median of several full runs
+			// instead (mirrors the routing probe's REPEATS averaging).
+			const results: RunResult[] = [];
+			for (let run = 0; run < BASELINE_RECORD_RUNS; run++) {
+				console.log(`canary-edit-gate: baseline recording run ${run + 1}/${BASELINE_RECORD_RUNS}`);
+				results.push(await runAll(tasks, modelSpec, shared, path.join(workRoot.path(), `record-${run}`)));
+			}
+			const median = results.slice().sort((a, b) => a.passed - b.passed)[Math.floor(results.length / 2)];
 			const baseline: EditBaseline = {
 				status: "ok",
 				model: modelSpec,
 				tasks: PINNED_TASK_IDS,
-				passed,
-				perTask,
+				passed: median.passed,
+				perTask: median.perTask,
 				generatedAt: new Date().toISOString(),
+				note: `median of ${BASELINE_RECORD_RUNS} recording runs (passed counts: ${results.map(r => r.passed).join(", ")})`,
 			};
 			await Bun.write(BASELINE_PATH, `${JSON.stringify(baseline, null, "\t")}\n`);
-			console.log(`canary-edit-gate: baseline written to ${BASELINE_PATH}`);
+			console.log(`canary-edit-gate: baseline written to ${BASELINE_PATH} (${baseline.note})`);
 			return 0;
 		}
+
+		const { passed } = await runAll(tasks, modelSpec, shared, path.join(workRoot.path(), "gate"));
 
 		const baseline = (await Bun.file(BASELINE_PATH).json()) as EditBaseline;
 		if (baseline.status !== "ok" || baseline.passed === null) {

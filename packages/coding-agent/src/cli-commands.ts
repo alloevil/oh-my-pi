@@ -24,6 +24,7 @@ export const commands: CommandEntry[] = [
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "dry-balance", load: () => import("./commands/dry-balance").then(m => m.default) },
 	{ name: "doctor", load: () => import("./commands/doctor").then(m => m.default) },
+	{ name: "evidence", load: () => import("./commands/evidence").then(m => m.default) },
 	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
 	{ name: "grep", load: () => import("./commands/grep").then(m => m.default) },
 	{ name: "gallery", load: () => import("./commands/gallery").then(m => m.default) },
