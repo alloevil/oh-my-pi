@@ -179,8 +179,9 @@ export async function initDb(): Promise<Database> {
 			session_file TEXT NOT NULL,
 			ts INTEGER NOT NULL,
 			signal TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
 			value INTEGER NOT NULL,
-			UNIQUE(session_file, signal)
+			UNIQUE(session_file, signal, model)
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_health_signals_ts ON health_signals(ts);
@@ -269,6 +270,32 @@ export async function initDb(): Promise<Database> {
 			);
 			CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp ON user_messages(timestamp);
 			CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp_model ON user_messages(timestamp, model, provider);
+		`);
+	}
+	// health_signals v1 -> v2: rows gained a `model` dimension (bare model id,
+	// '' when unattributable) and the upsert key widened to
+	// (session_file, signal, model). Detected by column shape (the same PRAGMA
+	// precedent as the `messages.premium_requests` ALTER above), but unlike
+	// `messages` the table is a PURE DERIVATION of session JSONL — the parser
+	// recomputes absolute full-file totals on every pass — so old rows are
+	// dropped instead of backfilled. `file_offsets` is deliberately NOT wiped:
+	// that would re-run the messages/tool_calls insert paths for every session.
+	// The tradeoff is lazy repopulation — rows reappear per session as it
+	// receives new content and gets re-parsed.
+	const healthSignalColumns = db.prepare("PRAGMA table_info(health_signals)").all() as { name: string }[];
+	if (!healthSignalColumns.some(column => column.name === "model")) {
+		db.run("DROP TABLE health_signals");
+		db.run(`
+			CREATE TABLE health_signals (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_file TEXT NOT NULL,
+				ts INTEGER NOT NULL,
+				signal TEXT NOT NULL,
+				model TEXT NOT NULL DEFAULT '',
+				value INTEGER NOT NULL,
+				UNIQUE(session_file, signal, model)
+			);
+			CREATE INDEX IF NOT EXISTS idx_health_signals_ts ON health_signals(ts);
 		`);
 	}
 	backfillUserMessages(db);
@@ -1593,16 +1620,16 @@ export function updateToolResults(links: ToolResultLink[]): number {
 /**
  * Upsert per-session behavioral health counters. The parser recomputes
  * absolute per-session totals from the full transcript on every pass that
- * touches the file, so REPLACE semantics on (session_file, signal) keep
- * incremental re-syncs idempotent.
+ * touches the file, so REPLACE semantics on (session_file, signal, model)
+ * keep incremental re-syncs idempotent.
  */
 export function insertHealthSignals(signals: HealthSignalStat[]): number {
 	if (!db || signals.length === 0) return 0;
 
 	const stmt = db.prepare(`
-		INSERT INTO health_signals (session_file, ts, signal, value)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(session_file, signal) DO UPDATE SET
+		INSERT INTO health_signals (session_file, ts, signal, model, value)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(session_file, signal, model) DO UPDATE SET
 			ts = excluded.ts,
 			value = excluded.value
 	`);
@@ -1610,7 +1637,7 @@ export function insertHealthSignals(signals: HealthSignalStat[]): number {
 	let written = 0;
 	const apply = db.transaction(() => {
 		for (const signal of signals) {
-			const result = stmt.run(signal.sessionFile, signal.timestamp, signal.signal, signal.value);
+			const result = stmt.run(signal.sessionFile, signal.timestamp, signal.signal, signal.model, signal.value);
 			written += result.changes;
 		}
 	});
@@ -1621,18 +1648,29 @@ export function insertHealthSignals(signals: HealthSignalStat[]): number {
 /**
  * Dumb SELECT wrapper over `health_signals` for one session file — the read
  * API for future health/doctor consumers. Interpretation (rates, thresholds)
- * stays with the caller.
+ * stays with the caller. `signal` optionally narrows to one counter.
  */
-export function readHealthSignals(sessionFile: string): HealthSignalStat[] {
+export function readHealthSignals(sessionFile: string, signal?: HealthSignalName): HealthSignalStat[] {
 	if (!db) return [];
 
-	const rows = db
-		.prepare("SELECT session_file, ts, signal, value FROM health_signals WHERE session_file = ? ORDER BY signal")
-		.all(sessionFile) as { session_file: string; ts: number; signal: HealthSignalName; value: number }[];
+	const rows = (
+		signal === undefined
+			? db
+					.prepare(
+						"SELECT session_file, ts, signal, model, value FROM health_signals WHERE session_file = ? ORDER BY signal, model",
+					)
+					.all(sessionFile)
+			: db
+					.prepare(
+						"SELECT session_file, ts, signal, model, value FROM health_signals WHERE session_file = ? AND signal = ? ORDER BY signal, model",
+					)
+					.all(sessionFile, signal)
+	) as { session_file: string; ts: number; signal: HealthSignalName; model: string; value: number }[];
 	return rows.map(row => ({
 		sessionFile: row.session_file,
 		timestamp: row.ts,
 		signal: row.signal,
+		model: row.model,
 		value: row.value,
 	}));
 }

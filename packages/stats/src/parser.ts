@@ -14,7 +14,7 @@ import { getSessionsDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
 import {
 	accumulateIntentFill,
 	accumulateStageTimings,
-	countRepeatReads,
+	countRepeatReadsByModel,
 	type HealthSignalStat,
 	type IntentFill,
 	isProviderErrorTurn,
@@ -358,53 +358,78 @@ function scanLastServiceTier(bytes: Uint8Array): ServiceTierByFamily | undefined
 }
 
 /**
- * Compute the per-session behavioral health counters from the FULL byte
- * range of a session file.
+ * Compute the per-session, per-model behavioral health counters from the
+ * FULL byte range of a session file.
  *
  * Deliberately not incremental: the repeat-read sliding window and the
- * call-id → tool-name links needed to classify edit rejections cross
- * incremental-sync chunk boundaries, so per-chunk deltas would silently
- * undercount. Recomputing absolute totals over all bytes (the same
- * full-prefix rescan precedent as {@link scanLastServiceTier}) and letting
- * `insertHealthSignals` REPLACE per (session_file, signal) keeps every
+ * call-id → issuing-model/tool-name links needed to attribute and classify
+ * edit rejections cross incremental-sync chunk boundaries, so per-chunk
+ * deltas would silently undercount. Recomputing absolute totals over all
+ * bytes (the same full-prefix rescan precedent as
+ * {@link scanLastServiceTier}) and letting `insertHealthSignals` REPLACE
+ * per (session_file, signal, model) keeps every
  * re-sync idempotent. The counters ride the existing offline sync path —
  * the session process itself never opens stats.db, so disabled/never-run
  * stats means none of this executes.
  */
 function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSignalStat[] {
-	const readKeys: (string | null)[] = [];
-	const editCallIds = new Set<string>();
-	let intentFill: IntentFill = { filled: 0, total: 0 };
-	let validationFailures = 0;
-	let editRejections = 0;
-	let providerErrorTurns = 0;
-	let timestamp = 0;
-	const stage: StageTimingSamples = {
-		transformMs: [],
-		ttfbMs: [],
-		streamMs: [],
-		toolErrorTurns: 0,
-		rows: 0,
-		timestamp: 0,
+	/** Per-model behavioral counter fold (key = bare model id, "" unattributable). */
+	interface ModelCounters {
+		intentFill: IntentFill;
+		validationFailures: number;
+		editRejections: number;
+		providerErrorTurns: number;
+		/** Newest contributing event for this model's counter group. */
+		timestamp: number;
+	}
+	const counters = new Map<string, ModelCounters>();
+	const counterFor = (model: string): ModelCounters => {
+		let acc = counters.get(model);
+		if (!acc) {
+			acc = {
+				intentFill: { filled: 0, total: 0 },
+				validationFailures: 0,
+				editRejections: 0,
+				providerErrorTurns: 0,
+				timestamp: 0,
+			};
+			counters.set(model, acc);
+		}
+		return acc;
 	};
+	const readKeys: (string | null)[] = [];
+	/** Issuing model per `readKeys` slot — repeat-read incidents attribute here. */
+	const readModels: string[] = [];
+	const editCallIds = new Set<string>();
+	// Tool-derived counters (validation failures, edit rejections) attribute to
+	// the model of the assistant turn that ISSUED the call, not whichever model
+	// answered later — hence the call-id → model link built from toolCall blocks.
+	const callModels = new Map<string, string>();
+	const stageByModel = new Map<string, StageTimingSamples>();
 
 	visitSessionEntriesLenient(bytes, entry => {
 		if (isAssistantMessage(entry)) {
 			const msg = entry.message as AssistantMessage;
+			const model = typeof msg.model === "string" ? msg.model : "";
 			if (isProviderErrorTurn(msg)) {
-				providerErrorTurns++;
+				const acc = counterFor(model);
+				acc.providerErrorTurns++;
 				const ts = coerceEntryTimestamp(msg.timestamp, entry);
-				if (ts > timestamp) timestamp = ts;
+				if (ts > acc.timestamp) acc.timestamp = ts;
 			}
 			if (!Array.isArray(msg.content)) return;
 			for (const rawBlock of msg.content) {
 				if (!rawBlock || typeof rawBlock !== "object" || rawBlock.type !== "toolCall") continue;
 				const block = rawBlock as ToolCall;
 				if (typeof block.name !== "string") continue;
-				intentFill = accumulateIntentFill(intentFill, [block.arguments]);
+				const acc = counterFor(model);
+				acc.intentFill = accumulateIntentFill(acc.intentFill, [block.arguments]);
 				const ts = coerceEntryTimestamp(msg.timestamp, entry);
-				if (ts > timestamp) timestamp = ts;
-				if (block.name === "edit" && typeof block.id === "string") editCallIds.add(block.id);
+				if (ts > acc.timestamp) acc.timestamp = ts;
+				if (typeof block.id === "string") {
+					callModels.set(block.id, model);
+					if (block.name === "edit") editCallIds.add(block.id);
+				}
 				let readKey: string | null = null;
 				if (block.name === "read") {
 					const args = block.arguments as Record<string, unknown> | undefined;
@@ -413,14 +438,16 @@ function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSig
 					if (typeof args?.path === "string") readKey = args.path;
 				}
 				readKeys.push(readKey);
+				readModels.push(model);
 			}
 			return;
 		}
 		if (isToolResultMessage(entry)) {
 			const msg = entry.message as ToolResultMessage;
 			if (msg.isError !== true || typeof msg.toolCallId !== "string") return;
+			const acc = counterFor(callModels.get(msg.toolCallId) ?? "");
 			const ts = coerceEntryTimestamp(msg.timestamp, entry);
-			if (ts > timestamp) timestamp = ts;
+			if (ts > acc.timestamp) acc.timestamp = ts;
 			let text = "";
 			if (Array.isArray(msg.content)) {
 				for (const resultBlock of msg.content) {
@@ -438,50 +465,60 @@ function computeHealthSignals(bytes: Uint8Array, sessionFile: string): HealthSig
 			// Pre-execution arg-schema rejections carry the pi-ai validation
 			// header regardless of tool; every other error on an `edit` call is
 			// a patch rejection (stale hash, failed hunk, ...).
-			if (text.startsWith(VALIDATION_FAILURE_PREFIX)) validationFailures++;
-			else if (editCallIds.has(msg.toolCallId)) editRejections++;
+			if (text.startsWith(VALIDATION_FAILURE_PREFIX)) acc.validationFailures++;
+			else if (editCallIds.has(msg.toolCallId)) acc.editRejections++;
 		}
 		if (entry.type === "custom") {
 			const custom = entry as { customType?: unknown; data?: unknown };
-			if (custom.customType === STAGE_TIMINGS_CUSTOM_TYPE) accumulateStageTimings(stage, custom.data);
+			if (custom.customType === STAGE_TIMINGS_CUSTOM_TYPE) accumulateStageTimings(stageByModel, custom.data);
 		}
 	});
 
+	const repeatReadsByModel = countRepeatReadsByModel(readKeys, index => readModels[index]);
 	const signals: HealthSignalStat[] = [];
-	if (intentFill.total > 0 || providerErrorTurns > 0) {
+	for (const [model, acc] of counters) {
+		// Same activity gate as the pre-model fold, now per model: a model with
+		// neither tool calls nor provider errors contributes no counter group.
+		if (acc.intentFill.total === 0 && acc.providerErrorTurns === 0) continue;
+		const { timestamp } = acc;
 		signals.push(
-			{ sessionFile, timestamp, signal: "tool_arg_validation_failures", value: validationFailures },
-			{ sessionFile, timestamp, signal: "edit_rejections", value: editRejections },
-			{ sessionFile, timestamp, signal: "repeat_reads", value: countRepeatReads(readKeys) },
-			{ sessionFile, timestamp, signal: "intent_filled_calls", value: intentFill.filled },
-			{ sessionFile, timestamp, signal: "intent_total_calls", value: intentFill.total },
-			{ sessionFile, timestamp, signal: "provider_error_turns", value: providerErrorTurns },
+			{ sessionFile, timestamp, signal: "tool_arg_validation_failures", model, value: acc.validationFailures },
+			{ sessionFile, timestamp, signal: "edit_rejections", model, value: acc.editRejections },
+			{ sessionFile, timestamp, signal: "repeat_reads", model, value: repeatReadsByModel.get(model) ?? 0 },
+			{ sessionFile, timestamp, signal: "intent_filled_calls", model, value: acc.intentFill.filled },
+			{ sessionFile, timestamp, signal: "intent_total_calls", model, value: acc.intentFill.total },
+			{ sessionFile, timestamp, signal: "provider_error_turns", model, value: acc.providerErrorTurns },
 		);
 	}
-	if (stage.rows > 0) {
+	for (const [model, stage] of stageByModel) {
+		if (stage.rows === 0) continue;
 		signals.push(
 			{
 				sessionFile,
 				timestamp: stage.timestamp,
 				signal: "stage_context_transform_p95_ms",
+				model,
 				value: nearestRankPercentile(stage.transformMs, 95),
 			},
 			{
 				sessionFile,
 				timestamp: stage.timestamp,
 				signal: "stage_provider_ttfb_p95_ms",
+				model,
 				value: nearestRankPercentile(stage.ttfbMs, 95),
 			},
 			{
 				sessionFile,
 				timestamp: stage.timestamp,
 				signal: "stage_provider_stream_p95_ms",
+				model,
 				value: nearestRankPercentile(stage.streamMs, 95),
 			},
 			{
 				sessionFile,
 				timestamp: stage.timestamp,
 				signal: "stage_tool_error_turns",
+				model,
 				value: stage.toolErrorTurns,
 			},
 		);

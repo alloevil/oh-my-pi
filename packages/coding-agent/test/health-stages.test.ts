@@ -139,6 +139,29 @@ describe("StageTimingsRecorder", () => {
 		const result = recorder.onTurnEnd();
 		expect(result?.tools).toEqual([{ name: "read", ms: 30 }]);
 	});
+
+	test("captures the streaming model at first attributable message_start; retries keep the first", () => {
+		const clock = fakeClock();
+		const recorder = new StageTimingsRecorder(clock.now);
+		recorder.onTransformStart();
+		clock.state.now += 10;
+		recorder.onTransformEnd();
+		clock.state.now += 100;
+		// An empty model id is unattributable and must not claim the slot.
+		recorder.onAssistantMessageStart("");
+		clock.state.now += 50;
+		recorder.onAssistantMessageEnd();
+		recorder.onTransformStart();
+		clock.state.now += 5;
+		recorder.onTransformEnd();
+		recorder.onAssistantMessageStart("model-a");
+		clock.state.now += 20;
+		recorder.onAssistantMessageEnd();
+		// A further retry with a different model keeps the first attribution.
+		recorder.onAssistantMessageStart("model-b");
+		const row = recorder.onTurnEnd();
+		expect(row?.model).toBe("model-a");
+	});
 });
 
 describe("parseStageTimingsRow / collectStageTimings", () => {
@@ -195,6 +218,19 @@ describe("parseStageTimingsRow / collectStageTimings", () => {
 			tools: [{ name: "bash", ms: 10 }, { name: 42, ms: 10 }, { name: "read" }],
 		});
 		expect(parsed).toEqual({ ts: 5, turnMs: 0, context: { transformMs: 3 }, tools: [{ name: "bash", ms: 10 }] });
+	});
+
+	test("parses the model field and tolerates rows without one (old sessions)", () => {
+		expect(parseStageTimingsRow({ ts: 5, turnMs: 9, model: "claude-fable-5", provider: { ttfbMs: 10 } })).toEqual({
+			ts: 5,
+			turnMs: 9,
+			model: "claude-fable-5",
+			provider: { ttfbMs: 10 },
+		});
+		expect(parseStageTimingsRow({ ts: 5, turnMs: 9, provider: { ttfbMs: 10 } })?.model).toBeUndefined();
+		// Non-string / empty model values are dropped, not propagated.
+		expect(parseStageTimingsRow({ ts: 5, turnMs: 9, model: 42, provider: { ttfbMs: 10 } })?.model).toBeUndefined();
+		expect(parseStageTimingsRow({ ts: 5, turnMs: 9, model: "", provider: { ttfbMs: 10 } })?.model).toBeUndefined();
 	});
 
 	test("a row with a timestamp but no stages is malformed", () => {

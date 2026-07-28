@@ -21,6 +21,7 @@ export { getGainDashboardStats } from "./gain-aggregator";
 export {
 	accumulateIntentFill,
 	countRepeatReads,
+	countRepeatReadsByModel,
 	type HealthSignalName,
 	type HealthSignalStat,
 	hasNonEmptyIntent,
