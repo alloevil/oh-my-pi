@@ -25,6 +25,7 @@ import type {
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
+import { getLanguageFromPath } from "../utils/lang-from-path";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
@@ -1483,29 +1484,84 @@ const HEREDOC_COLLAPSE_MIN_LINES = 4;
 const HEREDOC_OPEN_RE = /<<(-?)\s*(["']?)([A-Za-z_][\w-]*)\2/g;
 
 /**
- * Replace each long heredoc body with a one-line summary, keeping the redirect
- * line, the closing delimiter, and everything after it.
- *
- * A heredoc body is data the command carries, not command structure. Rendered as
- * command lines it takes the same visual weight as the pipeline it belongs to and
- * spends the whole preview budget (`previewWindowRows()`, i.e. the viewport) on
- * the least informative part — a 60-line PR body burying the `gh pr create` that
- * follows it.
- *
- * `raw` and `highlighted` are the same lines pre- and post-highlighting, so body
- * runs are located on `raw` and spliced out of `highlighted` by index.
+ * Language hint from a heredoc delimiter. The delimiter is the author's own label
+ * for the payload (`python3 - <<'PY'`, `<<'SQL'`), so it is a better signal than
+ * anything the surrounding shell syntax carries — but only when it names a
+ * language; `EOF`/`MSG` say nothing and fall through to the redirect target.
  */
-function collapseHeredocBodies(raw: readonly string[], highlighted: readonly string[], uiTheme: Theme): string[] {
+const HEREDOC_DELIMITER_LANG: Record<string, string> = {
+	PY: "python",
+	PYTHON: "python",
+	TS: "typescript",
+	TSX: "tsx",
+	JS: "javascript",
+	JSX: "jsx",
+	JSON: "json",
+	SQL: "sql",
+	YAML: "yaml",
+	YML: "yaml",
+	TOML: "toml",
+	HTML: "html",
+	CSS: "css",
+	MD: "markdown",
+	MARKDOWN: "markdown",
+	SH: "bash",
+	BASH: "bash",
+	RS: "rust",
+	GO: "go",
+	RB: "ruby",
+	LUA: "lua",
+	DIFF: "diff",
+	PATCH: "diff",
+};
+
+/** `> path`, `>> path`, `tee path` — where the body is headed, hence what it is. */
+const REDIRECT_TARGET_RE = /(?:>>?|\btee(?:\s+-a)?)\s+(?:"([^"]+)"|'([^']+)'|([^\s|&;<>]+))/;
+
+/**
+ * Language the heredoc payload should be highlighted as: the redirect target's
+ * extension first (a path is concrete evidence), then the delimiter label.
+ */
+function heredocBodyLanguage(openLine: string, delimiter: string): string | undefined {
+	const target = REDIRECT_TARGET_RE.exec(openLine);
+	const targetPath = target?.[1] ?? target?.[2] ?? target?.[3];
+	const fromPath = targetPath ? getLanguageFromPath(targetPath) : undefined;
+	return fromPath ?? HEREDOC_DELIMITER_LANG[delimiter.toUpperCase()];
+}
+
+/**
+ * Render heredoc bodies as the payload they are, not as shell source.
+ *
+ * Two problems, one cause. A heredoc body is data the command carries, so
+ * (a) highlighting it as bash mangles it — markdown headings, fenced blocks and
+ * tables are not shell tokens, and the whole payload came out as one
+ * undifferentiated run — and (b) rendering it as command lines gives payload
+ * bytes the same visual weight as the pipeline they belong to, spending the whole
+ * preview budget (`previewWindowRows()`, i.e. the viewport) on the least
+ * informative part: a 57-line PR body burying the `gh pr create` that consumed it.
+ *
+ * So each body is highlighted in its own language (inferred from the redirect
+ * target or the delimiter label) and, unless expanded, bodies longer than
+ * {@link HEREDOC_COLLAPSE_MIN_LINES} fold into one summary line. Bash lines keep
+ * the whole-command bash highlighting they always had: `raw` and `highlighted`
+ * are the same lines pre- and post-highlighting, so body runs are located on
+ * `raw` and replaced in `highlighted` by index.
+ */
+function renderHeredocBodies(
+	raw: readonly string[],
+	highlighted: readonly string[],
+	uiTheme: Theme,
+	expanded: boolean,
+): string[] {
 	const out: string[] = [];
 	for (let i = 0; i < raw.length; i++) {
 		const line = raw[i]!;
 		out.push(highlighted[i] ?? line);
 		HEREDOC_OPEN_RE.lastIndex = 0;
-		// The last redirect on the line owns the body that starts first; nested
-		// heredocs on one line are rare enough that collapsing to the first
-		// terminator is the honest approximation.
-		const opens = [...line.matchAll(HEREDOC_OPEN_RE)];
-		const open = opens[0];
+		// The first redirect on the line owns the body that starts first; several
+		// heredocs on one line are rare enough that treating the first terminator as
+		// the end is the honest approximation.
+		const open = [...line.matchAll(HEREDOC_OPEN_RE)][0];
 		if (!open) continue;
 		// `<<-` lets the terminator be tab-indented. The display pipeline has already
 		// expanded tabs to spaces by this point, so leading whitespace — not tabs
@@ -1514,17 +1570,44 @@ function collapseHeredocBodies(raw: readonly string[], highlighted: readonly str
 		const delimiter = open[3]!;
 		let end = i + 1;
 		while (end < raw.length && (indentedTerminator ? raw[end]!.trimStart() : raw[end]!) !== delimiter) end++;
-		const bodyLength = end - (i + 1);
-		if (bodyLength < HEREDOC_COLLAPSE_MIN_LINES) continue;
-		const terminated = end < raw.length;
-		const suffix = terminated ? "" : ", still streaming";
-		out.push(
-			uiTheme.fg("dim", `… ${bodyLength} ${pluralize("line", bodyLength)} of heredoc body (${delimiter}${suffix})`),
-		);
+		const body = raw.slice(i + 1, end);
+		if (body.length === 0) continue;
+		// The bash highlighter reads everything after `<<'DELIM'` as an unterminated
+		// string and leaves its colour open at end of line. The payload is highlighted
+		// by a different grammar, so without a reset every span the payload highlighter
+		// leaves uncoloured inherits bash's string colour.
+		out[out.length - 1] += "\x1b[0m";
+
+		if (!expanded && body.length >= HEREDOC_COLLAPSE_MIN_LINES) {
+			const language = heredocBodyLanguage(line, delimiter);
+			const label = language ? `${delimiter}, ${language}` : delimiter;
+			const streaming = end < raw.length ? "" : ", still streaming";
+			out.push(
+				uiTheme.fg(
+					"dim",
+					`… ${body.length} ${pluralize("line", body.length)} of heredoc body (${label}${streaming})`,
+				),
+			);
+		} else {
+			out.push(...highlightHeredocBody(body, heredocBodyLanguage(line, delimiter), uiTheme));
+		}
 		// Skip the body; the terminator line itself stays visible.
 		i = end - 1;
 	}
 	return out;
+}
+
+/**
+ * Highlight a payload in its own language, falling back to muted plain text when
+ * the language is unknown or unsupported — muted rather than default, so the
+ * payload still reads as data sitting inside a command.
+ */
+function highlightHeredocBody(body: readonly string[], language: string | undefined, uiTheme: Theme): string[] {
+	if (language) {
+		const highlighted = highlightCode(body.join("\n"), language);
+		if (highlighted.length === body.length) return highlighted;
+	}
+	return body.map(line => uiTheme.fg("muted", line));
 }
 
 /**
@@ -1533,9 +1616,9 @@ function collapseHeredocBodies(raw: readonly string[], highlighted: readonly str
  * only to the first line so multi-line commands display cleanly — terminals
  * reset SGR state at line boundaries, which made the previous single-string
  * `theme.fg("dim", ...)` form render only the first line as dim.
- *
- * Collapsed (the default), long heredoc bodies fold into a summary line; the
- * expanded view (`ctrl+o`) shows the payload verbatim.
+ * Heredoc payloads are highlighted in their own language rather than as shell
+ * source; collapsed (the default) a long body folds into a summary line, and the
+ * expanded view (`ctrl+o`) shows every payload line.
  */
 export function formatBashCommandLines(
 	args: BashRenderArgs,
@@ -1552,9 +1635,7 @@ export function formatBashCommandLines(
 	const prefix = uiTheme.fg("dim", `${prefixParts.join(" ")} `);
 	const highlightedLines = highlightCode(command, "bash");
 	if (highlightedLines.length === 0) return [prefix.trimEnd()];
-	const lines = options.expanded
-		? [...highlightedLines]
-		: collapseHeredocBodies(command.split("\n"), highlightedLines, uiTheme);
+	const lines = renderHeredocBodies(command.split("\n"), highlightedLines, uiTheme, options.expanded === true);
 	return lines.map((line, i) => (i === 0 ? `${prefix}${line}` : line));
 }
 
