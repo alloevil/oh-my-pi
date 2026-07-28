@@ -108,6 +108,7 @@ export type SymbolKey =
 	| "icon.context"
 	| "icon.cost"
 	| "icon.time"
+	| "icon.health"
 	| "icon.pi"
 	| "icon.ghost"
 	| "icon.agents"
@@ -318,6 +319,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.context": "◫",
 	"icon.cost": "💲",
 	"icon.time": "⏱",
+	"icon.health": "🛡",
 	"icon.pi": "π",
 	"icon.ghost": "👻",
 	"icon.agents": "👥",
@@ -594,6 +596,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.cost": "\uf155",
 	// pick:  | alt: ◷ ◴
 	"icon.time": "\uf017",
+	// pick:  (nf-fa-shield) | alt: 󰒃 (nf-md-shield) ✓
+	"icon.health": "\uf132",
 	// pick:  | alt: π ∏ ∑
 	"icon.pi": "\ue22c",
 	// pick: 󰊠 (nf-md-ghost) | alt: 👻
@@ -838,6 +842,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.context": "ctx:",
 	"icon.cost": "$",
 	"icon.time": "t:",
+	"icon.health": "ok",
 	"icon.pi": "pi",
 	"icon.ghost": "@",
 	"icon.agents": "AG",
@@ -1838,6 +1843,7 @@ export class Theme {
 			context: this.#symbols["icon.context"],
 			cost: this.#symbols["icon.cost"],
 			time: this.#symbols["icon.time"],
+			health: this.#symbols["icon.health"],
 			pi: this.#symbols["icon.pi"],
 			ghost: this.#symbols["icon.ghost"],
 			agents: this.#symbols["icon.agents"],

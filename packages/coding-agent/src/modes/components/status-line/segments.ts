@@ -683,7 +683,7 @@ const healthSegment: StatusLineSegment = {
 		const ledger = ctx.session.healthLedger as HealthLedger | undefined;
 		if (!ledger) return { content: "", visible: false };
 		const counts = ledger.counts();
-		const badge = formatHealthBadge(counts);
+		const badge = formatHealthBadge(counts, theme.icon.health);
 		const color: ThemeColor = counts.warn > 0 ? "warning" : counts.info > 0 ? "muted" : "success";
 		return { content: theme.fg(color, badge), visible: true };
 	},

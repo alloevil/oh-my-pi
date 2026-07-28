@@ -11,7 +11,7 @@ import {
 import { HealthLedger } from "@oh-my-pi/pi-coding-agent/health/ledger";
 import { SEGMENTS } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
 import type { SegmentContext } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/types";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 /** Minimal segment context: the health segment only reads `session.healthLedger`. */
 function contextWithSession(session: unknown): SegmentContext {
@@ -204,10 +204,11 @@ describe("health status-line segment", () => {
 		await initTheme();
 	});
 
-	it("renders the quiet heartbeat for an empty ledger (healthy ≠ monitor-off)", () => {
+	it("renders the theme's health shield for an empty ledger (healthy ≠ monitor-off)", () => {
 		const rendered = SEGMENTS.health.render(contextWithSession({ healthLedger: new HealthLedger() }));
 		expect(rendered.visible).toBe(true);
-		expect(rendered.content).toContain("✓");
+		expect(theme.icon.health.length).toBeGreaterThan(0);
+		expect(rendered.content).toContain(theme.icon.health);
 	});
 
 	it("renders nothing when the session exposes no ledger", () => {
