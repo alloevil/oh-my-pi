@@ -4,8 +4,8 @@
  * Pure, deterministic helpers — no DB handle, no I/O, no model calls. The
  * parser folds a session's tool-call / tool-result events through these and
  * emits absolute per-session totals; `insertHealthSignals` (db.ts) upserts
- * them keyed on `(session_file, signal)`, so a full-file recompute stays
- * idempotent under the offset-based incremental sync.
+ * them keyed on `(session_file, signal, model)`, so a full-file recompute
+ * stays idempotent under the offset-based incremental sync.
  *
  * Signals ride the existing offline stats write path (session JSONL →
  * `syncAllSessions` → stats.db). The session process never opens a second
@@ -33,6 +33,8 @@ export interface HealthSignalStat {
 	/** Unix ms of the newest transcript event that contributed (0 when unknown). */
 	timestamp: number;
 	signal: HealthSignalName;
+	/** Bare model id the counter attributes to (e.g. "claude-fable-5"), "" when unattributable. */
+	model: string;
 	value: number;
 }
 
@@ -109,11 +111,27 @@ export interface StageTimingSamples {
 	timestamp: number;
 }
 
-/** Fold one `stage_timings` entry payload into the accumulator; malformed payloads are ignored. */
-export function accumulateStageTimings(acc: StageTimingSamples, data: unknown): void {
+/** Empty stage-timing sample accumulator (one per attributed model). */
+export function createStageTimingSamples(): StageTimingSamples {
+	return { transformMs: [], ttfbMs: [], streamMs: [], toolErrorTurns: 0, rows: 0, timestamp: 0 };
+}
+
+/**
+ * Fold one `stage_timings` entry payload into the per-model accumulator map;
+ * malformed payloads are ignored. Rows carry their own bare `model` id
+ * (captured at assistant `message_start` by the runtime recorder); rows
+ * persisted before model capture fold under "".
+ */
+export function accumulateStageTimings(byModel: Map<string, StageTimingSamples>, data: unknown): void {
 	if (data === null || typeof data !== "object") return;
 	const row = data as Record<string, unknown>;
 	if (typeof row.ts !== "number" || !Number.isFinite(row.ts)) return;
+	const model = typeof row.model === "string" ? row.model : "";
+	let acc = byModel.get(model);
+	if (!acc) {
+		acc = createStageTimingSamples();
+		byModel.set(model, acc);
+	}
 	acc.rows++;
 	if (row.ts > acc.timestamp) acc.timestamp = row.ts;
 	const context = row.context as Record<string, unknown> | undefined;
@@ -148,7 +166,8 @@ export function nearestRankPercentile(values: readonly number[], p: number): num
 }
 
 /**
- * Count repeat-read incidents over an ordered tool-call sequence.
+ * Count repeat-read incidents per attributed model over an ordered tool-call
+ * sequence.
  *
  * `readKeys[n]` is the dedup key of the n-th tool call when it was a `read`
  * (the raw `path` argument — inline selectors like `:50-200` ride in the
@@ -157,15 +176,21 @@ export function nearestRankPercentile(values: readonly number[], p: number): num
  * trailing `windowSize`-call window climbs to exactly `threshold` —
  * transition-only, so a 4th read in the same window does not double count;
  * once eviction drops the key below threshold, a later burst counts again.
+ *
+ * The sliding window spans the whole sequence regardless of model — a burst
+ * is a burst even when models interleave. Each incident attributes to the
+ * model that issued the threshold-crossing read (`modelOf(index)`, "" when
+ * unattributable); the map only carries models with at least one incident.
  */
-export function countRepeatReads(
+export function countRepeatReadsByModel(
 	readKeys: readonly (string | null)[],
+	modelOf: (index: number) => string,
 	windowSize = REPEAT_READ_WINDOW,
 	threshold = REPEAT_READ_THRESHOLD,
-): number {
-	if (windowSize < 1 || threshold < 1) return 0;
+): Map<string, number> {
+	const incidents = new Map<string, number>();
+	if (windowSize < 1 || threshold < 1) return incidents;
 	const counts = new Map<string, number>();
-	let incidents = 0;
 	for (let i = 0; i < readKeys.length; i++) {
 		const evictIndex = i - windowSize;
 		if (evictIndex >= 0) {
@@ -182,7 +207,21 @@ export function countRepeatReads(
 		if (key === null) continue;
 		const next = (counts.get(key) ?? 0) + 1;
 		counts.set(key, next);
-		if (next === threshold) incidents++;
+		if (next === threshold) {
+			const model = modelOf(i);
+			incidents.set(model, (incidents.get(model) ?? 0) + 1);
+		}
 	}
 	return incidents;
+}
+
+/** Total repeat-read incidents regardless of model — see {@link countRepeatReadsByModel}. */
+export function countRepeatReads(
+	readKeys: readonly (string | null)[],
+	windowSize = REPEAT_READ_WINDOW,
+	threshold = REPEAT_READ_THRESHOLD,
+): number {
+	let total = 0;
+	for (const value of countRepeatReadsByModel(readKeys, () => "", windowSize, threshold).values()) total += value;
+	return total;
 }

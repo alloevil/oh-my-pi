@@ -34,7 +34,7 @@ import {
 	updateToolResults,
 	updateUserMessageLinks,
 } from "./db";
-import type { HealthSignalStat } from "./health-signals";
+import type { HealthSignalName, HealthSignalStat } from "./health-signals";
 import { getSessionEntry, listAllSessionFiles, type ParseSessionResult, parseSessionFile } from "./parser";
 import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
@@ -465,11 +465,12 @@ export async function getRecentRequests(limit?: number): Promise<MessageStats[]>
 
 /**
  * Read the per-session behavioral health counters recorded for one session
- * file. Dumb SELECT wrapper for health/doctor consumers.
+ * file. Dumb SELECT wrapper for health/doctor consumers; `signal` optionally
+ * narrows to one counter.
  */
-export async function readHealthSignals(sessionFile: string): Promise<HealthSignalStat[]> {
+export async function readHealthSignals(sessionFile: string, signal?: HealthSignalName): Promise<HealthSignalStat[]> {
 	await initDb();
-	return dbReadHealthSignals(sessionFile);
+	return dbReadHealthSignals(sessionFile, signal);
 }
 
 export async function getRecentErrors(range?: string | null, limit?: number): Promise<MessageStats[]> {

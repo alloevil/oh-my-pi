@@ -3124,7 +3124,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							stageTimings.reset();
 							break;
 						case "message_start":
-							if (event.message.role === "assistant") stageTimings.onAssistantMessageStart();
+							if (event.message.role === "assistant") stageTimings.onAssistantMessageStart(event.message.model);
 							break;
 						case "message_end":
 							if (event.message.role === "assistant") stageTimings.onAssistantMessageEnd();

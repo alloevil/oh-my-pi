@@ -65,6 +65,13 @@ export interface StageTimingsRow {
 	ts: number;
 	/** First clock point → `turn_end`, ms. */
 	turnMs: number;
+	/**
+	 * Bare model id of the assistant message that streamed this turn (the
+	 * first `message_start` — retries within the turn keep the first
+	 * attribution, matching `ttfbMs`). Absent on rows written before model
+	 * capture existed or when the turn never reached `message_start`.
+	 */
+	model?: string;
 	context?: StageContextTiming;
 	provider?: StageProviderTiming;
 	tools?: StageToolTiming[];
@@ -80,6 +87,7 @@ interface OpenTurnState {
 	ttfbMs?: number;
 	firstMessageStartTs?: number;
 	lastMessageEndTs?: number;
+	model?: string;
 	pendingTools: Map<string, { name: string; startTs: number }>;
 	tools: StageToolTiming[];
 }
@@ -124,8 +132,8 @@ export class StageTimingsRecorder {
 		if (promptChars !== undefined) turn.promptChars = promptChars;
 	}
 
-	/** Assistant message began streaming. */
-	onAssistantMessageStart(): void {
+	/** Assistant message began streaming; `model` is the bare model id off the message. */
+	onAssistantMessageStart(model?: string): void {
 		const turn = this.#turn;
 		if (!turn) return;
 		const now = this.#now();
@@ -133,6 +141,7 @@ export class StageTimingsRecorder {
 			turn.ttfbMs = Math.max(0, now - turn.transformEndTs);
 		}
 		if (turn.firstMessageStartTs === undefined) turn.firstMessageStartTs = now;
+		if (turn.model === undefined && typeof model === "string" && model.length > 0) turn.model = model;
 	}
 
 	/** Assistant message settled (complete, aborted, or errored). */
@@ -167,6 +176,7 @@ export class StageTimingsRecorder {
 		this.#turn = undefined;
 		if (!turn) return undefined;
 		const row: StageTimingsRow = { ts: turn.ts, turnMs: Math.max(0, this.#now() - turn.ts) };
+		if (turn.model !== undefined) row.model = turn.model;
 		if (turn.transformMs !== undefined) {
 			row.context = { transformMs: turn.transformMs };
 			if (turn.promptChars !== undefined) row.context.promptChars = turn.promptChars;
@@ -200,6 +210,9 @@ export function parseStageTimingsRow(data: unknown): StageTimingsRow | undefined
 		ts: record.ts,
 		turnMs: typeof record.turnMs === "number" && Number.isFinite(record.turnMs) ? record.turnMs : 0,
 	};
+	// Rows persisted before model capture (or turns that never streamed) have
+	// no `model`; readers treat absence as unattributable.
+	if (typeof record.model === "string" && record.model.length > 0) row.model = record.model;
 	const context = record.context;
 	if (context !== null && typeof context === "object") {
 		const transformMs = (context as Record<string, unknown>).transformMs;
