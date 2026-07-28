@@ -137,8 +137,8 @@ describe("silent-model-switch detection", () => {
 });
 
 describe("health badge formatting", () => {
-	it("returns null for an empty ledger", () => {
-		expect(formatHealthBadge({ info: 0, warn: 0 })).toBeNull();
+	it("returns the heartbeat glyph for an empty ledger", () => {
+		expect(formatHealthBadge({ info: 0, warn: 0 })).toBe("✓");
 	});
 
 	it("renders the warn count with the warning glyph", () => {
@@ -204,10 +204,10 @@ describe("health status-line segment", () => {
 		await initTheme();
 	});
 
-	it("renders nothing for an empty ledger (zero-noise contract)", () => {
+	it("renders the quiet heartbeat for an empty ledger (healthy ≠ monitor-off)", () => {
 		const rendered = SEGMENTS.health.render(contextWithSession({ healthLedger: new HealthLedger() }));
-		expect(rendered.visible).toBe(false);
-		expect(rendered.content).toBe("");
+		expect(rendered.visible).toBe(true);
+		expect(rendered.content).toContain("✓");
 	});
 
 	it("renders nothing when the session exposes no ledger", () => {

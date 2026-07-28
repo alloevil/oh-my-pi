@@ -196,12 +196,14 @@ export function detectSilentModelSwitch(
 
 /**
  * Compact status-bar badge: `⚠N` when any warn finding exists, `·N` for
- * info-only ledgers, `null` when the ledger is empty (zero-noise contract).
+ * info-only ledgers, and a quiet `✓` heartbeat when the ledger is empty —
+ * distinguishing "healthy" from "monitor not running" (a missing ledger
+ * renders nothing at the segment level).
  */
-export function formatHealthBadge(counts: HealthCounts): string | null {
+export function formatHealthBadge(counts: HealthCounts): string {
 	if (counts.warn > 0) return `⚠${counts.warn}`;
 	if (counts.info > 0) return `·${counts.info}`;
-	return null;
+	return "✓";
 }
 
 /** One-line session-end summary; `null` when there is nothing to warn about. */
