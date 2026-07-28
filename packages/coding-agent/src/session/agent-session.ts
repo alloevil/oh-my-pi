@@ -2166,16 +2166,12 @@ export class AgentSession {
 			message.model ? { provider: message.provider, id: message.model } : undefined,
 		);
 		if (!detected) return;
-		recordHealthFinding(
-			this.#healthLedger,
-			{
-				rule: HEALTH_RULES.silentModelSwitch,
-				severity: "info",
-				message: `assistant answered with ${detected.answered} while ${detected.configured} is configured`,
-				details: { ...detected },
-			},
-			noticeMessage => this.emitNotice("warning", noticeMessage, "health"),
-		);
+		recordHealthFinding(this.#healthLedger, {
+			rule: HEALTH_RULES.silentModelSwitch,
+			severity: "info",
+			message: `assistant answered with ${detected.answered} while ${detected.configured} is configured`,
+			details: { ...detected },
+		});
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
@@ -2215,6 +2211,12 @@ export class AgentSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#observeAssistantModelHealth(event.message);
+			// Deferred health-guard notices land here — right after the newest
+			// assistant message — instead of wherever the guard fired (startup
+			// mounts and mid-turn rebuilds sit far above the user's viewport).
+			for (const noticeMessage of this.#healthLedger.drainNotices()) {
+				this.emitNotice("warning", noticeMessage, "health");
+			}
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -3534,6 +3536,10 @@ export class AgentSession {
 			}
 		} catch (error) {
 			logger.debug("Session-end doctor sweep failed", { error: String(error) });
+		}
+		// Queued guard notices that never met a turn boundary still surface once.
+		for (const noticeMessage of this.#healthLedger.drainNotices()) {
+			this.emitNotice("warning", noticeMessage, "health");
 		}
 		const healthSummary = formatSessionEndHealthSummary(this.#healthLedger.counts());
 		if (healthSummary) this.emitNotice("warning", healthSummary, "health");

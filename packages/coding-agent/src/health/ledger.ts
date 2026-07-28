@@ -50,10 +50,28 @@ export interface HealthCounts {
 export class HealthLedger {
 	#findings: HealthFinding[] = [];
 	#listeners = new Set<() => void>();
+	#pendingNotices: string[] = [];
 
 	/** All findings in insertion order. */
 	findings(): readonly HealthFinding[] {
 		return this.#findings;
+	}
+
+	/**
+	 * Queue a user-facing notice for deferred delivery. Guards fire mid-turn or
+	 * during startup, where an immediate transcript notice lands far from the
+	 * user's viewport; the session drains this queue at the next turn boundary
+	 * so notices appear beside the latest message.
+	 */
+	queueNotice(message: string): void {
+		this.#pendingNotices.push(message);
+	}
+
+	/** Take all queued notices, leaving the queue empty. */
+	drainNotices(): string[] {
+		const drained = this.#pendingNotices;
+		this.#pendingNotices = [];
+		return drained;
 	}
 
 	/** Append a new finding unconditionally. */
