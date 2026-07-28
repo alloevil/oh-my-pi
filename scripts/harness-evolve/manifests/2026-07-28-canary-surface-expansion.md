@@ -136,4 +136,4 @@ Manual metrics — predictions the canary does not measure; fill by hand:
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-07-28; baseline range and stability predictions held (92.4% zero-spread, 28/30, 4.5min)

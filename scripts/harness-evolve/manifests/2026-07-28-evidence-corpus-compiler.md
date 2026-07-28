@@ -107,4 +107,4 @@ the boxes above after review):
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-07-28; all pre-registered predictions held (routing within tolerance, edit gate at baseline)
