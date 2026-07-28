@@ -669,11 +669,12 @@ const usageSegment: StatusLineSegment = {
 };
 
 /**
- * Session health badge. Zero-noise contract: renders nothing while the
- * session's {@link HealthLedger} is empty; otherwise a compact count badge
- * (`⚠2` when warn findings exist, `·3` for info-only). The status-line
- * component subscribes to ledger changes to repaint; this render reads the
- * live counts each pass.
+ * Session health badge. Renders a quiet muted `✓` heartbeat while the
+ * session's {@link HealthLedger} is empty (healthy ≠ monitor-off), a compact
+ * count badge otherwise (`⚠2` when warn findings exist, `·3` for info-only).
+ * Sessions without a ledger (partial test doubles) render nothing. The
+ * status-line component subscribes to ledger changes to repaint; this render
+ * reads the current counts only.
  */
 const healthSegment: StatusLineSegment = {
 	id: "health",
@@ -683,8 +684,8 @@ const healthSegment: StatusLineSegment = {
 		if (!ledger) return { content: "", visible: false };
 		const counts = ledger.counts();
 		const badge = formatHealthBadge(counts);
-		if (!badge) return { content: "", visible: false };
-		return { content: theme.fg(counts.warn > 0 ? "warning" : "muted", badge), visible: true };
+		const color: ThemeColor = counts.warn > 0 ? "warning" : counts.info > 0 ? "muted" : "success";
+		return { content: theme.fg(color, badge), visible: true };
 	},
 };
 
