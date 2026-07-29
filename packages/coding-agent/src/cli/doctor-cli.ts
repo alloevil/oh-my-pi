@@ -5,6 +5,7 @@
  * allowed here. The analysis itself lives in `../health/doctor`.
  */
 import * as path from "node:path";
+import { buildAutopsy, renderAutopsy, type SessionAutopsy } from "../health/autopsy";
 import { evaluateScan, scanSession } from "../health/doctor";
 import type { HealthFindingInput, HealthSeverity } from "../health/ledger";
 import {
@@ -28,6 +29,8 @@ export interface DoctorCommandFlags {
 	outbound?: boolean;
 	/** Show per-turn pipeline stage timings instead of findings. */
 	stages?: boolean;
+	/** Show the deterministic behavioral autopsy instead of findings. */
+	autopsy?: boolean;
 }
 
 export interface DoctorCommandArgs {
@@ -47,6 +50,8 @@ export interface DoctorReport {
 	outbound?: OutboundRequestSummary[];
 	/** Present only with `--stages`. */
 	stages?: StageTimingsRow[];
+	/** Present only with `--autopsy`. */
+	autopsy?: SessionAutopsy;
 }
 
 /**
@@ -137,6 +142,14 @@ export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cw
 		const id = report.sessionId ?? path.basename(sessionPath, ".jsonl");
 		process.stdout.write(
 			args.flags.json ? `${JSON.stringify(report.stages, null, 2)}\n` : renderStagesReport(id, report.stages),
+		);
+		return report;
+	}
+	if (args.flags.autopsy) {
+		report.autopsy = buildAutopsy(entries);
+		const id = report.sessionId ?? path.basename(sessionPath, ".jsonl");
+		process.stdout.write(
+			args.flags.json ? `${JSON.stringify(report.autopsy, null, 2)}\n` : `${renderAutopsy(id, report.autopsy)}\n`,
 		);
 		return report;
 	}

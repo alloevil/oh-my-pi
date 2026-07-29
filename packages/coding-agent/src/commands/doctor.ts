@@ -25,13 +25,17 @@ export default class Doctor extends Command {
 			description:
 				"Show per-turn pipeline stage timings (context transform, provider ttfb/stream, tool execution) with the slowest turns",
 		}),
+		autopsy: Flags.boolean({
+			description:
+				"Show the deterministic behavioral autopsy (error clusters, repeated command prefixes, ending state, ask waits) — computed evidence, human judgment",
+		}),
 	};
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Doctor);
 		const cmd: DoctorCommandArgs = {
 			session: args.session,
-			flags: { json: flags.json, outbound: flags.outbound, stages: flags.stages },
+			flags: { json: flags.json, outbound: flags.outbound, stages: flags.stages, autopsy: flags.autopsy },
 		};
 		try {
 			await runDoctorCommand(cmd);
