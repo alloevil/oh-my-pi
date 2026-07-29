@@ -34,3 +34,21 @@ Fixes applied at other layers:
 - `mac-mail-automation` user skill — strategy ladder so the same task starts
   with Mail rules / batch AppleScript instead of ending at per-message UI
   clicks.
+
+### Candidate measurements — 2026-07-28, corpus = 380 sessions (7 with bash/eval)
+
+| Candidate | Result | Verdict |
+|---|---|---|
+| consecutive same-prefix failures ≥3 | **0 firings anywhere — including the incident.** The incident's failures were 16 distinct shapes interleaved with successes ("wandering between walls"), never 3 consecutive hits on one wall | **discarded — deaf** |
+| error-diversity ≥0.7 with total ≥10 | 2 firings: the incident (19/16, 0.84) **and** a legitimate dev session (16/15, 0.94 — iteration, not flailing). 50% precision, n=3 eligible | **report-only**; not separable at this corpus size |
+| dominant command prefix ≥50 | 1 firing: the incident at **120×**. Next highest in the corpus: 11× (another Mail session), 10× (dev). Margin 120 vs 11 | **survives** — the one candidate fit for a live nudge |
+
+Delivery seam for the surviving candidate (per advisor recon): the advisor
+subsystem cannot host trajectory oversight (off by default, delta-only view,
+same-theme note dedup silences repeated nudges), but `ToolCallLoopGuard`
+(threshold: 5 consecutive *identical* calls → hidden redirect custom message
+at turn end) is the exact structural idiom — the churn nudge is its
+generalization from "identical call ×5" to "same first-line prefix ×50",
+attached on the same `setOnTurnEnd` chain next to `LoopGuards.recordTurn`.
+Advisor's own system prompt already lists "Churning" as a concern trigger
+with nothing computing it.
