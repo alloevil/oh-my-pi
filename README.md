@@ -1,44 +1,61 @@
-# oh-my-pi · `main-plus` (alloevil fork)
+<h1 align="center">oh-my-pi · <code>main-plus</code></h1>
 
-> [!IMPORTANT]
-> This branch is **upstream [`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi) `main` + every modification below**, merged against upstream continuously. Upstream-agnostic changes are contributed back as focused PRs; the rest incubates here. Everything in this section is fork-specific — the upstream README follows after it.
+<p align="center">
+  <strong>Upstream, plus a self-observing harness.</strong>
+</p>
 
-### Session health stack
+<p align="center">
+  <a href="https://github.com/can1357/oh-my-pi"><img src="https://img.shields.io/badge/base-can1357%2Foh--my--pi%20main-58A6FF?style=flat&colorA=222222" alt="base"></a>
+  <img src="https://img.shields.io/badge/routing%20canary-92.4%25-3FB950?style=flat&colorA=222222" alt="routing canary">
+  <img src="https://img.shields.io/badge/edit%20gate-28%2F30-3FB950?style=flat&colorA=222222" alt="edit gate">
+  <a href="https://github.com/can1357/oh-my-pi/pulls?q=is%3Apr+author%3Aalloevil"><img src="https://img.shields.io/badge/upstream%20PRs-3%20open-CB3837?style=flat&colorA=222222" alt="upstream PRs"></a>
+  <a href="scripts/harness-evolve/manifests/"><img src="https://img.shields.io/badge/manifest%20cards-8-DEA584?style=flat&colorA=222222" alt="manifest cards"></a>
+</p>
 
-Deterministic degradation detection for live sessions — code measures, the model self-reports nothing.
+<p align="center">
+  Every harness change ships with failure evidence, a pre-registered prediction, and a measured verdict.<br>
+  Code measures — the model self-reports nothing. The upstream README follows <a href="#install-anchor">below</a>.
+</p>
 
-- **`omp doctor [--json|--stages|--outbound]`** — post-hoc transcript analysis: 6 rules (error turns, model switches, injection volume, oversized messages, thinking collapse, duplicate device routes), per-turn pipeline stage timings (context transform / provider ttfb+stream / per-tool, p50/p95/max), and outbound request summaries with structural diffs between consecutive provider calls.
-- **Live guards** — prompt-size jumps, duplicate device routes, silent model switches, and provider-error streaks surface as notices at turn boundaries; a status-line `health` segment shows a quiet `✓` heartbeat when clean, `·N`/`⚠N` otherwise. `/health` lists current findings in-session.
-- **`omp evidence [--sessions N] [--out|--json]`** — compiles doctor findings, stage timings, outbound diffs, and behavioral telemetry for recent sessions into a three-layer markdown report: cross-session overview (with an honest "insufficient baseline" placeholder instead of fabricated trends), per-session deep-dives for anomalous sessions only, and verbatim `[session:entry]` source citations.
-- **Behavioral telemetry** — per-(session, signal, model) counters in the local stats DB: tool-arg validation failures, edit rejections, repeated reads, intent-field fill rate (a cheap, same-source-immune attention canary).
+| | What's added on this branch |
+|---|---|
+| **`omp doctor`** | Post-hoc transcript analysis: 6 rules (error turns, silent model switches, injection volume, oversized messages, thinking collapse, duplicate routes) · `--stages` per-turn pipeline timings (context / provider ttfb+stream / per-tool, p50/p95/max) · `--outbound` provider-request summaries with structural diffs |
+| **Live guards** | Prompt-size jumps, duplicate device routes, model switches, provider-error streaks — delivered at turn boundaries; status-line `health` segment (`✓` heartbeat / `·N` / `⚠N`); `/health` in-session |
+| **`omp evidence`** | Three-layer report over recent sessions: cross-session overview (honest "insufficient baseline" placeholder, never fabricated trends) → deep-dives for anomalous sessions only → verbatim `[session:entry]` citations |
+| **Telemetry** | Per-(session, signal, model) counters: tool-arg failures, edit rejections, repeated reads, intent-field fill rate — a cheap, same-source-immune attention canary |
+| **Evolution discipline** | `scripts/harness-evolve/`: manifest card per change (evidence → root cause → fix → prediction), `bun run manifest:verify` auto-checks against two fitness functions, human binds `keep`/`rollback`/`revise`. Falsified predictions are recorded, not widened |
+| **Fitness functions** | Routing canary: 24 synthetic skills / 12 near-neighbor pairs / 144 queries, baseline 92.4% at zero spread · Edit gate: 30 pinned tasks across all 20 mutation families, temp-0, median-of-3, baseline 28/30 |
 
-### Harness-evolution discipline
+<details>
+<summary><strong>Research & experiments</strong> — what was tried, measured, falsified, and retracted</summary>
+<br>
 
-Every harness change carries a manifest card (`scripts/harness-evolve/`): failure evidence → root cause → targeted fix → **pre-registered measurable predictions**, auto-checked by `bun run manifest:verify` against two fixed fitness functions, then human-adjudicated (`keep`/`rollback`/`revise`). Falsified predictions are recorded, not widened. Inspired by the AHE paper (arXiv 2604.25850); cards live in `scripts/harness-evolve/manifests/`, including the falsification cases.
+Full record: [`docs/notes/2026-07-27-harness-optimization-measurements.md`](docs/notes/2026-07-27-harness-optimization-measurements.md)
 
-- **Routing canary** — 24 synthetic skills in 12 near-neighbor pairs, 144 queries, weak-router baseline 92.4% (zero spread across repeats), designed off-ceiling so regressions move the number.
-- **Edit gate** — 30 pinned tasks covering all 20 mutation families of the in-repo edit benchmark, temp-0, median-of-3 baseline 28/30.
+- **Skill brief mode** — implemented → measured (system prompt 20436 → 16203 chars, −20.7%) → **falsified** (weak-router A/B over the real prompt: compressed descriptions lose the cues separating near-neighbor skills) → **reverted**. The feat+revert commit pair stays on this branch: the falsification *is* the record. AHE's ablation later independently agreed — system prompt was its only negative component.
+- **Measurement methodology that survived**: weak-model probe over the *real* full prompt (strong models mask routing damage) · repeat runs against the noise floor before trusting any delta · `NULL_PROMPT` gate sanity check (gutted prompt → 0% must follow).
+- **Canary calibration** — the first fixture set scored a non-discriminative 100%; near-neighbor pairs plus boundary/exclusion-bait queries brought it off-ceiling. Fitness surface later widened 60 → 174 samples specifically to resist overfitting by any future evolution loop.
+- **External survey with source verification** — AHE (arXiv 2604.25850, code-verified) absorbed in three phases; ECC qualified as content-pack, not harness. Two aggregator-sourced claims failed primary-source checks and are **retracted in the notes** — the retraction record stays.
+- **Guard incubation** — rules ship pull-mode first (`omp doctor`), promoted to always-on only once the false-positive rate is known. Two live loops so far: two false positives fixed (MCP-refresh prompt jumps; user-aborted turns counted as errors), one true positive caught (a streak of real provider stalls).
 
-### Research & experiments
+</details>
 
-Full record in [`docs/notes/2026-07-27-harness-optimization-measurements.md`](docs/notes/2026-07-27-harness-optimization-measurements.md); the short version:
-
-- **Skill brief mode** (implemented → measured → **falsified → reverted**). Frontmatter summaries cut the system prompt 20436 → 16203 chars (−20.7%), but a routing A/B with a weak router over the real system prompt showed the compressed descriptions lose the discriminative cues that separate near-neighbor skills. Conclusion: conciseness is the skill author's job, not the harness's. The revert is a commit pair on this branch, kept deliberately — the falsification *is* the record. The AHE paper's ablation later independently agreed (system prompt was its only negative component).
-- **Measurement methodology** that survived the experiment: weak-model probe over the *real* full prompt (a strong model masks routing damage), repeat runs against the noise floor before trusting any delta, and `NULL_PROMPT` as a gate sanity check (guts the prompt → 0% must follow).
-- **Canary calibration** — the first routing fixture set scored a non-discriminative 100%; it took near-neighbor skill pairs plus boundary/exclusion-bait queries to land off-ceiling where regressions actually move the number. Fitness surface later widened 60 → 174 samples specifically to resist overfitting by any future automated evolution loop.
-- **External survey with source verification** — AHE (arXiv 2604.25850, code-verified) absorbed as three phases (manifest discipline now, evidence corpus next, constrained evolution agent only after the fitness surface and card corpus justify it); ECC qualified as content-pack rather than harness. Two aggregator-sourced industry claims were checked against primaries, failed, and are **retracted in the notes** — the retraction record stays.
-- **Guard incubation** — new detection rules ship pull-mode first (`omp doctor`) and are promoted to always-on only after their false-positive rate is known. Two live calibration loops so far, each catching one false positive (MCP-refresh prompt jumps; user-aborted turns counted as errors) and one true positive (a streak of real provider stalls).
-
-### Upstreamed / in review
+<details>
+<summary><strong>Upstreamed / in review</strong> — focused PRs cut from this branch</summary>
+<br>
 
 | Change | Where |
 |---|---|
 | Heredoc payloads rendered in their own language + collapsed preview | [#6896](https://github.com/can1357/oh-my-pi/pull/6896) |
-| Thinking traces keep markdown hierarchy while receding (no flat override, no italics) | [#6894](https://github.com/can1357/oh-my-pi/pull/6894) |
+| Thinking traces keep markdown hierarchy while receding | [#6894](https://github.com/can1357/oh-my-pi/pull/6894) |
 | `tools.xdevTopLevelDevices` glob allowlist to pin hot devices top-level | [#6864](https://github.com/can1357/oh-my-pi/pull/6864) |
 | Duplicate MCP mounts report | [#6786](https://github.com/can1357/oh-my-pi/issues/6786) (fixed upstream) |
 
 The thinking-block and heredoc fixes are also live on this branch.
+
+</details>
+
+<a id="install-anchor"></a>
 
 ---
 
