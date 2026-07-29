@@ -26,6 +26,42 @@ The most capable agent surface that ships. Continuously tuned by real-world use 
 
 **40+** providers · **32** built-in tools · **14** lsp ops · **28** dap ops · **~55k** lines of Rust core.
 
+---
+
+> [!IMPORTANT]
+> **This is the `main-plus` branch of the `alloevil` fork** — upstream `main` plus every local harness modification, rebased/merged against upstream continuously. Upstream-agnostic changes are contributed back as focused PRs; the rest incubates here.
+
+## Fork modifications (`main-plus`)
+
+### Session health stack
+
+Deterministic degradation detection for live sessions — code measures, the model self-reports nothing.
+
+- **`omp doctor [--json|--stages|--outbound]`** — post-hoc transcript analysis: 6 rules (error turns, model switches, injection volume, oversized messages, thinking collapse, duplicate device routes), per-turn pipeline stage timings (context transform / provider ttfb+stream / per-tool, p50/p95/max), and outbound request summaries with structural diffs between consecutive provider calls.
+- **Live guards** — prompt-size jumps, duplicate device routes, silent model switches, and provider-error streaks surface as notices at turn boundaries; a status-line `health` segment shows a quiet `✓` heartbeat when clean, `·N`/`⚠N` otherwise. `/health` lists current findings in-session.
+- **`omp evidence [--sessions N] [--out|--json]`** — compiles doctor findings, stage timings, outbound diffs, and behavioral telemetry for recent sessions into a three-layer markdown report: cross-session overview (with an honest "insufficient baseline" placeholder instead of fabricated trends), per-session deep-dives for anomalous sessions only, and verbatim `[session:entry]` source citations.
+- **Behavioral telemetry** — per-(session, signal, model) counters in the local stats DB: tool-arg validation failures, edit rejections, repeated reads, intent-field fill rate (a cheap, same-source-immune attention canary).
+
+### Harness-evolution discipline
+
+Every harness change carries a manifest card (`scripts/harness-evolve/`): failure evidence → root cause → targeted fix → **pre-registered measurable predictions**, auto-checked by `bun run manifest:verify` against two fixed fitness functions, then human-adjudicated (`keep`/`rollback`/`revise`). Falsified predictions are recorded, not widened. Inspired by the AHE paper (arXiv 2604.25850); cards live in `scripts/harness-evolve/manifests/`, including the falsification cases.
+
+- **Routing canary** — 24 synthetic skills in 12 near-neighbor pairs, 144 queries, weak-router baseline 92.4% (zero spread across repeats), designed off-ceiling so regressions move the number.
+- **Edit gate** — 30 pinned tasks covering all 20 mutation families of the in-repo edit benchmark, temp-0, median-of-3 baseline 28/30.
+
+### Upstreamed / in review
+
+| Change | Where |
+|---|---|
+| Heredoc payloads rendered in their own language + collapsed preview | [#6896](https://github.com/can1357/oh-my-pi/pull/6896) |
+| Thinking traces keep markdown hierarchy while receding (no flat override, no italics) | [#6894](https://github.com/can1357/oh-my-pi/pull/6894) |
+| `tools.xdevTopLevelDevices` glob allowlist to pin hot devices top-level | [#6864](https://github.com/can1357/oh-my-pi/pull/6864) |
+| Duplicate MCP mounts report | [#6786](https://github.com/can1357/oh-my-pi/issues/6786) (fixed upstream) |
+
+The thinking-block and heredoc fixes are also live on this branch. Measurement notes and the abandoned-experiment record (skill brief mode: implemented, measured, falsified, reverted) are in `docs/notes/`.
+
+---
+
 > [!NOTE]
 > Pull requests are **temporarily open to everyone** as a trial. We previously
 > required a vouch before accepting PRs; that requirement is lifted for now
