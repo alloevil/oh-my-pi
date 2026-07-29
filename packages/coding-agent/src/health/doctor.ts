@@ -17,6 +17,14 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, StopReason, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { FileEntry, ModelChangeEntry } from "../session/session-entries";
 import type { HealthFindingInput } from "./ledger";
+import { OUTBOUND_SUMMARY_CUSTOM_TYPE, parseOutboundSummary } from "./outbound";
+import {
+	detectTtfbHealth,
+	parseStageTimingsRow,
+	STAGE_TIMINGS_CUSTOM_TYPE,
+	TTFB_RECENT_WINDOW,
+	TTFB_STALL_MS,
+} from "./stages";
 
 /**
  * Stop reasons of a healthy terminal turn.
@@ -94,6 +102,10 @@ export interface SessionScan {
 	ttsrInjections: number;
 	customMessages: number;
 	messageSizes: MessageSizeScan[];
+	/** Provider ttfb (ms) per turn, in stage-timings order. */
+	ttfbSeriesMs: number[];
+	/** `approxMessageChars`/`messageChars` of the last outbound summary, if any. */
+	lastOutboundMessageChars: number | undefined;
 	/**
 	 * Entry index of the trailing in-flight assistant turn: the last assistant
 	 * message with no user/assistant message after it. Its unanswered tool
@@ -130,6 +142,8 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 		ttsrInjections: 0,
 		customMessages: 0,
 		messageSizes: [],
+		ttfbSeriesMs: [],
+		lastOutboundMessageChars: undefined,
 		inFlightAssistantIndex: undefined,
 	};
 	let seenMessage = false;
@@ -157,6 +171,18 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 			case "ttsr_injection":
 				scan.ttsrInjections++;
 				break;
+			case "custom": {
+				// Reuses the stage/outbound parsers so the scan and `--stages` /
+				// `--outbound` never disagree about what a row means.
+				if (entry.customType === STAGE_TIMINGS_CUSTOM_TYPE) {
+					const ttfb = parseStageTimingsRow(entry.data)?.provider?.ttfbMs;
+					if (ttfb !== undefined) scan.ttfbSeriesMs.push(ttfb);
+				} else if (entry.customType === OUTBOUND_SUMMARY_CUSTOM_TYPE) {
+					const chars = parseOutboundSummary(entry.data)?.messageChars;
+					if (chars !== undefined) scan.lastOutboundMessageChars = chars;
+				}
+				break;
+			}
 			case "custom_message":
 				scan.customMessages++;
 				break;
@@ -392,6 +418,48 @@ function evaluateThinkingCollapse(scan: SessionScan): HealthFindingInput[] {
 	];
 }
 
+/**
+ * Report provider ttfb pathologies from the persisted stage timings. Incident
+ * grounding (session 019fac75, a Mail-organizing task): two 164s first-byte
+ * waits in the terminal three turns — one killed by the stream-stall watchdog
+ * (visible to error-turns), one silently endured (invisible to everything) —
+ * on top of a 10s chronic broker median. The originally hypothesised gradual
+ * *trend* was falsified by progressive replay (medians flat at 1.27×; means
+ * had suggested 2.4× — outlier-dominated); the trend branch stays as the cheap
+ * early form, but stalls and chronic slowness are the signals with a real hit.
+ */
+function evaluateTtfbHealth(scan: SessionScan): HealthFindingInput[] {
+	const verdict = detectTtfbHealth(scan.ttfbSeriesMs);
+	if (!verdict) return [];
+	const seconds = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
+	const findings: HealthFindingInput[] = [];
+	if (verdict.stalls) {
+		findings.push({
+			rule: "ttfb-stalls",
+			severity: "warn",
+			message: `provider stalls: ${verdict.stalls.count} turn(s) waited ≥${TTFB_STALL_MS / 1000}s for the first byte (max ${seconds(verdict.stalls.maxMs)})`,
+			details: { count: verdict.stalls.count, maxMs: verdict.stalls.maxMs, thresholdMs: TTFB_STALL_MS },
+		});
+	}
+	if (verdict.trend) {
+		findings.push({
+			rule: "ttfb-trend",
+			severity: "warn",
+			message: `provider ttfb degrading: last ${TTFB_RECENT_WINDOW} turns median ${seconds(verdict.trend.recentMs)} vs session baseline ${seconds(verdict.trend.baselineMs)} (${verdict.trend.ratio}×)`,
+			details: verdict.trend,
+		});
+	}
+	if (verdict.chronicMedianMs !== undefined) {
+		findings.push({
+			rule: "ttfb-chronic",
+			severity: "info",
+			message: `provider chronically slow: session median ttfb ${seconds(verdict.chronicMedianMs)} over ${scan.ttfbSeriesMs.length} turns — a provider/broker property, not a session event`,
+			details: { medianMs: verdict.chronicMedianMs, turns: scan.ttfbSeriesMs.length },
+		});
+	}
+	return findings;
+}
+
 /** All doctor rules, in report order. */
 export const DOCTOR_RULES: readonly DoctorRule[] = [
 	{ rule: "model-switch", evaluate: evaluateModelSwitch },
@@ -400,6 +468,7 @@ export const DOCTOR_RULES: readonly DoctorRule[] = [
 	{ rule: "injection-volume", evaluate: evaluateInjectionVolume },
 	{ rule: "oversized-messages", evaluate: evaluateOversizedMessages },
 	{ rule: "thinking-collapse", evaluate: evaluateThinkingCollapse },
+	{ rule: "ttfb-health", evaluate: evaluateTtfbHealth },
 ];
 
 /** Stage 2: evaluate every rule against a prepared scan. */

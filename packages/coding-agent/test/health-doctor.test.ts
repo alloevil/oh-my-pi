@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { analyzeSession } from "@oh-my-pi/pi-coding-agent/health/doctor";
 import type { HealthFindingInput } from "@oh-my-pi/pi-coding-agent/health/ledger";
+import { detectTtfbHealth } from "@oh-my-pi/pi-coding-agent/health/stages";
 import type {
 	CustomMessageEntry,
 	FileEntry,
@@ -264,5 +265,44 @@ describe("health doctor rules", () => {
 		const neverThought: FileEntry[] = [header(), user()];
 		for (let i = 0; i < 6; i++) neverThought.push(assistant({ text: `turn ${i}` }));
 		expect(findByRule(analyzeSession(neverThought), "thinking-collapse")).toBeUndefined();
+	});
+});
+
+describe("ttfb health detector", () => {
+	const flat = (n: number, ms: number): number[] => Array.from({ length: n }, () => ms);
+
+	test("fast flat series gives no verdict", () => {
+		expect(detectTtfbHealth(flat(100, 2_000))).toBeUndefined();
+	});
+
+	test("degrading medians fire the trend branch", () => {
+		const verdict = detectTtfbHealth([...flat(80, 4_000), ...flat(12, 25_000)]);
+		expect(verdict?.trend).toEqual({ baselineMs: 4_000, recentMs: 25_000, ratio: 6.3 });
+	});
+
+	test("fast sessions never fire the trend on ratio alone", () => {
+		// 200ms → 900ms is a 4.5× ratio with zero user pain.
+		expect(detectTtfbHealth([...flat(80, 200), ...flat(12, 900)])).toBeUndefined();
+	});
+
+	test("a stall outlier is counted, not smeared into a trend", () => {
+		// The mail-session shape: flat 10s medians, catastrophic terminal waits.
+		// (10s median also trips the chronic branch — that is the broker fact.)
+		const series = [...flat(97, 10_000), 164_751, 164_488, 47_618];
+		const verdict = detectTtfbHealth(series);
+		expect(verdict?.trend).toBeUndefined();
+		expect(verdict?.stalls).toEqual({ count: 2, maxMs: 164_751 });
+		expect(verdict?.chronicMedianMs).toBe(10_000);
+	});
+
+	test("chronic slowness reports the whole-session median", () => {
+		const verdict = detectTtfbHealth(flat(40, 9_000));
+		expect(verdict?.chronicMedianMs).toBe(9_000);
+		expect(verdict?.stalls).toBeUndefined();
+		expect(verdict?.trend).toBeUndefined();
+	});
+
+	test("short sessions give no verdict", () => {
+		expect(detectTtfbHealth([...flat(19, 10_000), ...flat(12, 90_000)])).toBeUndefined();
 	});
 });

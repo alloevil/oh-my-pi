@@ -306,6 +306,87 @@ function stageStat(values: number[], errors: number): StageStat {
 }
 
 /**
+ * Verdict from {@link detectTtfbHealth}: what is wrong with a session's
+ * provider time-to-first-byte, with the evidence for each claim.
+ */
+export interface TtfbHealthVerdict {
+	/**
+	 * Recent median ≥ 2× session baseline (both medians, so one stalled outlier
+	 * moves neither window). Absent in the motivating incident — kept because it
+	 * is the cheap early form of degradation *if* it ever appears — but the
+	 * signals below are the ones with a confirmed real-world hit.
+	 */
+	trend?: { recentMs: number; baselineMs: number; ratio: number };
+	/**
+	 * Stall cluster: turns whose first byte took ≥ {@link TTFB_STALL_MS}. In the
+	 * motivating incident (session 019fac75) the terminal three turns held two
+	 * 164s waits — one killed by the stream-stall watchdog, one silently endured.
+	 * error-turns only sees the killed one; this counts them all.
+	 */
+	stalls?: { count: number; maxMs: number };
+	/**
+	 * Chronic slowness: the whole-session median itself is above
+	 * {@link TTFB_CHRONIC_MS}. In the incident the median was ~10s from turn one
+	 * — a broker property, unrelated to the 2.7M-char context (prompt caching
+	 * kept the median flat while the payload grew 340×). Info-grade: real, but a
+	 * provider-choice fact rather than a session event.
+	 */
+	chronicMedianMs?: number;
+}
+
+/** Minimum samples before ttfb health is judged at all. */
+export const TTFB_MIN_SAMPLES = 32;
+/** Trailing window whose median is compared against the session baseline. */
+export const TTFB_RECENT_WINDOW = 12;
+/** Ratio at which recent-vs-baseline counts as a degradation trend. */
+const TTFB_DEGRADED_RATIO = 2;
+/** Recent medians below this never flag on ratio alone — no user pain. */
+const TTFB_RATIO_FLOOR_MS = 5_000;
+/** A single wait this long is a stall regardless of any baseline. */
+export const TTFB_STALL_MS = 60_000;
+/** Whole-session medians at or above this are chronically slow. */
+const TTFB_CHRONIC_MS = 8_000;
+
+/**
+ * Judge a session's provider ttfb series. Returns undefined when nothing is
+ * wrong or under {@link TTFB_MIN_SAMPLES} samples.
+ *
+ * Design note — the original hypothesis for the motivating incident was a
+ * *trend* (context growth grinding prompt processing). Progressive replay
+ * falsified it: the medians stayed flat (10.0s → 12.7s, ratio 1.27) while
+ * bucket *means* had suggested 2.4× — three terminal outliers dominated the
+ * means. The incident's true signature was a stall cluster on top of a
+ * chronically slow broker, which is exactly what this detector reports.
+ */
+export function detectTtfbHealth(ttfbMs: readonly number[]): TtfbHealthVerdict | undefined {
+	if (ttfbMs.length < TTFB_MIN_SAMPLES) return undefined;
+	const verdict: TtfbHealthVerdict = {};
+
+	const split = ttfbMs.length - TTFB_RECENT_WINDOW;
+	const baselineSorted = [...ttfbMs.slice(0, split)].sort((a, b) => a - b);
+	const recentSorted = [...ttfbMs.slice(split)].sort((a, b) => a - b);
+	const baselineMs = stagePercentile(baselineSorted, 50);
+	const recentMs = stagePercentile(recentSorted, 50);
+	if (recentMs >= TTFB_RATIO_FLOOR_MS && baselineMs > 0 && recentMs >= TTFB_DEGRADED_RATIO * baselineMs) {
+		verdict.trend = { recentMs, baselineMs, ratio: Math.round((recentMs / baselineMs) * 10) / 10 };
+	}
+
+	let stallCount = 0;
+	let maxMs = 0;
+	for (const ms of ttfbMs) {
+		if (ms >= TTFB_STALL_MS) stallCount++;
+		if (ms > maxMs) maxMs = ms;
+	}
+	if (stallCount > 0) verdict.stalls = { count: stallCount, maxMs };
+
+	const allSorted = [...ttfbMs].sort((a, b) => a - b);
+	const sessionMedian = stagePercentile(allSorted, 50);
+	if (sessionMedian >= TTFB_CHRONIC_MS) verdict.chronicMedianMs = sessionMedian;
+
+	return verdict.trend || verdict.stalls || verdict.chronicMedianMs !== undefined ? verdict : undefined;
+}
+
+/**
  * Per-stage {count, p50, p95, max, errors} over collected rows. Error
  * semantics: `providerStream.errors` counts turns whose assistant message
  * errored on the provider side; `toolExecution.errors` counts failed tool
