@@ -49,6 +49,16 @@ Every harness change carries a manifest card (`scripts/harness-evolve/`): failur
 - **Routing canary** — 24 synthetic skills in 12 near-neighbor pairs, 144 queries, weak-router baseline 92.4% (zero spread across repeats), designed off-ceiling so regressions move the number.
 - **Edit gate** — 30 pinned tasks covering all 20 mutation families of the in-repo edit benchmark, temp-0, median-of-3 baseline 28/30.
 
+### Research & experiments
+
+Full record in [`docs/notes/2026-07-27-harness-optimization-measurements.md`](docs/notes/2026-07-27-harness-optimization-measurements.md); the short version:
+
+- **Skill brief mode** (implemented → measured → **falsified → reverted**). Frontmatter summaries cut the system prompt 20436 → 16203 chars (−20.7%), but a routing A/B with a weak router over the real system prompt showed the compressed descriptions lose the discriminative cues that separate near-neighbor skills. Conclusion: conciseness is the skill author's job, not the harness's. The revert is a commit pair on this branch, kept deliberately — the falsification *is* the record. The AHE paper's ablation later independently agreed (system prompt was its only negative component).
+- **Measurement methodology** that survived the experiment: weak-model probe over the *real* full prompt (a strong model masks routing damage), repeat runs against the noise floor before trusting any delta, and `NULL_PROMPT` as a gate sanity check (guts the prompt → 0% must follow).
+- **Canary calibration** — the first routing fixture set scored a non-discriminative 100%; it took near-neighbor skill pairs plus boundary/exclusion-bait queries to land off-ceiling where regressions actually move the number. Fitness surface later widened 60 → 174 samples specifically to resist overfitting by any future automated evolution loop.
+- **External survey with source verification** — AHE (arXiv 2604.25850, code-verified) absorbed as three phases (manifest discipline now, evidence corpus next, constrained evolution agent only after the fitness surface and card corpus justify it); ECC qualified as content-pack rather than harness. Two aggregator-sourced industry claims were checked against primaries, failed, and are **retracted in the notes** — the retraction record stays.
+- **Guard incubation** — new detection rules ship pull-mode first (`omp doctor`) and are promoted to always-on only after their false-positive rate is known. Two live calibration loops so far, each catching one false positive (MCP-refresh prompt jumps; user-aborted turns counted as errors) and one true positive (a streak of real provider stalls).
+
 ### Upstreamed / in review
 
 | Change | Where |
@@ -58,7 +68,7 @@ Every harness change carries a manifest card (`scripts/harness-evolve/`): failur
 | `tools.xdevTopLevelDevices` glob allowlist to pin hot devices top-level | [#6864](https://github.com/can1357/oh-my-pi/pull/6864) |
 | Duplicate MCP mounts report | [#6786](https://github.com/can1357/oh-my-pi/issues/6786) (fixed upstream) |
 
-The thinking-block and heredoc fixes are also live on this branch. Measurement notes and the abandoned-experiment record (skill brief mode: implemented, measured, falsified, reverted) are in `docs/notes/`.
+The thinking-block and heredoc fixes are also live on this branch.
 
 ---
 
