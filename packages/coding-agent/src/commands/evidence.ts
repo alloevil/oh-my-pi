@@ -12,12 +12,20 @@ export default class Evidence extends Command {
 		sessions: Flags.integer({ description: "Most recent sessions to analyze", default: 10 }),
 		out: Flags.string({ description: "Write the report to a file instead of stdout" }),
 		json: Flags.boolean({ description: "Emit the structured per-session bundles as JSON" }),
+		"include-ephemeral": Flags.boolean({
+			description: "Also analyze ephemeral (eval/tmp) sessions, which the default scan skips",
+		}),
 	};
 
 	async run(): Promise<void> {
 		const { flags } = await this.parse(Evidence);
 		try {
-			await runEvidenceCommand({ sessions: flags.sessions, out: flags.out, json: flags.json });
+			await runEvidenceCommand({
+				sessions: flags.sessions,
+				out: flags.out,
+				json: flags.json,
+				includeEphemeral: flags["include-ephemeral"],
+			});
 		} catch (error) {
 			process.stderr.write(`evidence: ${error instanceof Error ? error.message : String(error)}\n`);
 			process.exitCode = 1;

@@ -118,4 +118,65 @@ describe("behavioral autopsy", () => {
 		expect(rendered).toContain("(no prefix repeated)");
 		expect(renderAutopsy("autopsy-test", buildAutopsy(entries))).toBe(rendered);
 	});
+
+	test("osascript mutation verbs land in the mutation inventory", () => {
+		const entries: FileEntry[] = [
+			header(),
+			assistantCalling("bash", {
+				command:
+					'osascript <<\'EOF\' 2>&1\ntell application "Mail"\n  move message 1 to mailbox "Archive"\nend tell\nEOF',
+			}),
+		];
+		const autopsy = buildAutopsy(entries);
+		expect(autopsy.mutations).toEqual([{ cluster: "osascript <<'EOF' 2>&1", count: 1 }]);
+	});
+
+	test("read-only osascript stays out of the mutation inventory", () => {
+		const entries: FileEntry[] = [
+			header(),
+			assistantCalling("bash", { command: "osascript -e 'tell application \"Mail\" to get name of every account'" }),
+		];
+		expect(buildAutopsy(entries).mutations).toEqual([]);
+	});
+
+	test("rm on an absolute path is inventoried; rm on a relative path is not", () => {
+		const absolute: FileEntry[] = [
+			header(),
+			assistantCalling("bash", { command: "rm -rf /Users/allo/Library/Mail/backup" }),
+		];
+		expect(buildAutopsy(absolute).mutations).toEqual([
+			{ cluster: "rm -rf /Users/allo/Library/Mail/backup", count: 1 },
+		]);
+
+		const relative: FileEntry[] = [header(), assistantCalling("bash", { command: "rm -rf dist && rm src/old.ts" })];
+		expect(buildAutopsy(relative).mutations).toEqual([]);
+	});
+
+	test("browser-automation click scripts are inventoried", () => {
+		const entries: FileEntry[] = [
+			header(),
+			assistantCalling("bash", { command: "ego-browser nodejs <<'EOF'\nawait tab.click('#move-button');\nEOF" }),
+			assistantCalling("eval", { code: "await tab.click('aria-ref=e5');" }),
+		];
+		const autopsy = buildAutopsy(entries);
+		expect(autopsy.mutations).toEqual([
+			{ cluster: "await tab.click('aria-ref=e5');", count: 1 },
+			{ cluster: "ego-browser nodejs <<'EOF'", count: 1 },
+		]);
+	});
+
+	test("mutation inventory is deterministic and renders (none detected) when empty", () => {
+		const busy: FileEntry[] = [
+			header(),
+			assistantCalling("bash", { command: "osascript <<'EOF'\nset x to 1\nEOF" }),
+			assistantCalling("bash", { command: "osascript <<'EOF'\nset x to 1\nEOF" }),
+		];
+		expect(buildAutopsy(busy).mutations).toEqual(buildAutopsy(busy).mutations);
+		expect(renderAutopsy("autopsy-test", buildAutopsy(busy))).toContain(
+			"out-of-repo mutations (heuristic inventory):",
+		);
+
+		const quiet: FileEntry[] = [header(), assistantText("Done: refactor complete.")];
+		expect(renderAutopsy("autopsy-test", buildAutopsy(quiet))).toContain("  (none detected)");
+	});
 });

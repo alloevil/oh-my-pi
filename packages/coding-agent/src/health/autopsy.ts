@@ -27,6 +27,15 @@ export interface SessionAutopsy {
 	};
 	/** bash/eval commands clustered by first line — strategy-churn evidence. */
 	commandLineage: { prefix: string; count: number }[];
+	/**
+	 * Commands that plausibly mutated user data *outside the repository*,
+	 * clustered by first line. Lexical heuristic inventory for post-hoc audit,
+	 * not a safety boundary: it classifies command text, not effects, so it can
+	 * miss mutations and flag reads. Classes: osascript with mutation verbs,
+	 * browser automation, rm/rmdir/mv on absolute/home paths, sqlite writes to
+	 * absolute paths.
+	 */
+	mutations: { cluster: string; count: number }[];
 	ending: {
 		lastRole: string | undefined;
 		/** Head of the last assistant text block, as the transcript's final word. */
@@ -56,6 +65,34 @@ function firstLine(text: string): string {
 	return line.length > CLUSTER_HEAD_CHARS ? line.slice(0, CLUSTER_HEAD_CHARS) : line;
 }
 
+/** osascript bodies containing these verbs plausibly change app state (word-boundary, case-insensitive). */
+const OSA_MUTATION_VERBS = /\b(?:move|delete|save|make new|empty trash|set )/i;
+/** rm/rmdir/mv whose first non-flag argument is absolute or home-relative — repo-relative targets are excluded. */
+const FS_DESTRUCTION_ABS = /(?:^|[\s;&|(])(?:rm|rmdir|mv)\s+(?:--?[\w=,-]+\s+)*["']?[/~]/m;
+/** sqlite3 pointed at an absolute/home database path. */
+const SQLITE_ABS = /\bsqlite3\s+["']?[/~]/;
+/** SQL verbs that write. */
+const SQL_WRITE = /\b(?:insert|update|delete|drop)\b/i;
+
+/**
+ * Lexical heuristic: does this bash/eval command text plausibly mutate user
+ * data outside the repository? Heuristic inventory for post-hoc audit, not a
+ * safety boundary — text-level classification only, no execution semantics.
+ */
+function isOutOfRepoMutation(command: string): boolean {
+	if (/\bosascript\b/.test(command) && OSA_MUTATION_VERBS.test(command)) return true;
+	if (
+		command.includes("ego-browser") ||
+		command.includes("tab.click") ||
+		command.includes("tab.fill") ||
+		command.includes("dispatchMouseEvent")
+	)
+		return true;
+	if (FS_DESTRUCTION_ABS.test(command)) return true;
+	if (SQLITE_ABS.test(command) && SQL_WRITE.test(command)) return true;
+	return false;
+}
+
 function topOf(counts: Map<string, number>, min = 1): { cluster: string; count: number }[] {
 	return [...counts.entries()]
 		.filter(([, count]) => count >= min)
@@ -69,6 +106,7 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 	const errorClusters = new Map<string, number>();
 	let errorTotal = 0;
 	const lineage = new Map<string, number>();
+	const mutationClusters = new Map<string, number>();
 	const questions: string[] = [];
 	let todoCalls = 0;
 	let askCalls = 0;
@@ -112,12 +150,17 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 					const question = Array.isArray(qs) ? (qs[0] as { question?: string } | undefined)?.question : undefined;
 					if (typeof question === "string") questions.push(firstLine(question));
 				}
-				if ((block.name === "bash" || block.name === "eval") && typeof args?.command === "string") {
-					const prefix = firstLine(args.command);
+				const commandText =
+					(block.name === "bash" || block.name === "eval") && typeof args?.command === "string"
+						? args.command
+						: block.name === "eval" && typeof args?.code === "string"
+							? args.code
+							: undefined;
+				if (commandText !== undefined) {
+					const prefix = firstLine(commandText);
 					lineage.set(prefix, (lineage.get(prefix) ?? 0) + 1);
-				} else if (block.name === "eval" && typeof args?.code === "string") {
-					const prefix = firstLine(args.code);
-					lineage.set(prefix, (lineage.get(prefix) ?? 0) + 1);
+					if (isOutOfRepoMutation(commandText))
+						mutationClusters.set(prefix, (mutationClusters.get(prefix) ?? 0) + 1);
 				}
 			}
 		}
@@ -134,6 +177,7 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 	return {
 		errors: { total: errorTotal, distinctClusters: errorClusters.size, top: topOf(errorClusters) },
 		commandLineage: topOf(lineage, LINEAGE_MIN_REPEATS).map(({ cluster, count }) => ({ prefix: cluster, count })),
+		mutations: topOf(mutationClusters),
 		ending: { lastRole, lastAssistantText: lastAssistantText?.slice(0, 120), inFlight, todoCalls },
 		asks: { count: askCalls, questions, durationsMs: askDurations },
 	};
@@ -151,6 +195,11 @@ export function renderAutopsy(sessionId: string, autopsy: SessionAutopsy): strin
 	lines.push("command lineage (repeated first-line prefixes):");
 	for (const { prefix, count } of autopsy.commandLineage) lines.push(`  ${String(count).padStart(3)}× ${prefix}`);
 	if (autopsy.commandLineage.length === 0) lines.push("  (no prefix repeated)");
+	lines.push("");
+
+	lines.push("out-of-repo mutations (heuristic inventory):");
+	for (const { cluster, count } of autopsy.mutations) lines.push(`  ${String(count).padStart(3)}× ${cluster}`);
+	if (autopsy.mutations.length === 0) lines.push("  (none detected)");
 	lines.push("");
 
 	const e = autopsy.ending;

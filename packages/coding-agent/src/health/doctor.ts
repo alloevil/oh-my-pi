@@ -18,6 +18,7 @@ import type { AssistantMessage, StopReason, ToolResultMessage } from "@oh-my-pi/
 import type { FileEntry, ModelChangeEntry } from "../session/session-entries";
 import type { HealthFindingInput } from "./ledger";
 import { OUTBOUND_SUMMARY_CUSTOM_TYPE, parseOutboundSummary } from "./outbound";
+import { parseSessionOutcome, SESSION_OUTCOME_CUSTOM_TYPE, type SessionOutcomeLabel } from "./outcome";
 import {
 	detectTtfbHealth,
 	parseStageTimingsRow,
@@ -113,6 +114,8 @@ export interface SessionScan {
 	 * snapshotted mid-turn, so orphan detection excludes them.
 	 */
 	inFlightAssistantIndex: number | undefined;
+	/** Last parseable ground-truth `session_outcome` label; undefined when unlabeled. */
+	outcome: SessionOutcomeLabel | undefined;
 }
 
 /** A named doctor rule: pure function from scan to findings. */
@@ -145,6 +148,7 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 		ttfbSeriesMs: [],
 		lastOutboundMessageChars: undefined,
 		inFlightAssistantIndex: undefined,
+		outcome: undefined,
 	};
 	let seenMessage = false;
 	const pushModelEvent = (model: string): void => {
@@ -180,6 +184,9 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 				} else if (entry.customType === OUTBOUND_SUMMARY_CUSTOM_TYPE) {
 					const chars = parseOutboundSummary(entry.data)?.messageChars;
 					if (chars !== undefined) scan.lastOutboundMessageChars = chars;
+				} else if (entry.customType === SESSION_OUTCOME_CUSTOM_TYPE) {
+					// Last parseable label wins: relabeling is a correction.
+					scan.outcome = parseSessionOutcome(entry.data) ?? scan.outcome;
 				}
 				break;
 			}
