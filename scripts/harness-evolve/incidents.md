@@ -14,7 +14,11 @@ candidate rule sketch, and what a second occurrence would look like.
 ## #1 — 2026-07-28 · Mail-organizing session `019fac75-730d-7000-ab46-05190f8fb6b0`
 
 **Task**: organize Mac Mail inboxes by sender (user's daily workload).
-**Outcome**: transcript ends mid-operation (“移动项目”对话框出现了…); completion unverified.
+**Outcome**: transcript ends mid-operation (“移动项目”对话框出现了…); ground truth
+(user, 2026-07-28): **task abandoned to manual takeover** — the user organized
+the mail themselves. 2.5h of session time, ~28min of ask-waits, and the
+deliverable was ultimately produced by hand. This label is what every detector
+above lacks: a dependent variable.
 
 Pathologies (autopsy numbers):
 
