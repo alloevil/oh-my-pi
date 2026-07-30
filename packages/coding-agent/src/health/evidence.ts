@@ -33,6 +33,7 @@ import {
 	type OutboundRequestSummary,
 	parseOutboundSummary,
 } from "./outbound";
+import { collectSessionOutcome, SESSION_OUTCOMES, type SessionOutcomeLabel } from "./outcome";
 import { parseStageTimingsRow, STAGE_TIMINGS_CUSTOM_TYPE, type StageTimingsRow, stagePercentile } from "./stages";
 
 /** Minimum data span (days) before L1 emits trend lines instead of the placeholder. */
@@ -71,6 +72,8 @@ export interface EvidenceSessionBundle {
 	outbound: EvidenceOutboundItem[];
 	/** Stats `health_signals` rows for this session file; empty when stats.db is absent or unsynced. */
 	healthSignals: HealthSignalStat[];
+	/** Ground-truth outcome label (`omp label`); absent when the session is unlabeled. */
+	outcome?: SessionOutcomeLabel;
 }
 
 export interface EvidenceReportOptions {
@@ -103,7 +106,10 @@ export function collectEvidenceBundle(
 		}
 	}
 	const findings = analyzeSession([...entries]).map(finding => ({ finding, entryIndex: 0 }));
-	return { sessionId, filePath, findings, stageRows, outbound, healthSignals };
+	const bundle: EvidenceSessionBundle = { sessionId, filePath, findings, stageRows, outbound, healthSignals };
+	const outcome = collectSessionOutcome(entries);
+	if (outcome !== undefined) bundle.outcome = outcome;
+	return bundle;
 }
 
 /** Stage keys the report aggregates, with human labels. */
@@ -210,6 +216,22 @@ export function compileEvidenceReport(
 	// ---- L1 overview -------------------------------------------------------
 	lines.push("## L1 — Overview", "");
 	lines.push(`- sessions analyzed: ${inputs.length}`);
+
+	// Ground-truth outcome labels: rendered only when at least one session
+	// carries one, so unlabeled corpora keep the exact pre-label report.
+	const outcomeCounts: Partial<Record<(typeof SESSION_OUTCOMES)[number], number>> = {};
+	let labeledCount = 0;
+	for (const bundle of inputs) {
+		if (bundle.outcome === undefined) continue;
+		labeledCount++;
+		outcomeCounts[bundle.outcome.outcome] = (outcomeCounts[bundle.outcome.outcome] ?? 0) + 1;
+	}
+	if (labeledCount > 0) {
+		const parts = SESSION_OUTCOMES.filter(outcome => outcomeCounts[outcome] !== undefined).map(
+			outcome => `${outcome} ${outcomeCounts[outcome]}`,
+		);
+		lines.push(`- outcomes: ${parts.join(", ")} (${labeledCount}/${inputs.length} sessions labeled)`);
+	}
 
 	const allTimestamps = inputs.flatMap(bundleTimestamps);
 	const spanMs = allTimestamps.length > 0 ? Math.max(...allTimestamps) - Math.min(...allTimestamps) : 0;

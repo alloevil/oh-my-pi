@@ -7,8 +7,10 @@
  * derives one bundle per session, and optionally joins stats `health_signals`
  * rows (read-only — a missing stats.db is tolerated, never created).
  */
+import * as path from "node:path";
 import type { HealthSignalStat } from "@oh-my-pi/omp-stats";
 import { getStatsDbPath } from "@oh-my-pi/pi-utils";
+import { isEphemeralSession } from "../health/ephemeral";
 import { collectEvidenceBundle, compileEvidenceReport, type EvidenceSessionBundle } from "../health/evidence";
 import { listSessionsReadOnly } from "../session/session-listing";
 import { loadEntriesFromFile } from "../session/session-loader";
@@ -25,6 +27,12 @@ export interface EvidenceCommandFlags {
 	out?: string;
 	/** Emit the structured per-session bundles as JSON instead of markdown. */
 	json?: boolean;
+	/**
+	 * Also analyze ephemeral (eval/tmp) sessions. Default scans skip sessions
+	 * whose recorded cwd / session dir resolves under an OS temp root so eval
+	 * harness runs never contaminate the evidence denominator.
+	 */
+	includeEphemeral?: boolean;
 }
 
 /**
@@ -56,8 +64,22 @@ export async function runEvidenceCommand(flags: EvidenceCommandFlags, cwd = proc
 	const sessionDir = computeDefaultSessionDir(cwd, storage);
 	const sessions = await listSessionsReadOnly(sessionDir, storage);
 	if (sessions.length === 0) throw new Error(`no sessions recorded for ${cwd}`);
+	const sessionDirName = path.basename(sessionDir);
+	const eligible = flags.includeEphemeral
+		? sessions
+		: sessions.filter(info => !isEphemeralSession({ headerCwd: info.cwd, sessionDirName }));
+	const skippedEphemeral = sessions.length - eligible.length;
+	if (skippedEphemeral > 0) {
+		// stderr on purpose: the report payload (markdown or JSON) owns stdout.
+		process.stderr.write(`evidence: skipped ${skippedEphemeral} ephemeral (eval/tmp) sessions\n`);
+	}
+	if (eligible.length === 0) {
+		throw new Error(
+			`no non-ephemeral sessions recorded for ${cwd} (${skippedEphemeral} eval/tmp sessions skipped; use --include-ephemeral to analyze them)`,
+		);
+	}
 	const limit = flags.sessions !== undefined && flags.sessions > 0 ? flags.sessions : DEFAULT_EVIDENCE_SESSIONS;
-	const recent = sessions.slice(0, limit);
+	const recent = eligible.slice(0, limit);
 
 	const signalsByFile = await readHealthSignalsByFile(recent.map(info => info.path));
 	const bundles: EvidenceSessionBundle[] = [];

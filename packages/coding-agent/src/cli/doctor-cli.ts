@@ -14,6 +14,7 @@ import {
 	OUTBOUND_SUMMARY_RING_SIZE,
 	type OutboundRequestSummary,
 } from "../health/outbound";
+import { formatSessionOutcome, type SessionOutcomeLabel } from "../health/outcome";
 import { collectStageTimings, renderStagesReport, type StageTimingsRow } from "../health/stages";
 import { findMostRecentSession, resolveResumableSession } from "../session/session-listing";
 import { loadEntriesFromFile } from "../session/session-loader";
@@ -46,6 +47,8 @@ export interface DoctorReport {
 	messageCount: number;
 	models: string[];
 	findings: HealthFindingInput[];
+	/** Ground-truth outcome label (`omp label`), when the session carries one. */
+	outcome?: SessionOutcomeLabel;
 	/** Present only with `--outbound`. */
 	outbound?: OutboundRequestSummary[];
 	/** Present only with `--stages`. */
@@ -59,7 +62,7 @@ export interface DoctorReport {
  * first, then global — same matching as `--resume`), or the most recent
  * session recorded for `cwd`.
  */
-async function resolveDoctorSessionFile(target: string | undefined, cwd: string): Promise<string> {
+export async function resolveDoctorSessionFile(target: string | undefined, cwd: string): Promise<string> {
 	const storage = new FileSessionStorage();
 	if (target === undefined) {
 		const sessionDir = computeDefaultSessionDir(cwd, storage);
@@ -76,10 +79,12 @@ async function resolveDoctorSessionFile(target: string | undefined, cwd: string)
 function renderReport(report: DoctorReport): string {
 	const id = report.sessionId ?? path.basename(report.sessionPath, ".jsonl");
 	const models = report.models.length > 0 ? report.models.join(", ") : "none";
+	const outcomeLine = report.outcome === undefined ? "" : `${formatSessionOutcome(report.outcome)}\n`;
 	if (report.findings.length === 0) {
-		return `✓ session ${id}: no findings (${report.messageCount} messages, models: ${models})\n`;
+		return `✓ session ${id}: no findings (${report.messageCount} messages, models: ${models})\n${outcomeLine}`;
 	}
 	const lines = [`session ${id} — ${report.messageCount} messages, models: ${models}`];
+	if (report.outcome !== undefined) lines.push(formatSessionOutcome(report.outcome));
 	// Stable sort: warns first, report order otherwise preserved.
 	const sorted = [...report.findings].sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
 	for (const finding of sorted) {
@@ -130,6 +135,7 @@ export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cw
 		models: scan.models,
 		findings: evaluateScan(scan),
 	};
+	if (scan.outcome !== undefined) report.outcome = scan.outcome;
 	if (args.flags.outbound) {
 		report.outbound = collectOutboundSummaries(entries);
 		process.stdout.write(
