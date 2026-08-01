@@ -108,3 +108,14 @@ measurement script must exclude eval sessions —
 `health/ephemeral.ts` (`isEphemeralSession`) handles tmp-workdir evals
 mechanically; the 2026-07-27 legacy routing probes need the explicit
 content criterion documented in the correction above.
+
+### Candidate added 2026-07-30 — repetition-trend (lost-in-the-middle proxy)
+
+Position-resolved probe over the 3 real sessions ≥300 messages: repetition
+signals (same path+selector re-reads, byte-identical command re-runs) skew to
+the back half in 2/3 (incident: re-reads 0→7→13→9 by quartile, re-runs
+0→1→3→3); raw error *rate* is U-shaped (Q1 setup noise dominates), so the
+instrument must use repetition density, never error rate. Rule sketch:
+back-half repetition density ≥ k× front-half. k uncalibratable at n=3 —
+waiting on outcome-labeled sessions (abandoned/manual-takeover set becomes the
+calibration corpus). Full analysis: docs/notes/2026-07-30-agent-error-discovery-and-task-map.md
