@@ -32,6 +32,7 @@ import {
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
 import { formatHealthBadge, formatHealthFindingsReport } from "../health/guards";
+import { buildTaskMap, renderTaskMap } from "../health/map";
 import { resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -1407,6 +1408,23 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			await runtime.output(
 				ledger ? formatHealthFindingsReport(ledger.findings()) : "health ledger unavailable in this session",
 			);
+			return commandConsumed();
+		},
+	},
+	{
+		name: "map",
+		description: "Show the task map: declared plan vs derived trajectory, with divergence",
+		acpDescription: "Show the task map",
+		getTuiAutocompleteDescription: runtime => {
+			const phases = runtime.ctx.session.getTodoPhases().filter(phase => phase.tasks.length > 0);
+			if (phases.length === 0) return "Map: no declared plan";
+			const done = phases.reduce((n, p) => n + p.tasks.filter(t => t.status === "completed").length, 0);
+			const total = phases.reduce((n, p) => n + p.tasks.length, 0);
+			return `Map: ${done}/${total} tasks across ${phases.length} phase(s)`;
+		},
+		handle: async (_command, runtime) => {
+			const map = buildTaskMap(runtime.sessionManager.getEntries(), runtime.session.getTodoPhases());
+			await runtime.output(renderTaskMap(map));
 			return commandConsumed();
 		},
 	},
