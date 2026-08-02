@@ -1,4 +1,5 @@
 import type { FileEntry } from "../session/session-entries";
+import { firstLine } from "./cluster";
 import { collectStageTimings } from "./stages";
 
 /**
@@ -52,18 +53,10 @@ export interface SessionAutopsy {
 	};
 }
 
-/** Cluster key length — enough to distinguish failure shapes, short enough to merge noise. */
-const CLUSTER_HEAD_CHARS = 80;
 /** Command prefixes repeated fewer times than this are omitted from the lineage. */
 const LINEAGE_MIN_REPEATS = 2;
 /** How many top clusters / prefixes the report carries. */
 const TOP_LIMIT = 8;
-
-function firstLine(text: string): string {
-	const nl = text.indexOf("\n");
-	const line = nl === -1 ? text : text.slice(0, nl);
-	return line.length > CLUSTER_HEAD_CHARS ? line.slice(0, CLUSTER_HEAD_CHARS) : line;
-}
 
 /** osascript bodies containing these verbs plausibly change app state (word-boundary, case-insensitive). */
 const OSA_MUTATION_VERBS = /\b(?:move|delete|save|make new|empty trash|set )/i;

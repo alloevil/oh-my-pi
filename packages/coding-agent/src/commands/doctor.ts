@@ -29,13 +29,23 @@ export default class Doctor extends Command {
 			description:
 				"Show the deterministic behavioral autopsy (error clusters, repeated command prefixes, ending state, ask waits) — computed evidence, human judgment",
 		}),
+		subagents: Flags.boolean({
+			description:
+				"List subagent sessions spawned by this session's task calls (name, status, messages, warns, models, session path)",
+		}),
 	};
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Doctor);
 		const cmd: DoctorCommandArgs = {
 			session: args.session,
-			flags: { json: flags.json, outbound: flags.outbound, stages: flags.stages, autopsy: flags.autopsy },
+			flags: {
+				json: flags.json,
+				outbound: flags.outbound,
+				stages: flags.stages,
+				autopsy: flags.autopsy,
+				subagents: flags.subagents,
+			},
 		};
 		try {
 			await runDoctorCommand(cmd);

@@ -16,6 +16,12 @@ import {
 } from "../health/outbound";
 import { formatSessionOutcome, type SessionOutcomeLabel } from "../health/outcome";
 import { collectStageTimings, renderStagesReport, type StageTimingsRow } from "../health/stages";
+import {
+	collectSubagentRefs,
+	resolveSubagentSessions,
+	type SubagentRow,
+	subagentsRootForSession,
+} from "../health/subagents";
 import { findMostRecentSession, resolveResumableSession } from "../session/session-listing";
 import { loadEntriesFromFile } from "../session/session-loader";
 import { computeDefaultSessionDir } from "../session/session-paths";
@@ -32,6 +38,8 @@ export interface DoctorCommandFlags {
 	stages?: boolean;
 	/** Show the deterministic behavioral autopsy instead of findings. */
 	autopsy?: boolean;
+	/** List subagent sessions spawned by this session's task calls. */
+	subagents?: boolean;
 }
 
 export interface DoctorCommandArgs {
@@ -55,6 +63,8 @@ export interface DoctorReport {
 	stages?: StageTimingsRow[];
 	/** Present only with `--autopsy`. */
 	autopsy?: SessionAutopsy;
+	/** Present only with `--subagents`. */
+	subagents?: SubagentRow[];
 }
 
 /**
@@ -123,6 +133,40 @@ function renderOutboundReport(report: DoctorReport): string {
 	return `${lines.join("\n")}\n`;
 }
 
+/**
+ * `--subagents` rendering: one row per agent referenced by the parent's task
+ * calls — resolution state, message count, warn-severity findings, models,
+ * and the child session path (directly doctorable/autopsiable).
+ */
+function renderSubagentsReport(report: DoctorReport): string {
+	const id = report.sessionId ?? path.basename(report.sessionPath, ".jsonl");
+	const rows = report.subagents ?? [];
+	if (rows.length === 0) return `session ${id}: (no subagents)\n`;
+	const resolvedCount = rows.filter(row => row.resolved).length;
+	const table: string[][] = [["name", "status", "msgs", "warns", "models", "session"]];
+	for (const row of rows) {
+		// Resolution state only: the persisted lifecycle status is a spawn-time
+		// snapshot (async children usually persist as "pending") — it lives in
+		// `--json`, not the table, where it would read as current state.
+		const status = row.resolved ? "resolved" : "unresolved";
+		const models = row.digest !== undefined && row.digest.models.length > 0 ? row.digest.models.join(",") : "-";
+		table.push([
+			row.ref.id,
+			status,
+			row.digest === undefined ? "-" : String(row.digest.messageCount),
+			row.digest === undefined ? "-" : String(row.digest.warnCount),
+			models,
+			row.sessionPath ?? row.note ?? "(no session file)",
+		]);
+	}
+	const widths = table[0].map((_, column) => Math.max(...table.map(cells => cells[column].length)));
+	const lines = [
+		`subagents of session ${id} — ${rows.length} referenced, ${resolvedCount} resolved`,
+		...table.map(cells => `  ${cells.map((cell, column) => cell.padEnd(widths[column])).join("  ")}`.trimEnd()),
+	];
+	return `${lines.join("\n")}\n`;
+}
+
 export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cwd()): Promise<DoctorReport> {
 	const sessionPath = await resolveDoctorSessionFile(args.session, cwd);
 	const entries = await loadEntriesFromFile(sessionPath);
@@ -148,6 +192,14 @@ export async function runDoctorCommand(args: DoctorCommandArgs, cwd = process.cw
 		const id = report.sessionId ?? path.basename(sessionPath, ".jsonl");
 		process.stdout.write(
 			args.flags.json ? `${JSON.stringify(report.stages, null, 2)}\n` : renderStagesReport(id, report.stages),
+		);
+		return report;
+	}
+	if (args.flags.subagents) {
+		const refs = collectSubagentRefs(entries);
+		report.subagents = await resolveSubagentSessions(refs, subagentsRootForSession(sessionPath));
+		process.stdout.write(
+			args.flags.json ? `${JSON.stringify(report.subagents, null, 2)}\n` : renderSubagentsReport(report),
 		);
 		return report;
 	}

@@ -1179,6 +1179,29 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"model.commandChurnGuard.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Command Churn Guard",
+			description:
+				"Detect one bash/eval command prefix accumulating many lifetime calls in a session and inject a one-time batch-approach steer",
+		},
+	},
+
+	"model.commandChurnGuard.threshold": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Command Churn Threshold",
+			description: "Lifetime bash/eval calls sharing one command prefix before the steer is injected (minimum 10)",
+		},
+	},
+
 	inlineToolDescriptors: {
 		type: "enum",
 		values: ["auto", "on", "off"] as const,

@@ -1,0 +1,99 @@
+# 2026-08-02-command-churn-guard
+
+- **Component-class**: middleware
+- **Date**: 2026-08-02
+- **Fix**: `packages/coding-agent/src/session/stream-guards.ts` (new `CommandChurnGuard`, LoopGuards wiring, `healthLedger` host seam), `src/session/agent-session.ts` (expose ledger on `StreamGuardsHost`), `src/health/cluster.ts` (new shared `firstLine` cluster key), `src/health/autopsy.ts` + `src/health/map.ts` (import shared key, drop local copies), `src/health/guards.ts` (`HEALTH_RULES.commandChurn`), `src/prompts/system/command-churn-redirect.md` (new), `src/config/settings-schema.ts` (`model.commandChurnGuard.enabled|threshold`), `test/command-churn-guard.test.ts` (new)
+
+## Failure evidence
+
+Incident #1 (`incidents.md`, session `019fac75`, Mail-organizing task,
+outcome-labeled manual-takeover): the agent ground through **120
+near-identical `ego-browser nodejs <<'EOF'` invocations** — one message
+moved per synthesized browser click — with no harness signal at any layer.
+The user took over by hand. Corpus measurement (2026-07-28, re-measured
+2026-07-30 on the corrected 11-session real corpus): "dominant command
+prefix ≥ 50" fires on exactly one session — the incident, at 120×. Next
+highest prefix count anywhere in the real corpus: 11× (another Mail
+session), then 10× (dev). **0 false positives, 120-vs-11 margin** — the
+only candidate from that sweep judged fit for a live nudge (the other two
+were discarded/report-only). The incubation happened: pull-mode
+instruments (`--autopsy` command lineage, `/map` prefix clusters) carried
+this axis for a week; this card is its graduation to always-on.
+
+## Root cause
+
+Nothing in the live request path watches command *shape* across a whole
+session. `ToolCallLoopGuard` detects only *consecutive identical* calls
+(threshold 5) — the incident's 120 heredoc scripts each differed in body
+(different message ids), never tripping it (max identical streak: 1 —
+`incidents.md` measured 0 firings of consecutive-same-prefix ≥3, "deaf").
+The advisor subsystem cannot host this (off by default, delta-only view,
+same-theme dedup); its own prompt lists "Churning" as a concern with
+nothing computing it. Post-hoc tools (autopsy, map) see the pattern but
+only when a human asks, after the grind already burned the session.
+
+## Targeted fix
+
+Generalize `ToolCallLoopGuard` from "identical call ×5" to "same
+first-line prefix ×N, lifetime": new `CommandChurnGuard` in
+`stream-guards.ts`, fed every bash/eval tool call at the same
+`LoopGuards.recordTurn` seam (the `setOnTurnEnd` chain). Clusters by the
+autopsy lineage key — first line, ≤80 chars — now exported once from
+`health/cluster.ts` and imported by autopsy, map, and the guard (three
+copies → one). When one cluster's lifetime count reaches the threshold the
+guard fires **once per cluster per session**: it injects the same hidden
+redirect custom-message idiom ToolCallLoopGuard uses (turn-end
+`messages.push` + `appendCustomMessageEntry`, `display: false`), naming
+the prefix, the count, and the ask — consider a batch approach or surface
+the grind to the user — and records an info-severity `command-churn`
+finding on the session health ledger (reachable via a one-line
+`healthLedger()` addition to `StreamGuardsHost`, mirroring
+`SessionToolsHost`). Settings follow the toolCallLoopGuard pattern:
+`model.commandChurnGuard.enabled` (default **true** — the graduation
+decision; 0 FP on the full real corpus justifies default-on) and
+`model.commandChurnGuard.threshold` (default 50, clamped to a minimum of
+10 in the guard). Non-goals: no blocking, no repeated nagging, no doctor
+changes.
+
+## Prediction
+
+- routing canary ≥ 87.4% (within 5pp tolerance of the 92.4% baseline) —
+  the nudge is injected only past 50 same-prefix calls; canary probes make
+  zero tool calls, so the guard is invisible to them.
+- edit gate ≥ 27/30 (within 1-task tolerance of the 28/30 baseline).
+- Incident replay: feeding the incident session's (`019fac75`) bash/eval
+  command sequence through `CommandChurnGuard` (threshold 50) fires
+  **exactly once**, at the 50th `ego-browser nodejs <<'EOF'` call.
+- Corpus replay: feeding every OTHER real session's command sequence
+  through the guard fires **zero** times (routing probes and ephemeral
+  eval sessions excluded per the `incidents.md` denominator correction;
+  they make no bash/eval calls anyway).
+- Unit contracts (test/command-churn-guard.test.ts): fires at exactly the
+  threshold and not before; once per cluster (calls 51..120 silent);
+  distinct clusters fire independently; threshold below 10 clamps to 10;
+  disabled setting injects nothing end-to-end; threshold setting respected
+  end-to-end (AgentSession integration at threshold 10 injects exactly one
+  hidden `command-churn-redirect` custom message and one info
+  `command-churn` ledger finding).
+- Existing stream-guard tests untouched and green
+  (test/agent-session-tool-call-loop-guard.test.ts).
+
+## Verification (auto)
+
+_Generated by `bun run manifest:verify` at 2026-08-02T07:02:53.149Z. Do not edit — re-runs replace this whole section._
+
+| Metric | Measured | Baseline | Delta | Gate | Exit code |
+|---|---|---|---|---|---|
+| Routing canary (top-1) | 93.1% | 92.4% | +0.7pp | PASS | 0 |
+| Edit gate | 27/30 | 28/30 | -1 task(s) | PASS | 0 |
+
+Manual metrics — predictions the canary does not measure; fill by hand:
+
+- [x] (measured 2026-08-02 via /tmp/churn-replay.ts against the real guard class: `INCIDENT …019fac75…: 187 bash/eval commands, 1 fire(s) — fired at overall command #104, cluster occurrence #50, count=50, prefix="ego-browser nodejs <<'EOF'"`) Incident replay: feeding the incident session's (`019fac75`) bash/eval command sequence through `CommandChurnGuard` (threshold 50) fires **exactly once**, at the 50th `ego-browser nodejs <<'EOF'` call.
+- [x] (measured in the same replay: 386 session files scanned — all real sessions plus routing probes and ephemeral tmp runs, none hidden — `non-incident sessions with fires: 0`) Corpus replay: feeding every OTHER real session's command sequence through the guard fires **zero** times (routing probes and ephemeral eval sessions excluded per the `incidents.md` denominator correction; they make no bash/eval calls anyway).
+- [x] (8 tests green in test/command-churn-guard.test.ts: 5 unit — fires-once-at-50 on the synthetic 120-call replay, silent below threshold, per-cluster independence, first-line-only clustering at the 80-char head, clamp-to-10; 2 AgentSession integration — threshold 10 injects exactly one hidden `command-churn-redirect` visible to model call 11 not 10, with one info `command-churn` ledger finding; disabled setting injects nothing and records nothing) Unit contracts (test/command-churn-guard.test.ts): fires at exactly the threshold and not before; once per cluster (calls 51..120 silent); distinct clusters fire independently; threshold below 10 clamps to 10; disabled setting injects nothing end-to-end; threshold setting respected end-to-end (AgentSession integration at threshold 10 injects exactly one hidden `command-churn-redirect` custom message and one info `command-churn` ledger finding).
+- [x] (test/agent-session-tool-call-loop-guard.test.ts: 1 pass, 0 fail, run alongside the new file; health-autopsy/health-map/health-guards suites also green after the shared `firstLine` extraction: 55 pass) Existing stream-guard tests untouched and green (test/agent-session-tool-call-loop-guard.test.ts).
+
+## Verdict
+
+pending-review
