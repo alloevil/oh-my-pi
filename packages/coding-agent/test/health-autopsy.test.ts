@@ -180,3 +180,60 @@ describe("behavioral autopsy", () => {
 		expect(renderAutopsy("autopsy-test", buildAutopsy(quiet))).toContain("  (none detected)");
 	});
 });
+
+describe("ending verification", () => {
+	const writeCall = (path: string) => assistantCalling("write", { path, content: "x" });
+	const editCall = (path: string) => assistantCalling("edit", { input: `[${path}#AB12]\nSWAP 1.=1:\n+x` });
+	const bash = (command: string) => assistantCalling("bash", { command });
+	function bothInOneTurn(path: string, command: string): SessionMessageEntry {
+		return {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "b1", name: "write", arguments: { path, content: "x" } },
+					{ type: "toolCall", id: "b2", name: "bash", arguments: { command } },
+				],
+				model: "test-model",
+				stopReason: "toolUse",
+			},
+		} as unknown as SessionMessageEntry;
+	}
+
+	test("execution at the mutation turn or later verifies the tail", () => {
+		expect(
+			buildAutopsy([header(), writeCall("/a/x.ts"), bash("bun test x.ts")]).ending.verification.unverifiedTail,
+		).toBeFalse();
+		// Same turn: a turn carrying both write and bash counts as verified.
+		expect(
+			buildAutopsy([header(), bothInOneTurn("/a/x.ts", "bun test x.ts")]).ending.verification.unverifiedTail,
+		).toBeFalse();
+	});
+
+	test("mutation after the last execution is an unverified tail", () => {
+		const autopsy = buildAutopsy([header(), bash("bun test"), editCall("/a/y.ts")]);
+		expect(autopsy.ending.verification.unverifiedTail).toBeTrue();
+		expect(autopsy.ending.verification.lastMutationTurn).toBe(2);
+		expect(autopsy.ending.verification.lastExecutionTurn).toBe(1);
+		expect(renderAutopsy("s", autopsy)).toContain("⚠ verification: unverified tail");
+	});
+
+	test("earlier mention does not exercise a later mutation", () => {
+		// x.ts named BEFORE its edit — not exercised; z.ts edited then named — exercised.
+		const autopsy = buildAutopsy([
+			header(),
+			bash("cat x.ts"),
+			editCall("/a/x.ts"),
+			editCall("/a/z.ts"),
+			bash("bun test z.ts"),
+		]);
+		expect(autopsy.ending.verification.mutatedFilesNeverExercised).toEqual(["x.ts"]);
+		expect(autopsy.ending.verification.unverifiedTail).toBeFalse();
+	});
+
+	test("no repo mutations renders the neutral line", () => {
+		const autopsy = buildAutopsy([header(), bash("ls")]);
+		expect(autopsy.ending.verification.lastMutationTurn).toBeUndefined();
+		expect(renderAutopsy("s", autopsy)).toContain("no repo mutations");
+	});
+});
