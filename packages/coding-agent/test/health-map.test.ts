@@ -85,16 +85,17 @@ describe("task map", () => {
 		const enough = [...few, bashTurn("e 19")];
 		const map = buildTaskMap(enough, []);
 		expect(map.divergence).toHaveLength(1);
-		expect(map.divergence[0]).toContain("no declared plan");
+		expect(map.divergence[0]).toContain("no plan declared");
 	});
 
 	test("render is deterministic and carries all three sections", () => {
 		const entries = [turn([{ name: "todo" }]), bashTurn("echo hi")];
 		const map = buildTaskMap(entries, phases(1, 2, "next"));
 		const rendered = renderTaskMap(map);
-		expect(rendered).toContain("declared: Work 1/2");
-		expect(rendered).toContain("derived (last 2 turns):");
-		expect(rendered).toContain("divergence: none");
+		expect(rendered).toContain("PLAN — 1/2 done");
+		expect(rendered).toContain("▰▰▰▰▰▱▱▱▱▱ 1/2  Work");
+		expect(rendered).toContain("ACTIVITY — last 2 turns");
+		expect(rendered).toContain("✓ plan and activity agree");
 		expect(renderTaskMap(buildTaskMap(entries, phases(1, 2, "next")))).toBe(rendered);
 	});
 });
@@ -116,12 +117,12 @@ describe("recently completed tasks", () => {
 		const map = buildTaskMap([turn([{ name: "todo" }])], todo);
 		// Last three in declaration order — task a scrolls off.
 		expect(map.declared.recentCompleted).toEqual(["task b", "task c", "task d"]);
-		expect(renderTaskMap(map)).toContain("✓ recently completed: task b · task c · task d");
+		expect(renderTaskMap(map)).toContain("✓ done: task b · task c · task d");
 	});
 
 	test("no completed tasks renders no line", () => {
 		const map = buildTaskMap([turn([{ name: "todo" }])], phases(0, 2, "first"));
 		expect(map.declared.recentCompleted).toEqual([]);
-		expect(renderTaskMap(map)).not.toContain("recently completed");
+		expect(renderTaskMap(map)).not.toContain("✓ done:");
 	});
 });
