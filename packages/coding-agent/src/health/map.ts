@@ -1,5 +1,6 @@
 import type { FileEntry } from "../session/session-entries";
 import type { TodoPhase } from "../tools/todo";
+import { firstLine } from "./cluster";
 
 /**
  * Task map: declared intent (todo phases) juxtaposed with derived trajectory
@@ -64,14 +65,6 @@ const RECENT_COMPLETED_LIMIT = 3;
 const STALE_TODO_COMMANDS = 15;
 /** Assistant turns without any todo before "no declared plan" is worth saying. */
 const NO_PLAN_TURNS = 20;
-/** Cluster key length — matches the autopsy's first-line clustering. */
-const PREFIX_HEAD_CHARS = 80;
-
-function firstLine(text: string): string {
-	const nl = text.indexOf("\n");
-	const line = nl === -1 ? text : text.slice(0, nl);
-	return line.length > PREFIX_HEAD_CHARS ? line.slice(0, PREFIX_HEAD_CHARS) : line;
-}
 
 interface TurnFacts {
 	toolNames: string[];

@@ -18,6 +18,7 @@ export const HEALTH_RULES = {
 	duplicateDeviceRoutes: "duplicate-device-routes",
 	silentModelSwitch: "silent-model-switch",
 	providerErrors: "provider-errors",
+	commandChurn: "command-churn",
 } as const;
 
 /**

@@ -1152,6 +1152,7 @@ export class AgentSession {
 			sessionManager: this.sessionManager,
 			obfuscator: this.#obfuscator,
 			model: () => this.model,
+			healthLedger: () => this.#healthLedger,
 			isDisposed: () => this.#isDisposed,
 			promptGeneration: () => this.#promptGeneration,
 			localProtocolOptions: () => this.#localProtocolOptions(),

@@ -6,7 +6,11 @@ import { type RepeatedToolCallDetection, ToolCallLoopGuard } from "@oh-my-pi/pi-
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
+import { firstLine } from "../health/cluster";
+import { HEALTH_RULES, recordHealthFinding } from "../health/guards";
+import type { HealthLedger } from "../health/ledger";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import commandChurnRedirectTemplate from "../prompts/system/command-churn-redirect.md" with { type: "text" };
 import geminiToolReminderTemplate from "../prompts/system/gemini-tool-call-reminder.md" with { type: "text" };
 import toolCallLoopRedirectTemplate from "../prompts/system/tool-call-loop-redirect.md" with { type: "text" };
 import type { SecretObfuscator } from "../secrets/obfuscator";
@@ -19,6 +23,7 @@ import type { SessionManager } from "./session-manager";
 const GEMINI_HEADER_INTERRUPT_REASON = "Interrupted: emit a tool call instead of more planning";
 const GEMINI_TOOL_REMINDER_TYPE = "gemini-tool-call-reminder";
 const TOOL_CALL_LOOP_REDIRECT_TYPE = "tool-call-loop-redirect";
+const COMMAND_CHURN_REDIRECT_TYPE = "command-churn-redirect";
 
 /** Capabilities borrowed by the session's streaming and loop guards. */
 export interface StreamGuardsHost {
@@ -27,6 +32,8 @@ export interface StreamGuardsHost {
 	sessionManager: SessionManager;
 	obfuscator: SecretObfuscator | undefined;
 	model(): Model | undefined;
+	/** Session health ledger; guards record findings here when they fire. */
+	healthLedger(): HealthLedger;
 	isDisposed(): boolean;
 	promptGeneration(): number;
 	localProtocolOptions(): LocalProtocolOptions;
@@ -267,18 +274,65 @@ export class StreamingEditGuard {
 	}
 }
 
+/** Runtime settings for command-churn detection. */
+export interface CommandChurnGuardOptions {
+	readonly threshold: number;
+}
+
+/** Details needed to steer the model away from a dominant command prefix. */
+export interface CommandChurnDetection {
+	readonly kind: "command_churn";
+	readonly toolName: string;
+	readonly prefix: string;
+	readonly count: number;
+}
+
+/** Floor for the configurable churn threshold; below it, legitimate iteration (test/build cycles) would trip the guard. */
+const COMMAND_CHURN_MIN_THRESHOLD = 10;
+
+/**
+ * Detects one bash/eval command-prefix cluster dominating a session.
+ *
+ * Generalizes {@link ToolCallLoopGuard} from "identical call ×5, consecutive"
+ * to "same first-line prefix ×N, lifetime": every bash/eval command is
+ * clustered by {@link firstLine} (the autopsy lineage key), counts never
+ * reset, and each cluster fires at most once per session — when its count
+ * first reaches the threshold. Calibrated on the real session corpus
+ * (`scripts/harness-evolve/incidents.md` #1): at ≥50 the only firing is the
+ * incident itself (120×; next highest anywhere: 11×).
+ */
+export class CommandChurnGuard {
+	readonly #threshold: number;
+	readonly #counts = new Map<string, number>();
+
+	constructor(options: CommandChurnGuardOptions) {
+		this.#threshold = Math.max(COMMAND_CHURN_MIN_THRESHOLD, Math.trunc(options.threshold));
+	}
+
+	/** Records one bash/eval command; returns a detection when its cluster first reaches the threshold. */
+	recordCommand(toolName: string, commandText: string): CommandChurnDetection | null {
+		const prefix = firstLine(commandText);
+		const count = (this.#counts.get(prefix) ?? 0) + 1;
+		this.#counts.set(prefix, count);
+		if (count !== this.#threshold) return null;
+		return { kind: "command_churn", toolName, prefix, count };
+	}
+}
+
 /** Detects cross-turn tool loops and Gemini reasoning-header runaways. */
 export class LoopGuards {
 	readonly #host: StreamGuardsHost;
 	#geminiHeaderDetector: GeminiHeaderRunDetector | undefined;
 	#toolCallLoopGuard: ToolCallLoopGuard | undefined;
 	#toolCallLoopGuardSettingsKey: string | undefined;
+	#commandChurnGuard: CommandChurnGuard | undefined;
+	#commandChurnGuardSettingsKey: string | undefined;
 
 	constructor(host: StreamGuardsHost) {
 		this.#host = host;
 	}
 
-	/** Records a completed turn and injects a redirect when calls repeat. */
+	/** Records a completed turn; injects a redirect when calls repeat or one command prefix dominates. */
 	recordTurn(messages: AgentMessage[], context: AgentTurnEndContext | undefined): void {
 		if (context?.message.role !== "assistant") return;
 		const detection = this.#activeToolCallLoopGuard()?.recordTurn({
@@ -286,6 +340,7 @@ export class LoopGuards {
 			toolResults: context.toolResults,
 		});
 		if (detection) this.#injectToolCallLoopRedirect(messages, detection);
+		this.#recordCommandChurn(messages, context.message);
 	}
 
 	/** Feeds a streamed assistant event to the Gemini header-runaway detector. */
@@ -353,6 +408,67 @@ export class LoopGuards {
 			details,
 			"agent",
 		);
+	}
+
+	#activeCommandChurnGuard(): CommandChurnGuard | undefined {
+		if (this.#host.settings.get("model.commandChurnGuard.enabled") !== true) {
+			this.#commandChurnGuard = undefined;
+			this.#commandChurnGuardSettingsKey = undefined;
+			return undefined;
+		}
+		const threshold = this.#host.settings.get("model.commandChurnGuard.threshold");
+		const settingsKey = String(threshold);
+		if (!this.#commandChurnGuard || this.#commandChurnGuardSettingsKey !== settingsKey) {
+			this.#commandChurnGuard = new CommandChurnGuard({ threshold });
+			this.#commandChurnGuardSettingsKey = settingsKey;
+		}
+		return this.#commandChurnGuard;
+	}
+
+	/** Feeds the turn's bash/eval commands to the churn guard and injects a redirect on a threshold hit. */
+	#recordCommandChurn(messages: AgentMessage[], message: AssistantMessage): void {
+		const guard = this.#activeCommandChurnGuard();
+		if (!guard) return;
+		for (const block of message.content) {
+			if (block.type !== "toolCall" || (block.name !== "bash" && block.name !== "eval")) continue;
+			const command =
+				typeof block.arguments.command === "string"
+					? block.arguments.command
+					: typeof block.arguments.code === "string"
+						? block.arguments.code
+						: undefined;
+			if (command === undefined) continue;
+			const detection = guard.recordCommand(block.name, command);
+			if (detection) this.#injectCommandChurnRedirect(messages, detection);
+		}
+	}
+
+	#injectCommandChurnRedirect(messages: AgentMessage[], detection: CommandChurnDetection): void {
+		const content = prompt.render(commandChurnRedirectTemplate, {
+			tool_name: detection.toolName,
+			count: detection.count,
+			prefix: detection.prefix,
+		});
+		const details = { toolName: detection.toolName, count: detection.count, prefix: detection.prefix };
+		logger.warn("command churn detected", details);
+		const redirectMessage: CustomMessage = {
+			role: "custom",
+			customType: COMMAND_CHURN_REDIRECT_TYPE,
+			content,
+			display: false,
+			details,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		messages.push(redirectMessage);
+		if (this.#host.agent.state.messages !== messages) this.#host.agent.appendMessage(redirectMessage);
+		this.#host.sessionManager.appendCustomMessageEntry(COMMAND_CHURN_REDIRECT_TYPE, content, false, details, "agent");
+		recordHealthFinding(this.#host.healthLedger(), {
+			rule: HEALTH_RULES.commandChurn,
+			severity: "info",
+			message: `${detection.count}× ${detection.toolName} calls share one command prefix: ${detection.prefix}`,
+			details,
+		});
 	}
 
 	#geminiHeaderGuardActive(): boolean {
