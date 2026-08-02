@@ -105,6 +105,12 @@ export interface SessionScan {
 	messageSizes: MessageSizeScan[];
 	/** Provider ttfb (ms) per turn, in stage-timings order. */
 	ttfbSeriesMs: number[];
+	/** Total persisted `stage_timings` rows, parseable or not — instrument liveness evidence. */
+	stageRowCount: number;
+	/** Total persisted `outbound_summary` rows — instrument liveness evidence. */
+	outboundRowCount: number;
+	/** Session header timestamp (epoch ms); undefined when the header is missing or unparseable. */
+	sessionStartMs: number | undefined;
 	/** `approxMessageChars`/`messageChars` of the last outbound summary, if any. */
 	lastOutboundMessageChars: number | undefined;
 	/**
@@ -146,6 +152,9 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 		customMessages: 0,
 		messageSizes: [],
 		ttfbSeriesMs: [],
+		stageRowCount: 0,
+		outboundRowCount: 0,
+		sessionStartMs: undefined,
 		lastOutboundMessageChars: undefined,
 		inFlightAssistantIndex: undefined,
 		outcome: undefined,
@@ -160,9 +169,12 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 	for (let index = 0; index < entries.length; index++) {
 		const entry = entries[index];
 		switch (entry.type) {
-			case "session":
+			case "session": {
 				scan.sessionId ??= entry.id;
+				const startMs = Date.parse(entry.timestamp ?? "");
+				scan.sessionStartMs ??= Number.isNaN(startMs) ? undefined : startMs;
 				break;
+			}
 			case "model_change": {
 				// Change entries persist "provider/modelId" while assistant
 				// messages persist the bare model id (provider is a separate
@@ -179,9 +191,11 @@ export function scanSession(entries: FileEntry[]): SessionScan {
 				// Reuses the stage/outbound parsers so the scan and `--stages` /
 				// `--outbound` never disagree about what a row means.
 				if (entry.customType === STAGE_TIMINGS_CUSTOM_TYPE) {
+					scan.stageRowCount++;
 					const ttfb = parseStageTimingsRow(entry.data)?.provider?.ttfbMs;
 					if (ttfb !== undefined) scan.ttfbSeriesMs.push(ttfb);
 				} else if (entry.customType === OUTBOUND_SUMMARY_CUSTOM_TYPE) {
+					scan.outboundRowCount++;
 					const chars = parseOutboundSummary(entry.data)?.messageChars;
 					if (chars !== undefined) scan.lastOutboundMessageChars = chars;
 				} else if (entry.customType === SESSION_OUTCOME_CUSTOM_TYPE) {
@@ -467,6 +481,35 @@ function evaluateTtfbHealth(scan: SessionScan): HealthFindingInput[] {
 	return findings;
 }
 
+/** Sessions started after this ship with both telemetry writers on by default. */
+const TELEMETRY_SHIPPED_MS = Date.parse("2026-07-28T00:00:00Z");
+/** Sessions shorter than this haven't earned a liveness verdict. */
+const TELEMETRY_MIN_TURNS = 10;
+
+/**
+ * Warn when a session that should carry telemetry carries none. Zero rows was
+ * previously read as "session predates tracking" and silently passed — which
+ * makes a silently broken writer (an upstream merge is the likely killer)
+ * indistinguishable from a healthy patient. The transcript cannot tell a
+ * broken writer from a deliberately disabled setting, so the message names
+ * both: users who disabled the writers get one truthful finding saying they
+ * are flying blind.
+ */
+function evaluateTelemetryLiveness(scan: SessionScan): HealthFindingInput[] {
+	if (scan.sessionStartMs === undefined || scan.sessionStartMs < TELEMETRY_SHIPPED_MS) return [];
+	if (scan.assistantTurns.length < TELEMETRY_MIN_TURNS) return [];
+	const findings: HealthFindingInput[] = [];
+	const silent = (instrument: string, setting: string): HealthFindingInput => ({
+		rule: "telemetry-liveness",
+		severity: "warn",
+		message: `${instrument} recorded zero rows over ${scan.assistantTurns.length} assistant turns — the writer may be broken, or ${setting} is off (flying blind either way)`,
+		details: { instrument, turns: scan.assistantTurns.length },
+	});
+	if (scan.stageRowCount === 0) findings.push(silent("stage timings", "debug.stageTimings"));
+	if (scan.outboundRowCount === 0) findings.push(silent("outbound summaries", "debug.outboundSummaries"));
+	return findings;
+}
+
 /** All doctor rules, in report order. */
 export const DOCTOR_RULES: readonly DoctorRule[] = [
 	{ rule: "model-switch", evaluate: evaluateModelSwitch },
@@ -476,6 +519,7 @@ export const DOCTOR_RULES: readonly DoctorRule[] = [
 	{ rule: "oversized-messages", evaluate: evaluateOversizedMessages },
 	{ rule: "thinking-collapse", evaluate: evaluateThinkingCollapse },
 	{ rule: "ttfb-health", evaluate: evaluateTtfbHealth },
+	{ rule: "telemetry-liveness", evaluate: evaluateTelemetryLiveness },
 ];
 
 /** Stage 2: evaluate every rule against a prepared scan. */
