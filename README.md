@@ -20,6 +20,7 @@
 | | What's added on this branch |
 |---|---|
 | **`omp doctor`** | Post-hoc transcript analysis: 6 rules (error turns, silent model switches, injection volume, oversized messages, thinking collapse, duplicate routes) · `--stages` per-turn pipeline timings (context / provider ttfb+stream / per-tool, p50/p95/max) · `--outbound` provider-request summaries with structural diffs |
+| **`/map`** | Task map: declared plan (todo) vs derived trajectory (tool counts, dominant command prefix, repetition counters) with deterministic divergence findings — a model-maintained map goes stale; a derived one cannot |
 | **Live guards** | Prompt-size jumps, duplicate device routes, model switches, provider-error streaks — delivered at turn boundaries; status-line `health` segment (`✓` heartbeat / `·N` / `⚠N`); `/health` in-session |
 | **`omp evidence`** | Three-layer report over recent sessions: cross-session overview (honest "insufficient baseline" placeholder, never fabricated trends) → deep-dives for anomalous sessions only → verbatim `[session:entry]` citations |
 | **Telemetry** | Per-(session, signal, model) counters: tool-arg failures, edit rejections, repeated reads, intent-field fill rate — a cheap, same-source-immune attention canary |
