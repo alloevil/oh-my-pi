@@ -146,6 +146,7 @@ import {
 	recordHealthFinding,
 } from "../health/guards";
 import { HealthLedger } from "../health/ledger";
+import { sweepSubagentWarns } from "../health/subagents";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
@@ -3588,6 +3589,14 @@ export class AgentSession {
 		try {
 			for (const finding of analyzeSession(this.sessionManager.getEntries())) {
 				this.#healthLedger.upsert(finding);
+			}
+			// Children's warn findings fold into one parent finding — the week's
+			// largest session ended ✓ while eight of its twenty-two subagents
+			// carried warns nobody saw until a human ran --subagents.
+			const sessionFile = this.sessionManager.getSessionFile();
+			if (sessionFile) {
+				const childFinding = await sweepSubagentWarns(this.sessionManager.getEntries(), sessionFile);
+				if (childFinding) this.#healthLedger.upsert(childFinding);
 			}
 		} catch (error) {
 			logger.debug("Session-end doctor sweep failed", { error: String(error) });

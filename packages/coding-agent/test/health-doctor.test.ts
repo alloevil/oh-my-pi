@@ -306,3 +306,42 @@ describe("ttfb health detector", () => {
 		expect(detectTtfbHealth([...flat(19, 10_000), ...flat(12, 90_000)])).toBeUndefined();
 	});
 });
+
+describe("telemetry liveness", () => {
+	function session(startIso: string, turns: number, stageRows: number): FileEntry[] {
+		const entries: FileEntry[] = [
+			{ type: "session", version: 3, id: "tl", timestamp: startIso, cwd: "/tmp" } as unknown as FileEntry,
+		];
+		for (let i = 0; i < turns; i++) entries.push(assistant());
+		for (let i = 0; i < stageRows; i++) {
+			entries.push({
+				type: "custom",
+				customType: "stage_timings",
+				data: { ts: 1, turnMs: 1, provider: { ttfbMs: 100, streamMs: 1 } },
+			} as unknown as FileEntry);
+		}
+		return entries;
+	}
+	const liveness = (entries: FileEntry[]) => analyzeSession(entries).filter(f => f.rule === "telemetry-liveness");
+
+	test("recent long session with zero telemetry warns for both instruments", () => {
+		const findings = liveness(session("2026-08-01T00:00:00Z", 12, 0));
+		expect(findings).toHaveLength(2);
+		expect(findings[0]!.message).toContain("stage timings recorded zero rows");
+		expect(findings[1]!.message).toContain("outbound summaries recorded zero rows");
+	});
+
+	test("stage rows silence the stage finding but not the outbound one", () => {
+		const findings = liveness(session("2026-08-01T00:00:00Z", 12, 3));
+		expect(findings).toHaveLength(1);
+		expect(findings[0]!.message).toContain("outbound summaries");
+	});
+
+	test("sessions predating the telemetry ship date stay silent", () => {
+		expect(liveness(session("2026-07-20T00:00:00Z", 40, 0))).toHaveLength(0);
+	});
+
+	test("short sessions have not earned a verdict", () => {
+		expect(liveness(session("2026-08-01T00:00:00Z", 9, 0))).toHaveLength(0);
+	});
+});

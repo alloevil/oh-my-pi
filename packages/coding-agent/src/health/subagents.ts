@@ -22,6 +22,7 @@ import type { FileEntry } from "../session/session-entries";
 import { loadEntriesFromFile } from "../session/session-loader";
 import type { AgentProgress, SingleResult, TaskParams, TaskToolDetails } from "../task/types";
 import { evaluateScan, scanSession } from "./doctor";
+import type { HealthFindingInput } from "./ledger";
 
 /** Where in the parent transcript a subagent reference was observed. */
 export type SubagentRefSource = "progress" | "result" | "async-result" | "task-args";
@@ -278,3 +279,44 @@ export async function resolveSubagentSessions(refs: SubagentRef[], sessionsRoot:
 	}
 	return rows;
 }
+
+/**
+ * Session-end sweep: fold the children's warn counts into one parent finding.
+ *
+ * The week's largest dev session ended `✓` while eight of its twenty-two
+ * children carried warn findings — child ledgers are invisible to the parent
+ * unless a human runs `--subagents` after the fact. This gives the sentinel a
+ * cheap way to land the children's state in the parent ledger at dispose.
+ *
+ * Capped and defensive: at most {@link SWEEP_CHILD_CAP} children are read, and
+ * any failure degrades to `undefined` — the sentinel must never fail a dispose.
+ */
+export async function sweepSubagentWarns(
+	entries: FileEntry[],
+	sessionFile: string,
+): Promise<HealthFindingInput | undefined> {
+	try {
+		const refs = collectSubagentRefs(entries).slice(0, SWEEP_CHILD_CAP);
+		if (refs.length === 0) return undefined;
+		const rows = await resolveSubagentSessions(refs, subagentsRootForSession(sessionFile));
+		let warns = 0;
+		let resolved = 0;
+		for (const row of rows) {
+			if (row.digest === undefined) continue;
+			resolved++;
+			warns += row.digest.warnCount;
+		}
+		if (warns === 0) return undefined;
+		return {
+			rule: "subagent-health",
+			severity: "info",
+			message: `${warns} warn finding(s) across ${resolved} subagent session(s) — inspect with omp doctor <session> --subagents`,
+			details: { warns, resolved, referenced: refs.length },
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/** Upper bound on children read during the dispose-time sweep. */
+const SWEEP_CHILD_CAP = 32;
