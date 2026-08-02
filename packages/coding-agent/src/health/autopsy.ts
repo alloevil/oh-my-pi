@@ -44,6 +44,28 @@ export interface SessionAutopsy {
 		/** True when the transcript stops inside an unanswered assistant turn. */
 		inFlight: boolean;
 		todoCalls: number;
+		/**
+		 * Did verification *happen*? The harness cannot judge output correctness,
+		 * but "was anything executed after the last repo mutation" is computable
+		 * with zero NLP — an edit-then-declare-done ending leaves this false.
+		 * Post-hoc reads only: an in-flight session naturally carries an
+		 * unverified tail.
+		 */
+		verification: {
+			/** Assistant-turn ordinal of the last edit/write; undefined = no repo mutations. */
+			lastMutationTurn: number | undefined;
+			/** Assistant-turn ordinal of the last bash/eval; undefined = nothing executed. */
+			lastExecutionTurn: number | undefined;
+			/** Last mutation strictly after last execution. */
+			unverifiedTail: boolean;
+			/**
+			 * Files edited/written whose basename never appears in any LATER
+			 * bash/eval command text (cap 5). Lexical containment heuristic: a
+			 * test runner invoked without naming the file will false-positive
+			 * here — report-only, the human judges.
+			 */
+			mutatedFilesNeverExercised: string[];
+		};
 	};
 	asks: {
 		count: number;
@@ -106,6 +128,12 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 	let lastRole: string | undefined;
 	let lastAssistantText: string | undefined;
 	let inFlight = false;
+	let assistantTurn = 0;
+	let lastMutationTurn: number | undefined;
+	let lastExecutionTurn: number | undefined;
+	/** file path → turn of its last mutation; command texts checked later. */
+	const mutatedAt = new Map<string, number>();
+	const executions: { turn: number; text: string }[] = [];
 
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
@@ -129,6 +157,7 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 		}
 		if (message.role !== "assistant") continue;
 		inFlight = false;
+		assistantTurn++;
 		if (!Array.isArray(message.content)) continue;
 		for (const block of message.content) {
 			if (block.type === "text" && block.text.trim().length > 0) {
@@ -154,6 +183,21 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 					lineage.set(prefix, (lineage.get(prefix) ?? 0) + 1);
 					if (isOutOfRepoMutation(commandText))
 						mutationClusters.set(prefix, (mutationClusters.get(prefix) ?? 0) + 1);
+					lastExecutionTurn = assistantTurn;
+					executions.push({ turn: assistantTurn, text: commandText });
+				}
+				const mutatedPath =
+					block.name === "write" && typeof args?.path === "string"
+						? args.path
+						: block.name === "edit" && typeof args?.input === "string"
+							? /\[([^\]#]+)#/.exec(args.input)?.[1]
+							: undefined;
+				// `write` to an internal URI (xd:// device dispatch, local:// notes)
+				// is a tool invocation, not a repo mutation — found live on the
+				// first real-session smoke and excluded since.
+				if (mutatedPath !== undefined && !mutatedPath.includes("://")) {
+					lastMutationTurn = assistantTurn;
+					mutatedAt.set(mutatedPath, assistantTurn);
 				}
 			}
 		}
@@ -167,11 +211,35 @@ export function buildAutopsy(entries: readonly FileEntry[]): SessionAutopsy {
 	}
 	askDurations.sort((a, b) => b - a);
 
+	// A file counts as exercised when any LATER execution's text contains its
+	// basename — lexical containment, so an unnamed test-runner run will
+	// false-positive the other way; the field is report-only.
+	const neverExercised: string[] = [];
+	for (const [file, mutTurn] of mutatedAt) {
+		const base = file.split("/").pop() ?? file;
+		const exercised = executions.some(ex => ex.turn >= mutTurn && ex.text.includes(base));
+		if (!exercised) neverExercised.push(base);
+		if (neverExercised.length >= 5) break;
+	}
+
 	return {
 		errors: { total: errorTotal, distinctClusters: errorClusters.size, top: topOf(errorClusters) },
 		commandLineage: topOf(lineage, LINEAGE_MIN_REPEATS).map(({ cluster, count }) => ({ prefix: cluster, count })),
 		mutations: topOf(mutationClusters),
-		ending: { lastRole, lastAssistantText: lastAssistantText?.slice(0, 120), inFlight, todoCalls },
+		ending: {
+			lastRole,
+			lastAssistantText: lastAssistantText?.slice(0, 120),
+			inFlight,
+			todoCalls,
+			verification: {
+				lastMutationTurn,
+				lastExecutionTurn,
+				unverifiedTail:
+					lastMutationTurn !== undefined &&
+					(lastExecutionTurn === undefined || lastMutationTurn > lastExecutionTurn),
+				mutatedFilesNeverExercised: neverExercised,
+			},
+		},
 		asks: { count: askCalls, questions, durationsMs: askDurations },
 	};
 }
@@ -200,6 +268,21 @@ export function renderAutopsy(sessionId: string, autopsy: SessionAutopsy): strin
 		`ending: last message from ${e.lastRole ?? "?"}${e.inFlight ? " — transcript stops inside an unanswered assistant turn" : ""}; todo calls: ${e.todoCalls}`,
 	);
 	if (e.lastAssistantText) lines.push(`  last assistant text: ${JSON.stringify(e.lastAssistantText)}`);
+	const v = e.verification;
+	if (v.lastMutationTurn === undefined) {
+		lines.push("  verification: no repo mutations (edit/write) in this session");
+	} else if (v.unverifiedTail) {
+		lines.push(
+			`  ⚠ verification: unverified tail — last mutation at turn ${v.lastMutationTurn}, ${v.lastExecutionTurn === undefined ? "nothing was ever executed" : `last execution at turn ${v.lastExecutionTurn}`}`,
+		);
+	} else {
+		lines.push(
+			`  verification: ✓ execution followed the last mutation (turn ${v.lastMutationTurn} → ${v.lastExecutionTurn})`,
+		);
+	}
+	if (v.mutatedFilesNeverExercised.length > 0) {
+		lines.push(`  edited but never exercised later: ${v.mutatedFilesNeverExercised.join(", ")}`);
+	}
 	lines.push("");
 
 	lines.push(`asks: ${autopsy.asks.count}`);
