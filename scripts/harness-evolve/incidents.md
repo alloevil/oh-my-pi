@@ -108,3 +108,28 @@ measurement script must exclude eval sessions —
 `health/ephemeral.ts` (`isEphemeralSession`) handles tmp-workdir evals
 mechanically; the 2026-07-27 legacy routing probes need the explicit
 content criterion documented in the correction above.
+
+### Candidate added 2026-07-30 — repetition-trend (lost-in-the-middle proxy)
+
+Position-resolved probe over the 3 real sessions ≥300 messages: repetition
+signals (same path+selector re-reads, byte-identical command re-runs) skew to
+the back half in 2/3 (incident: re-reads 0→7→13→9 by quartile, re-runs
+0→1→3→3); raw error *rate* is U-shaped (Q1 setup noise dominates), so the
+instrument must use repetition density, never error rate. Rule sketch:
+back-half repetition density ≥ k× front-half. k uncalibratable at n=3 —
+waiting on outcome-labeled sessions (abandoned/manual-takeover set becomes the
+calibration corpus). Full analysis: docs/notes/2026-07-30-agent-error-discovery-and-task-map.md
+
+### Candidate added 2026-08-02 — task regression (re-executing completed tasks)
+
+User-reported: multi-task sessions sometimes return to and re-execute task #1
+after later tasks. Probe: command-cluster resurrection (prefix dormant ≥30
+turns, then active) — **falsified as a detector**: 29 hits in one dev session,
+all benign recurrence (git/test/format cycles are the workflow). Task identity
+is semantic; no lexical rule separates "redoing finished work" from "running
+the test suite again". Mitigations: /map declared section now lists recent
+completed tasks (human-glance instrument); goal mode already re-injects todo
+state per continuation; periodic todo-snapshot injection for plain sessions is
+a candidate pending context-cost evidence; semantic detection belongs to the
+offline-judge tier. A concrete session exhibiting the regression would make
+incident #2 — label it (`omp label`) and autopsy it when next observed.
