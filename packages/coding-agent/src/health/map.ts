@@ -184,11 +184,11 @@ export function buildTaskMap(entries: readonly FileEntry[], todoPhases: readonly
 		lastTodoTurn === -1 ? undefined : turns.slice(lastTodoTurn + 1).reduce((n, t) => n + t.commands.length, 0);
 	if (phases.length > 0 && commandsSinceTodo !== undefined && commandsSinceTodo >= STALE_TODO_COMMANDS) {
 		divergence.push(
-			`declared plan may be stale: ${commandsSinceTodo} commands since the last todo update (${turnsSinceTodo} turns ago)`,
+			`plan may be stale: ${commandsSinceTodo} commands since the last todo update (${turnsSinceTodo} turns ago)`,
 		);
 	}
 	if (phases.length === 0 && turns.length >= NO_PLAN_TURNS) {
-		divergence.push(`no declared plan after ${turns.length} assistant turns — trajectory below is the only map`);
+		divergence.push(`no plan declared after ${turns.length} turns — the activity above is the only map`);
 	}
 
 	return {
@@ -208,44 +208,63 @@ export function buildTaskMap(entries: readonly FileEntry[], todoPhases: readonly
 
 /** Render the task map for `/map` output. */
 export function renderTaskMap(map: TaskMap): string {
-	const lines: string[] = ["task map — declared plan vs derived trajectory", ""];
+	const lines: string[] = [];
 
+	// ---- PLAN: what the agent said it would do -----------------------------
 	if (map.declared.phases.length === 0) {
-		lines.push("declared: (no todos)");
+		lines.push("PLAN — none declared");
 	} else {
-		const summary = map.declared.phases.map(phase => `${phase.name} ${phase.done}/${phase.total}`).join(" · ");
-		lines.push(`declared: ${summary}`);
-		if (map.declared.current) lines.push(`  ▸ current: ${map.declared.current}`);
-		if (map.declared.recentCompleted.length > 0) {
-			lines.push(`  ✓ recently completed: ${map.declared.recentCompleted.join(" · ")}`);
+		const done = map.declared.phases.reduce((n, p) => n + p.done, 0);
+		const total = map.declared.phases.reduce((n, p) => n + p.total, 0);
+		const updated =
+			map.declared.turnsSinceTodo !== undefined ? ` · updated ${map.declared.turnsSinceTodo} turn(s) ago` : "";
+		lines.push(`PLAN — ${done}/${total} done${updated}`);
+		for (const phase of map.declared.phases) {
+			lines.push(`  ${progressBar(phase.done, phase.total)} ${phase.done}/${phase.total}  ${phase.name}`);
 		}
-		if (map.declared.turnsSinceTodo !== undefined) {
-			lines.push(`  last todo update: ${map.declared.turnsSinceTodo} turn(s) ago`);
+		if (map.declared.current) lines.push(`  ▸ now:  ${map.declared.current}`);
+		if (map.declared.recentCompleted.length > 0) {
+			lines.push(`  ✓ done: ${map.declared.recentCompleted.join(" · ")}`);
 		}
 	}
 	lines.push("");
 
+	// ---- ACTIVITY: what it actually did ------------------------------------
 	const d = map.derived;
-	lines.push(`derived (last ${d.windowTurns} turns):`);
+	lines.push(`ACTIVITY — last ${d.windowTurns} turns`);
 	if (d.tools.length === 0) {
-		lines.push("  (no tool calls)");
+		lines.push("  no tool calls");
 	} else {
-		lines.push(`  tools: ${d.tools.map(t => `${t.name}×${t.count}`).join("  ")}  errors: ${d.errors}`);
+		const errorNote = d.errors > 0 ? ` · ⚠ ${d.errors} error(s)` : "";
+		lines.push(`  ${d.tools.map(t => `${t.name} ×${t.count}`).join(" · ")}${errorNote}`);
 	}
-	if (d.dominantPrefix) {
+	// A "hottest" of one or two is every session's normal texture, not heat —
+	// showing it would teach users to ignore the line.
+	if (d.dominantPrefix && d.dominantPrefix.count >= HOTTEST_RENDER_FLOOR) {
 		const lifetime =
-			d.dominantPrefixLifetime > d.dominantPrefix.count ? ` (${d.dominantPrefixLifetime} lifetime)` : "";
-		lines.push(`  dominant prefix: ×${d.dominantPrefix.count}${lifetime}  ${d.dominantPrefix.prefix}`);
+			d.dominantPrefixLifetime > d.dominantPrefix.count ? ` · ×${d.dominantPrefixLifetime} all-session` : "";
+		lines.push(`  hottest command  ×${d.dominantPrefix.count}${lifetime}`);
+		lines.push(`    ${d.dominantPrefix.prefix}`);
 	}
 	if (d.reReads > 0 || d.identicalReruns > 0) {
-		lines.push(`  repetition: ${d.reReads} re-read(s) · ${d.identicalReruns} identical re-run(s)`);
+		lines.push(`  repeats  ${d.reReads} re-read(s) · ${d.identicalReruns} identical re-run(s)`);
 	}
 	lines.push("");
 
+	// ---- verdict line last: the one thing to take away ---------------------
 	if (map.divergence.length === 0) {
-		lines.push("divergence: none — declared and derived agree");
+		lines.push("✓ plan and activity agree");
 	} else {
-		for (const finding of map.divergence) lines.push(`⚠ divergence: ${finding}`);
+		for (const finding of map.divergence) lines.push(`⚠ ${finding}`);
 	}
 	return lines.join("\n");
 }
+
+/** Ten-cell unicode progress bar: `▰▰▰▰▱▱▱▱▱▱`. */
+function progressBar(done: number, total: number): string {
+	const cells = total > 0 ? Math.round((done / total) * 10) : 0;
+	return "▰".repeat(cells) + "▱".repeat(10 - cells);
+}
+
+/** Window count below which the hottest-command line is withheld as noise. */
+const HOTTEST_RENDER_FLOOR = 3;

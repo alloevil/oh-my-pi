@@ -91,6 +91,19 @@ only; 2 new contract tests; no gate re-run (pure render addition inside this
 card's already-verified feature — the gates measure routing/edit, which this
 cannot move; re-running would sample provider noise, not the change).
 
+### Addendum 2026-08-02 (2) — render clarity revision (user feedback)
+
+User: the map's content wasn't clear. Diagnosis: engineering vocabulary leaked
+into the UI (declared/derived/divergence, "dominant prefix") and every line
+carried equal visual weight. Render-only revision, builder untouched: sections
+renamed PLAN / ACTIVITY, per-phase ten-cell progress bars, current task as
+`▸ now:`, done-list as `✓ done:`, "hottest command" with a ≥3 render floor (a
+hottest-of-one is normal texture and would teach users to ignore the line),
+errors flagged ⚠ only when nonzero, and the verdict line moved last —
+`✓ plan and activity agree` / `⚠ plan may be stale…`. Divergence message
+wording simplified to match. 9/9 contract tests updated and green; no gate
+re-run (pure render text within this card's verified feature).
+
 ### Note on a first-run gate failure
 
 The first manifest:verify run scored the edit gate 26/30 (FAIL). The change is
