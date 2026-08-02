@@ -77,6 +77,20 @@ Manual metrics — predictions the canary does not measure; fill by hand:
 - [x] (7/7: progress arithmetic, window clipping, dominant tie-break + lifetime, repetition seeding against pre-window history, both divergence branches, determinism) Unit contracts: declared progress arithmetic, window clipping, dominant prefix tie-breaking, both divergence branches (stale vs absent), determinism.
 - [x] (registered beside /health in builtin-registry with autocomplete summary; typecheck-verified) `/map` appears in the builtin registry with autocomplete text (asserted by test or smoke).
 
+### Addendum 2026-08-02 — task regression (user report)
+
+User observation: within multi-task sessions the agent sometimes re-executes
+an already-completed task. Probe (command-cluster resurrection: prefix dormant
+≥30 turns then active again) FAILED as a detector — 29 hits in one dev session,
+all benign (git checkout / test / format recur by nature); task identity is
+semantic and lexical clustering cannot see it. Recorded in incidents.md.
+Deterministic detection is therefore out; the map instead arms the human:
+`declared` now lists the last 3 completed task names (`✓ recently completed`),
+so current activity can be checked against the done-list at a glance. Display
+only; 2 new contract tests; no gate re-run (pure render addition inside this
+card's already-verified feature — the gates measure routing/edit, which this
+cannot move; re-running would sample provider noise, not the change).
+
 ### Note on a first-run gate failure
 
 The first manifest:verify run scored the edit gate 26/30 (FAIL). The change is

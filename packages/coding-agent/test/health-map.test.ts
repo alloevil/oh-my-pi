@@ -98,3 +98,30 @@ describe("task map", () => {
 		expect(renderTaskMap(buildTaskMap(entries, phases(1, 2, "next")))).toBe(rendered);
 	});
 });
+
+describe("recently completed tasks", () => {
+	test("declared lists the last completed tasks for regression-spotting", () => {
+		const todo: TodoPhase[] = [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "task a", status: "completed" },
+					{ content: "task b", status: "completed" },
+					{ content: "task c", status: "completed" },
+					{ content: "task d", status: "completed" },
+					{ content: "task e", status: "in_progress" },
+				],
+			},
+		];
+		const map = buildTaskMap([turn([{ name: "todo" }])], todo);
+		// Last three in declaration order — task a scrolls off.
+		expect(map.declared.recentCompleted).toEqual(["task b", "task c", "task d"]);
+		expect(renderTaskMap(map)).toContain("✓ recently completed: task b · task c · task d");
+	});
+
+	test("no completed tasks renders no line", () => {
+		const map = buildTaskMap([turn([{ name: "todo" }])], phases(0, 2, "first"));
+		expect(map.declared.recentCompleted).toEqual([]);
+		expect(renderTaskMap(map)).not.toContain("recently completed");
+	});
+});

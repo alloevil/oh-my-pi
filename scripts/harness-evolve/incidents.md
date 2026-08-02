@@ -119,3 +119,17 @@ instrument must use repetition density, never error rate. Rule sketch:
 back-half repetition density ≥ k× front-half. k uncalibratable at n=3 —
 waiting on outcome-labeled sessions (abandoned/manual-takeover set becomes the
 calibration corpus). Full analysis: docs/notes/2026-07-30-agent-error-discovery-and-task-map.md
+
+### Candidate added 2026-08-02 — task regression (re-executing completed tasks)
+
+User-reported: multi-task sessions sometimes return to and re-execute task #1
+after later tasks. Probe: command-cluster resurrection (prefix dormant ≥30
+turns, then active) — **falsified as a detector**: 29 hits in one dev session,
+all benign recurrence (git/test/format cycles are the workflow). Task identity
+is semantic; no lexical rule separates "redoing finished work" from "running
+the test suite again". Mitigations: /map declared section now lists recent
+completed tasks (human-glance instrument); goal mode already re-injects todo
+state per continuation; periodic todo-snapshot injection for plain sessions is
+a candidate pending context-cost evidence; semantic detection belongs to the
+offline-judge tier. A concrete session exhibiting the regression would make
+incident #2 — label it (`omp label`) and autopsy it when next observed.

@@ -23,6 +23,16 @@ export interface TaskMap {
 		phases: { name: string; done: number; total: number }[];
 		/** The in-progress task's content, if any. */
 		current: string | undefined;
+		/**
+		 * The last few completed tasks, in declaration order. Rendered so a human
+		 * can spot task regression at a glance — an agent re-executing work that
+		 * is already checked off. Task identity is semantic, so no deterministic
+		 * rule can flag the regression itself (measured: command-cluster
+		 * "resurrection" drowns in benign tool recurrence, 29 false hits in one
+		 * dev session); juxtaposing the done-list with current activity is the
+		 * honest instrument.
+		 */
+		recentCompleted: string[];
 		/** Assistant turns since the last todo tool call; undefined when never called. */
 		turnsSinceTodo: number | undefined;
 	};
@@ -48,6 +58,8 @@ export interface TaskMap {
 
 /** Trailing assistant-turn window the derived side describes. */
 export const MAP_WINDOW_TURNS = 30;
+/** How many completed tasks the declared section lists for regression-spotting. */
+const RECENT_COMPLETED_LIMIT = 3;
 /** Commands since the last todo update before the declared plan counts as stale. */
 const STALE_TODO_COMMANDS = 15;
 /** Assistant turns without any todo before "no declared plan" is worth saying. */
@@ -122,6 +134,11 @@ export function buildTaskMap(entries: readonly FileEntry[], todoPhases: readonly
 	for (const phase of todoPhases) {
 		current ??= phase.tasks.find(task => task.status === "in_progress")?.content;
 	}
+	// Declaration order stands in for completion order — TodoPhase carries no
+	// completion timestamps, and phase order is how the operator reads the plan.
+	const recentCompleted = todoPhases
+		.flatMap(phase => phase.tasks.filter(task => task.status === "completed").map(task => task.content))
+		.slice(-RECENT_COMPLETED_LIMIT);
 	let lastTodoTurn = -1;
 	for (let i = 0; i < turns.length; i++) if (turns[i].calledTodo) lastTodoTurn = i;
 	const turnsSinceTodo = lastTodoTurn === -1 ? undefined : turns.length - 1 - lastTodoTurn;
@@ -182,7 +199,7 @@ export function buildTaskMap(entries: readonly FileEntry[], todoPhases: readonly
 	}
 
 	return {
-		declared: { phases, current, turnsSinceTodo },
+		declared: { phases, current, recentCompleted, turnsSinceTodo },
 		derived: {
 			windowTurns: window.length,
 			tools,
@@ -206,6 +223,9 @@ export function renderTaskMap(map: TaskMap): string {
 		const summary = map.declared.phases.map(phase => `${phase.name} ${phase.done}/${phase.total}`).join(" · ");
 		lines.push(`declared: ${summary}`);
 		if (map.declared.current) lines.push(`  ▸ current: ${map.declared.current}`);
+		if (map.declared.recentCompleted.length > 0) {
+			lines.push(`  ✓ recently completed: ${map.declared.recentCompleted.join(" · ")}`);
+		}
 		if (map.declared.turnsSinceTodo !== undefined) {
 			lines.push(`  last todo update: ${map.declared.turnsSinceTodo} turn(s) ago`);
 		}
