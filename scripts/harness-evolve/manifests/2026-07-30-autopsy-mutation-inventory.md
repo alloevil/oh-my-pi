@@ -81,4 +81,4 @@ Manual metrics — predictions the canary does not measure; fill by hand:
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-08-02; incident inventory surfaced 120× browser + 21× osascript mutations, healthy session clean

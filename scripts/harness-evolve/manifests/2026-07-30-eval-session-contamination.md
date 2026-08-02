@@ -155,4 +155,4 @@ ticks after review):
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-08-02; corpus corrected 380→11 real, all three candidate verdicts survived, premise-failure (366 path-invisible probe sessions) recorded

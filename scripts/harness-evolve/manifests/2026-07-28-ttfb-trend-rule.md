@@ -113,4 +113,4 @@ discipline exists for.
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-08-02; revised rule accepted with the falsified trend hypothesis on record (stalls + chronic are the signals with a real hit)

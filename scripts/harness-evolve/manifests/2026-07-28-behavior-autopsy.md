@@ -81,4 +81,4 @@ Manual metrics — predictions the canary does not measure; fill by hand:
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-08-02; all predictions held (incident four-axis surfacing, healthy-session quiet render, 6/6 contracts)

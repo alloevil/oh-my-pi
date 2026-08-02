@@ -120,7 +120,7 @@ Manual metrics — predictions the canary does not measure; fill by hand:
 
 ## Verdict
 
-pending-review — all eleven predictions held (six from the first pass, five
+keep — user-approved 2026-08-02 after real use; both passes (collapse + payload language) accepted
 pre-registered for the payload-language pass). Recorded corrections: the `<<-`
 terminator match was written against tabs though `replaceTabs` runs first
 (caught by test, not by reading); and the first pass fixed only the symptom —

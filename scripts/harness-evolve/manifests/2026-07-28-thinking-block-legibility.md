@@ -128,4 +128,4 @@ Manual metrics — predictions the canary does not measure; fill by hand:
 
 ## Verdict
 
-pending-review — six of seven predictions held as written; the italic prediction was falsified as literally stated (markdown-theme blockquote italics, identical to prose) and is recorded as revised rather than widened. Light-theme recess was broken by the first design and is now covered by a test.
+keep — user-approved 2026-08-02 after several days of real use; italic prediction stays recorded as revised

@@ -102,4 +102,4 @@ roughly a one-task noise floor, which is why the tolerance exists.
 
 ## Verdict
 
-pending-review
+keep — user-approved 2026-08-02; incident replay matched all predictions; first-run gate noise event recorded
